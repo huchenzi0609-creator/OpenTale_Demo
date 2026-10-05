@@ -63,6 +63,20 @@ def _strict_json(raw: str | bytes) -> object:
     return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
 
 
+def _contains_credential(value: object, credential: str) -> bool:
+    """Inspect decoded values too: JSON escapes must not bypass the output boundary."""
+    if isinstance(value, str):
+        return credential in value
+    if isinstance(value, dict):
+        return any(
+            _contains_credential(key, credential) or _contains_credential(item, credential)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_credential(item, credential) for item in value)
+    return False
+
+
 def _actor_frame(frame: GenerationFrame) -> dict[str, object]:
     """An explicit allowlist prevents new debugging fields from reaching an actor."""
     return {
@@ -166,6 +180,8 @@ class DeepSeekProvider:
                 value = schema.model_validate(_strict_json(content), strict=True)
             except (ValueError, ValidationError, RecursionError):
                 raise ProviderError("MODEL_OUTPUT_INVALID", "模型输出不符合当前表达格式。", True) from None
+            if _contains_credential(value.model_dump(mode="json"), key):
+                raise ProviderError("MODEL_OUTPUT_INVALID", "模型输出包含不允许公开的内容。", True)
             return ModelResult(value, envelope.usage.prompt_tokens, envelope.usage.completion_tokens)
         except httpx.TimeoutException:
             raise ProviderError("PROVIDER_TIMEOUT", "模型连接超时，可保留当前进度后重试。", True) from None

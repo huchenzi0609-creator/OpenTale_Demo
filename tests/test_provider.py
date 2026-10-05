@@ -8,6 +8,7 @@ from opentale.config import Settings
 from opentale.domain import GenerationFrame, ReadingFrame
 from opentale.providers import DeepSeekProvider, FixtureProvider, ProviderError, make_provider
 from opentale.providers.deepseek import MAX_RESPONSE_BYTES
+from pydantic import BaseModel
 
 TEST_CREDENTIAL = "unit-test-only-credential"
 
@@ -222,6 +223,65 @@ async def test_invalid_json_schema_or_prose_is_bounded_safe_failure(content):
     assert caught.value.retryable
     assert TEST_CREDENTIAL not in str(caught.value)
     assert "private" not in str(caught.value)
+
+
+async def test_escaped_credential_in_surface_is_rejected_after_json_decoding():
+    escaped = "".join(f"\\u{ord(character):04x}" for character in TEST_CREDENTIAL)
+    content = '{"text":"她看见了' + escaped + '，然后停下。"}'
+    assert TEST_CREDENTIAL not in content
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=response(content)))
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.realize(generation_frame())
+    finally:
+        await client.aclose()
+    assert caught.value.code == "MODEL_OUTPUT_INVALID"
+    assert TEST_CREDENTIAL not in str(caught.value)
+    assert TEST_CREDENTIAL not in json.dumps(caught.value.public())
+
+
+@pytest.mark.parametrize("field", ["text", "role", "value", "anchor", "target_position_id"])
+async def test_escaped_credential_in_nested_proposal_fields_never_becomes_model_result(field):
+    payload = {
+        "position_id": "p-a", "based_on_revision": 0,
+        "text": "写信人正在写第一句。",
+        "operations": [{"op": "rebind", "target_position_id": "p-b", "expression_id": "e-letter",
+                        "role": "共同生活", "value": "写信人正在写第一句。", "anchor": "正在写第一句"}],
+    }
+    if field == "text":
+        payload["text"] = TEST_CREDENTIAL
+    else:
+        payload["operations"][0][field] = TEST_CREDENTIAL
+    escaped = "".join(f"\\u{ord(character):04x}" for character in TEST_CREDENTIAL)
+    content = json.dumps(payload, ensure_ascii=False).replace(TEST_CREDENTIAL, escaped)
+    assert TEST_CREDENTIAL not in content
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=response(content)))
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.propose(generation_frame())
+    finally:
+        await client.aclose()
+    assert caught.value.code == "MODEL_OUTPUT_INVALID"
+    assert TEST_CREDENTIAL not in str(caught.value)
+    assert TEST_CREDENTIAL not in json.dumps(caught.value.public())
+
+
+async def test_escaped_credential_in_decoded_mapping_key_is_rejected_at_provider_boundary():
+    class MappingPayload(BaseModel):
+        mapping: dict[str, str]
+
+    escaped = "".join(f"\\u{ord(character):04x}" for character in TEST_CREDENTIAL)
+    content = '{"mapping":{"' + escaped + '":"ordinary value"}}'
+    assert TEST_CREDENTIAL not in content
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=response(content)))
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider._request("只输出 json。", {}, MappingPayload)
+    finally:
+        await client.aclose()
+    assert caught.value.code == "MODEL_OUTPUT_INVALID"
+    assert TEST_CREDENTIAL not in str(caught.value)
+    assert TEST_CREDENTIAL not in json.dumps(caught.value.public())
 
 
 async def test_truncation_is_distinguished_from_schema_error():
