@@ -7,9 +7,18 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 from uuid import uuid4
 
+from .capacity import MAX_READING_TRACKS
 from .config import Settings
-from .domain import Event, Limits, Pending, Presentation, ReadingFrame, Snapshot
-from .kernel import KernelError, audit_for, frame_for, install_presentation, validate_proposal, without_source
+from .domain import Event, Limits, Pending, Presentation, ReadingFrame, ReadingTrack, Snapshot
+from .kernel import (
+    KernelError,
+    audit_for,
+    frame_for,
+    install_presentation,
+    reading_track_for,
+    validate_proposal,
+    without_source,
+)
 from .kernel import install_batch as install
 from .providers import ModelResult, ProviderError, make_provider
 from .storage import Store
@@ -63,6 +72,51 @@ class Runner:
         self.event(state, "limits_updated", previous=previous, limits=state.run.limits.model_dump())
         return state
 
+    def _stable(self, run_id: str) -> Snapshot:
+        state = self.store.load(run_id)
+        if self.busy(run_id) or state.run.status == "running":
+            raise KernelError("RUN_BUSY", "请先暂停生成，再配置或单独生成连续阅读。")
+        return state
+
+    def add_reading(self, run_id: str, title: str, start_position_id: str, enabled: bool = True) -> Snapshot:
+        state = self._stable(run_id)
+        if start_position_id not in {position.id for position in state.positions}:
+            raise KernelError("READING_START_INVALID", "请选择本世界中的起始人物。")
+        if not title.strip() or len(title.strip()) > 120:
+            raise KernelError("READING_TITLE_INVALID", "请填写不超过 120 字符的阅读名称。")
+        if len(state.reading_tracks) >= MAX_READING_TRACKS:
+            raise KernelError("READING_LIMIT_REACHED", "本实验的连续阅读数量已达到上限。")
+        track = ReadingTrack(
+            id=uuid4().hex, title=title.strip(), start_position_id=start_position_id,
+            created_revision=state.run.revision, enabled=enabled,
+        )
+        state.reading_tracks.append(track)
+        self.event(state, "reading_created", track=track.model_dump())
+        return state
+
+    def set_reading_enabled(self, run_id: str, reading_id: str, enabled: bool) -> Snapshot:
+        state = self._stable(run_id)
+        track = reading_track_for(state, reading_id)
+        if track.enabled != enabled:
+            track.enabled = enabled
+            self.event(state, "reading_enabled", reading_id=reading_id, enabled=enabled)
+        return state
+
+    @staticmethod
+    def _presented_revision(track: ReadingTrack, revision: int) -> bool:
+        return any(segment.revision == revision for segment in track.story)
+
+    @staticmethod
+    def _world_ready(state: Snapshot) -> bool:
+        return state.run.revision >= 1 and all(
+            continuation.frame_revision == state.run.revision
+            and continuation.status == "ready" and bool(continuation.surface.strip())
+            for continuation in state.continuations
+        ) and len(state.continuations) == len(state.positions) and (
+            state.pending is None or not state.pending.committed
+            or set(state.pending.realizations) == {position.id for position in state.positions}
+        )
+
     async def start(self, run_id: str) -> Snapshot:
         if self.busy(run_id):
             raise KernelError("RUN_BUSY", "该实验已有生成任务正在执行。")
@@ -99,9 +153,68 @@ class Runner:
     def _needed_calls(self, state: Snapshot) -> int:
         pending = state.pending
         if not pending:
-            return len(state.positions) * 2 + 1
+            return len(state.positions) * 2 + sum(track.enabled for track in state.reading_tracks)
         drafts = 0 if pending.committed else len(state.positions) - len(pending.proposals)
-        return drafts + len(state.positions) - len(pending.realizations) + 1
+        readers = sum(
+            track.enabled and (not pending.committed or not self._presented_revision(track, state.run.revision))
+            for track in state.reading_tracks
+        )
+        return drafts + len(state.positions) - len(pending.realizations) + readers
+
+    async def _present_track(self, state: Snapshot, provider: Any, reading_id: str) -> None:
+        track = reading_track_for(state, reading_id)
+        if self._presented_revision(track, state.run.revision):
+            return
+        frame = self.reading_frame(state, reading_id)
+        try:
+            result = await self._call(state, frame, lambda: provider.present(frame))
+            self.apply_presentation(state, result.value, reading_id)
+            if state.pending is not None and state.pending.committed:
+                state.pending.presentations[reading_id] = result.value
+            self.event(
+                state, "presented", reading_id=reading_id, segment_id=track.story[-1].id,
+                reinterprets=result.value.reinterprets, presentation=result.value.model_dump(),
+            )
+        except (KernelError, ProviderError) as error:
+            track.last_error = {"code": error.code, "message": error.message, "retryable": error.retryable}
+            self.store.save(state)
+            raise
+
+    async def present_reading(self, run_id: str, reading_id: str) -> Snapshot:
+        # Manual serialization shares the world's lock and budget, but never reruns actors.
+        self._stable(run_id)
+        lock = self.locks.setdefault(run_id, asyncio.Lock())
+        async with lock:
+            state = self.store.load(run_id)
+            track = reading_track_for(state, reading_id)
+            if self._presented_revision(track, state.run.revision):
+                return state
+            if not self._world_ready(state):
+                raise KernelError("READING_NOT_READY", "请先完成本世界的共同构想和各人物续延，再从当前世界生成阅读。")
+            provider = make_provider(state.run.provider, self.settings)
+            previous_status, previous_phase = state.run.status, state.run.phase
+            state.run.status, state.run.phase = "running", "presenting"
+            self.store.save(state)
+            try:
+                await self._present_track(state, provider, reading_id)
+                return state
+            except (KernelError, ProviderError):
+                self.event(state, "reading_error", reading_id=reading_id, **track.last_error)
+                raise
+            except asyncio.CancelledError:
+                # _call already settles an interrupted request conservatively.
+                raise
+            except Exception:
+                track.last_error = {
+                    "code": "RUNTIME_FAILURE", "message": "当前阅读未完成，可从本世界已保存结果重新呈现。",
+                    "retryable": True,
+                }
+                self.event(state, "reading_error", reading_id=reading_id, **track.last_error)
+                raise ProviderError("RUNTIME_FAILURE", track.last_error["message"], True) from None
+            finally:
+                state.run.status = "paused" if run_id in self.pause_requests else previous_status
+                state.run.phase = previous_phase
+                self.store.save(state)
 
     async def _call(
         self, state: Snapshot, frame: Any, call: Callable[[], Awaitable[ModelResult[T]]]
@@ -245,9 +358,17 @@ class Runner:
                     state.run.status = "paused"
                     self.event(state, "paused", boundary="before_presentation")
                     return state
-                reading_frame = self.reading_frame(state)
-                result = await self._call(state, reading_frame, lambda: provider.present(reading_frame))
-                self.apply_presentation(state, result.value)
+                async def present(reading_id: str) -> None:
+                    async with semaphore:
+                        await self._present_track(state, provider, reading_id)
+
+                results = await asyncio.gather(
+                    *(present(track.id) for track in state.reading_tracks if track.enabled),
+                    return_exceptions=True,
+                )
+                failure = next((result for result in results if isinstance(result, BaseException)), None)
+                if failure:
+                    raise failure
                 state.pending = None
                 state.run.usage.windows += 1
                 state.run.phase = "idle"
@@ -256,10 +377,8 @@ class Runner:
                 )
                 self.event(
                     state,
-                    "presented",
-                    segment_id=state.story[-1].id,
-                    reinterprets=state.story[-1].reinterprets,
-                    presentation=result.value.model_dump(),
+                    "window_completed",
+                    reading_ids=[track.id for track in state.reading_tracks if track.enabled],
                 )
                 if state.run.status == "paused":
                     self.event(state, "paused", boundary="after_presentation")
@@ -290,7 +409,8 @@ class Runner:
                     "RUNTIME_FAILURE", state.run.last_error["message"], retryable=True
                 ) from None
 
-    def reading_frame(self, state: Snapshot) -> ReadingFrame:
+    def reading_frame(self, state: Snapshot, reading_id: str = "main") -> ReadingFrame:
+        track = reading_track_for(state, reading_id)
         shared_ids = {entry["expression_id"] for entry in audit_for(state)["shared_expressions"]}
         return ReadingFrame(
             revision=state.run.revision,
@@ -307,13 +427,15 @@ class Runner:
                 }
                 for p in state.positions
             ],
-            previous_segments=[s.model_dump() for s in state.story[-3:]],
-            open_relations=state.reading.open_relations,
-            current_focus=state.reading.focus_position_id,
+            previous_segments=[segment.model_dump() for segment in track.story[-3:]],
+            open_relations=track.reading.open_relations,
+            current_focus=track.reading.focus_position_id,
+            start_position_id=track.start_position_id,
+            required_focus_position_id=track.start_position_id if not track.story else None,
         )
 
-    def apply_presentation(self, state: Snapshot, presentation: Presentation) -> None:
-        install_presentation(state, presentation)
+    def apply_presentation(self, state: Snapshot, presentation: Presentation, reading_id: str = "main") -> None:
+        install_presentation(state, presentation, reading_id)
 
     async def counterfactual(self, run_id: str, target_id: str, source_id: str) -> dict[str, Any]:
         state = self.store.load(run_id)

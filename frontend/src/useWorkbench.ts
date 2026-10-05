@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, post, request } from "./api";
 import { DEFAULT_LIMITS, budgetBounds, limitsValid, sameLimits } from "./budgetLimits";
 import { presetPayload, type PresetDraft } from "./presetDraft";
+import { readingTracks } from "./readings";
 import type {
   Counterfactual,
   Limits,
@@ -32,6 +33,8 @@ export function useWorkbench() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedPosition, setSelectedPosition] = useState("");
+  const [selectedReadingId, setSelectedReadingId] = useState("main");
+  const [presentingReadingId, setPresentingReadingId] = useState("");
   const [tab, setTab] = useState<"story" | "structure" | "diagnostics">(
     "story",
   );
@@ -55,6 +58,12 @@ export function useWorkbench() {
   const active = snapshot?.run.status === "running";
   const anyActive = active || runs.some((run) => run.status === "running");
   const preset = presets.find((item) => item.id === presetId);
+
+  useEffect(() => {
+    if (snapshot && !readingTracks(snapshot).some((reading) => reading.id === selectedReadingId)) {
+      setSelectedReadingId("main");
+    }
+  }, [snapshot, selectedReadingId]);
 
   useEffect(() => {
     setCreateError("");
@@ -241,6 +250,45 @@ export function useWorkbench() {
       },
     );
   }
+  function createReading(title: string, startPositionId: string, enabled: boolean) {
+    if (!snapshot || anyActive || busy) return;
+    const id = snapshot.run.id;
+    const oldIds = new Set(readingTracks(snapshot).map((reading) => reading.id));
+    return perform("新建阅读", async () => {
+      const next = await post<Snapshot>(`/runs/${encodeURIComponent(id)}/readings`, {
+        title: title.trim(), start_position_id: startPositionId, enabled,
+      });
+      adopt(next);
+      const created = readingTracks(next).find((reading) => !oldIds.has(reading.id));
+      if (created) setSelectedReadingId(created.id);
+      setNotice("已新建独立阅读，共享同一世界；尚未调用模型。可从当前世界生成一段，或随以后窗口自动续写。");
+    });
+  }
+  function setReadingEnabled(readingId: string, enabled: boolean) {
+    if (!snapshot || anyActive || busy) return;
+    return perform("更新阅读设置", async () => {
+      adopt(await request<Snapshot>(`/runs/${encodeURIComponent(snapshot.run.id)}/readings/${encodeURIComponent(readingId)}`, {
+        method: "PATCH", body: JSON.stringify({ enabled }),
+      }));
+      setNotice(enabled ? "此阅读将随以后窗口续写；设置未调用模型。" : "此阅读已停止自动续写，已有正文保留；设置未调用模型。");
+    });
+  }
+  function presentReading(readingId: string) {
+    if (!snapshot || anyActive || busy) return;
+    const id = snapshot.run.id;
+    setPresentingReadingId(readingId);
+    return perform("生成阅读", async () => {
+      try {
+        adopt(await post<Snapshot>(`/runs/${encodeURIComponent(id)}/readings/${encodeURIComponent(readingId)}/present`));
+      } catch (cause) {
+        try {
+          adopt(await request<Snapshot>(`/runs/${encodeURIComponent(id)}`));
+        } catch { /* Keep the last usable state when the server is unavailable. */ }
+        throw cause;
+      }
+      setNotice("已从当前世界完成此阅读的呈现，人物构想与续延未重新执行。");
+    }).finally(() => setPresentingReadingId(""));
+  }
   const disabled = !!busy;
   const frozen = disabled || active;
   const exhausted = snapshot?.run.status === "budget_exhausted";
@@ -388,6 +436,9 @@ export function useWorkbench() {
     selectedRunId,
     selectedPosition,
     setSelectedPosition,
+    selectedReadingId,
+    setSelectedReadingId,
+    presentingReadingId,
     tab,
     setTab,
     booting,
@@ -433,6 +484,9 @@ export function useWorkbench() {
     reconnect,
     selectRun,
     runAction,
+    createReading,
+    setReadingEnabled,
+    presentReading,
   };
 }
 

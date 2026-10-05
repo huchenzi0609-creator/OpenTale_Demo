@@ -486,7 +486,7 @@ def initialize(preset: dict, provider: str, limits: Limits) -> Snapshot:
             revision=0,
             data={
                 "preset_id": preset["id"],
-                "schema_version": 1,
+                "schema_version": state.schema_version,
                 "initial": state.model_dump(exclude={"events"}),
             },
         )

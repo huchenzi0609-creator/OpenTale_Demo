@@ -37,7 +37,7 @@ class Store:
         with self.connect() as db:
             db.execute(
                 "INSERT INTO runs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET snapshot=excluded.snapshot",
-                (snapshot.run.id, snapshot.model_dump_json()),
+                (snapshot.run.id, snapshot.model_dump_json(exclude={"story", "reading"})),
             )
             db.executemany(
                 "INSERT OR IGNORE INTO events VALUES (?,?,?)",

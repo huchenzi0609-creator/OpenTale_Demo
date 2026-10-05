@@ -1,14 +1,28 @@
 """Replay semantic operations from recorded evidence without running any provider."""
 
-from .domain import Event, Presentation, Proposal, Snapshot
-from .kernel import fingerprint, frame_for, install_batch, install_presentation, semantic_projection
+from .domain import Event, Presentation, Proposal, ReadingTrack, Snapshot
+from .kernel import (
+    fingerprint,
+    frame_for,
+    install_batch,
+    install_presentation,
+    reading_track_for,
+    semantic_projection,
+)
 
 
 def replay(events: list[Event]) -> Snapshot:
     initial = next(event for event in events if event.type == "created")
     state = Snapshot.model_validate(initial.data["initial"])
     for event in events:
-        if event.type == "batch_installed":
+        if event.type == "reading_created":
+            track = ReadingTrack.model_validate(event.data["track"])
+            if any(existing.id == track.id for existing in state.reading_tracks):
+                raise ValueError("Duplicate reading creation evidence")
+            state.reading_tracks.append(track)
+        elif event.type == "reading_enabled":
+            reading_track_for(state, event.data["reading_id"]).enabled = event.data["enabled"]
+        elif event.type == "batch_installed":
             proposals = [Proposal.model_validate(p) for p in event.data["proposals"]]
             state = install_batch(state, proposals, event.data["base_revision"])
         elif event.type == "continuation_resumed":
@@ -22,7 +36,10 @@ def replay(events: list[Event]) -> Snapshot:
             continuation.status = "ready"
             continuation.resume_count += 1
         elif event.type == "presented":
-            install_presentation(state, Presentation.model_validate(event.data["presentation"]))
+            install_presentation(
+                state, Presentation.model_validate(event.data["presentation"]),
+                event.data.get("reading_id", "main"),
+            )
     return state
 
 

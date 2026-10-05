@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from .capacity import (
     DEFAULT_TOKEN_BUDGET,
@@ -16,6 +16,7 @@ from .capacity import (
     MAX_PRESENTATION_TEXT_CHARS,
     MAX_PROPOSAL_OPERATIONS,
     MAX_PROPOSAL_TEXT_CHARS,
+    MAX_READING_TRACKS,
     MAX_TOKEN_BUDGET,
     MAX_WINDOW_BUDGET,
 )
@@ -121,6 +122,8 @@ class ReadingFrame(Record):
     previous_segments: list[dict[str, Any]]
     open_relations: list[dict[str, Any]]
     current_focus: str | None = None
+    start_position_id: str | None = None
+    required_focus_position_id: str | None = None
 
 
 class Presentation(Record):
@@ -158,6 +161,7 @@ class Pending(Record):
     proposals: dict[str, Proposal] = Field(default_factory=dict)
     realizations: dict[str, str] = Field(default_factory=dict)
     committed: bool = False
+    presentations: dict[str, Presentation] = Field(default_factory=dict)
 
 
 class Run(Record):
@@ -175,15 +179,81 @@ class Run(Record):
     fork_of: str | None = None
 
 
+class ReadingTrack(Record):
+    id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=120)
+    start_position_id: str | None = None
+    created_revision: int = Field(default=0, ge=0)
+    enabled: bool = True
+    story: list[StorySegment] = Field(default_factory=list)
+    reading: Reading = Field(default_factory=Reading)
+    last_error: dict[str, Any] | None = None
+
+
 class Snapshot(Record):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     run: Run
     positions: list[Position]
     expressions: list[Expression]
     uses: list[Use]
     continuations: list[Continuation]
     events: list[Event] = Field(default_factory=list)
-    story: list[StorySegment] = Field(default_factory=list)
-    reading: Reading = Field(default_factory=Reading)
+    reading_tracks: list[ReadingTrack] = Field(
+        default_factory=lambda: [ReadingTrack(id="main", title="阅读 1")],
+        min_length=1, max_length=MAX_READING_TRACKS,
+    )
     pending: Pending | None = None
     audit: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_readings(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        version = data.get("schema_version", 1)
+        if type(version) is not int or version not in {1, 2}:
+            return data  # Literal validation rejects unknown future versions.
+        if version == 2 and "reading_tracks" not in data:
+            raise ValueError("Version-2 snapshots require canonical reading histories")
+        legacy_story = data.pop("story", [])
+        legacy_reading = data.pop("reading", {})
+        if "reading_tracks" not in data:
+            data["reading_tracks"] = [{
+                "id": "main", "title": "阅读 1", "story": legacy_story, "reading": legacy_reading,
+            }]
+        elif legacy_story or legacy_reading:
+            # Compatibility projections must never silently override canonical histories.
+            main = next((track for track in data["reading_tracks"] if (
+                track.id if isinstance(track, ReadingTrack) else track.get("id")
+            ) == "main"), None)
+            if main is not None:
+                main_data = main.model_dump() if isinstance(main, ReadingTrack) else main
+                if legacy_story and legacy_story != main_data.get("story", []):
+                    raise ValueError("Primary reading projection does not match its history")
+                if legacy_reading and legacy_reading != main_data.get("reading", {}):
+                    raise ValueError("Primary reading projection does not match its state")
+        data["schema_version"] = 2
+        return data
+
+    @model_validator(mode="after")
+    def unique_readings(self) -> "Snapshot":
+        identifiers = [track.id for track in self.reading_tracks]
+        if len(identifiers) != len(set(identifiers)) or "main" not in identifiers:
+            raise ValueError("Reading tracks need unique IDs and one main compatibility view")
+        positions = {position.id for position in self.positions}
+        if any(track.start_position_id is not None and track.start_position_id not in positions
+               for track in self.reading_tracks):
+            raise ValueError("Reading starts must reference current positions")
+        return self
+
+    @computed_field
+    @property
+    def story(self) -> list[StorySegment]:
+        """Compatibility projection; every reading has one canonical history."""
+        return next(track.story for track in self.reading_tracks if track.id == "main")
+
+    @computed_field
+    @property
+    def reading(self) -> Reading:
+        return next(track.reading for track in self.reading_tracks if track.id == "main")

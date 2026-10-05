@@ -13,7 +13,7 @@ async def test_complete_semantic_replay_two_windows_and_fork(snapshot, settings,
     await runner.step(snapshot.run.id)
     saved = await runner.step(snapshot.run.id)
     result = verify_replay(saved, store.read_events(saved.run.id))
-    assert result["ok"] and len(result["checks"]) == 6
+    assert result["ok"] and len(result["checks"]) == 7
     fork = store.fork(saved.run.id)
     advanced = await runner.step(fork.run.id)
     assert verify_replay(advanced, store.read_events(fork.run.id))["ok"]

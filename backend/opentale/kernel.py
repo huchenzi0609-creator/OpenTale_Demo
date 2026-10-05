@@ -7,7 +7,17 @@ import json
 from collections import defaultdict
 from typing import Any
 
-from .domain import Binding, Expression, GenerationFrame, Presentation, Proposal, Snapshot, StorySegment, Use
+from .domain import (
+    Binding,
+    Expression,
+    GenerationFrame,
+    Presentation,
+    Proposal,
+    ReadingTrack,
+    Snapshot,
+    StorySegment,
+    Use,
+)
 
 
 class KernelError(Exception):
@@ -229,11 +239,19 @@ def without_source(state: Snapshot, target_id: str, source_id: str) -> tuple[Sna
     return result, changed
 
 
-def install_presentation(state: Snapshot, presentation: Presentation) -> None:
+def reading_track_for(state: Snapshot, reading_id: str = "main") -> ReadingTrack:
+    track = next((track for track in state.reading_tracks if track.id == reading_id), None)
+    if track is None:
+        raise KernelError("READING_NOT_FOUND", "该连续阅读不存在。")
+    return track
+
+
+def install_presentation(state: Snapshot, presentation: Presentation, reading_id: str = "main") -> None:
+    track = reading_track_for(state, reading_id)
     positions = {p.id for p in state.positions}
-    allowed = {u.expression_id for u in state.uses}
+    allowed = {u.expression_id for u in state.uses if u.position_id == presentation.focus_position_id}
     shared = {e["expression_id"] for e in audit_for(state)["shared_expressions"]}
-    segments = {s.id for s in state.story}
+    segments = {s.id for s in track.story}
     if (
         presentation.focus_position_id not in positions
         or not set(presentation.expression_ids) <= allowed
@@ -241,18 +259,25 @@ def install_presentation(state: Snapshot, presentation: Presentation) -> None:
     ):
         raise KernelError("PRESENTATION_REFERENCE_INVALID", "呈现须承接当前有效的共同表达。")
     if not set(presentation.reinterprets) <= segments:
-        raise KernelError("PRESENTATION_REFERENCE_INVALID", "返回的读法引用了尚未呈现的片段。")
+        raise KernelError("PRESENTATION_REFERENCE_INVALID", "重读只能承接本条连续阅读已经呈现的片段。")
+    if not track.story and track.start_position_id is not None:
+        if presentation.focus_position_id != track.start_position_id:
+            raise KernelError("PRESENTATION_FOCUS_INVALID", "这条阅读的首段须从选定人物的当前生活开始。")
+    if any(segment.revision == state.run.revision for segment in track.story):
+        raise KernelError("READING_ALREADY_PRESENTED", "本条阅读已呈现当前世界版本。")
     segment = StorySegment(
-        id=f"story-{state.run.revision}",
+        id=(f"story-{state.run.revision}" if reading_id == "main"
+            else f"story-{fingerprint([reading_id, state.run.revision])[:20]}"),
         revision=state.run.revision,
         text=presentation.text,
         focus_position_id=presentation.focus_position_id,
         expression_ids=presentation.expression_ids,
         reinterprets=presentation.reinterprets,
     )
-    state.story.append(segment)
-    state.reading.focus_position_id = presentation.focus_position_id
-    state.reading.open_relations = [
+    track.story.append(segment)
+    track.last_error = None
+    track.reading.focus_position_id = presentation.focus_position_id
+    track.reading.open_relations = [
         {
             "position_id": joint["position_id"],
             "expression_id": joint["expression_id"],
@@ -264,7 +289,7 @@ def install_presentation(state: Snapshot, presentation: Presentation) -> None:
         for joint in audit_for(state)["joint_targets"]
     ]
     for previous_id in presentation.reinterprets:
-        state.reading.interpretations.append(
+        track.reading.interpretations.append(
             {
                 "segment_id": previous_id,
                 "through_segment_id": segment.id,
@@ -275,7 +300,12 @@ def install_presentation(state: Snapshot, presentation: Presentation) -> None:
 
 
 def semantic_projection(state: Snapshot) -> dict:
-    return {
+    projection = {
         key: state.model_dump()[key]
         for key in ("positions", "expressions", "uses", "continuations", "story", "reading")
     }
+    projection["reading_tracks"] = [
+        track.model_dump(exclude={"last_error"})
+        for track in sorted(state.reading_tracks, key=lambda track: track.id)
+    ]
+    return projection

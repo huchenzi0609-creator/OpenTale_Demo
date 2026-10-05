@@ -5,6 +5,7 @@ import StoryReader from "./components/StoryReader";
 import Relations from "./components/Relations";
 import Diagnostics from "./components/Diagnostics";
 import Verification from "./components/Verification";
+import { readingTracks } from "./readings";
 
 const STATUS: Record<string, string> = {
   idle: "待命",
@@ -297,6 +298,7 @@ export default function App() {
                   {Object.keys(snapshot.pending.realizations).length}/
                   {snapshot.positions.length} ·{" "}
                   {snapshot.pending.committed ? "已共同安装" : "等待共同安装"}
+                  {snapshot.pending.committed && <> · 呈现 {readingTracks(snapshot).filter((reading) => reading.enabled && Object.hasOwn(snapshot.pending!.presentations ?? {}, reading.id)).length}/{readingTracks(snapshot).filter((reading) => reading.enabled).length}</>}
                 </small>
               </div>
             )}
@@ -315,12 +317,12 @@ export default function App() {
                   onClick={() => setTab(value)}
                 >
                   {label}
-                  {value === "story" && <span>{snapshot.story.length}</span>}
+                  {value === "story" && <span>{readingTracks(snapshot).reduce((total, reading) => total + reading.story.length, 0)}</span>}
                 </button>
               ))}
             </nav>
 
-            {tab === "story" && <StoryReader snapshot={snapshot} />}
+            {tab === "story" && <StoryReader snapshot={snapshot} model={workbench} />}
             {tab === "structure" && (
               <Relations
                 snapshot={snapshot}

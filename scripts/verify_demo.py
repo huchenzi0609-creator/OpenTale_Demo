@@ -228,28 +228,118 @@ def verify_custom_presets(server: Server) -> list[dict]:
     return [fork_advanced, new_run, custom_advanced]
 
 
+def reading_of(snapshot: dict, identifier: str) -> dict:
+    return next(reading for reading in snapshot["reading_tracks"] if reading["id"] == identifier)
+
+
+def verify_readings(server: Server) -> dict:
+    """Different serializations share one fixture world and independent histories."""
+    status, created = server.request("POST", "/api/runs", {
+        "preset_id": "letters", "provider": "fixture",
+        "limits": {"max_calls": 100, "max_tokens": 5120000, "max_parallel": 3, "max_windows": 8},
+    })
+    check(status == 200 and created["schema_version"] == 2
+          and created["story"] == reading_of(created, "main")["story"],
+          "v2 多阅读存档保留 main 的兼容投影")
+    path = f"/api/runs/{id_of(created)}"
+    status, added = server.request("POST", path + "/readings", {
+        "title": "从读者展开", "start_position_id": "reader", "enabled": True,
+    })
+    check(status == 200 and added["run"]["usage"]["calls"] == 0
+          and len(added["reading_tracks"]) == 2, "第二阅读配置保存不调用模型")
+    other = next(reading for reading in added["reading_tracks"] if reading["id"] != "main")
+    reading_path = path + f"/readings/{other['id']}"
+    status, not_ready = server.request("POST", reading_path + "/present")
+    check(status == 422 and not_ready["error"]["code"] == "READING_NOT_READY",
+          "尚无已续延的世界时安全拒绝单独呈现")
+    status, first = server.request("POST", path + "/step")
+    check(status == 200 and first["run"]["revision"] == 1
+          and first["run"]["usage"]["calls"] == 8
+          and len(first["story"]) == len(reading_of(first, other["id"])["story"]) == 1,
+          "同一窗口共用六次人物生成并形成两条阅读")
+    other_story = reading_of(first, other["id"])["story"]
+    check(other_story[0]["focus_position_id"] == "reader"
+          and other_story[0]["id"] != first["story"][0]["id"],
+          "新增入口首段从读者展开且故事段 ID 独立")
+    assert_safe_projection(first)
+    status, replay = server.request("GET", path + "/replay")
+    check(status == 200 and replay["ok"], "双阅读共同输入与各自历史均可语义重放")
+    status, disabled = server.request("PATCH", reading_path, {"enabled": False})
+    check(status == 200 and disabled["run"]["usage"] == first["run"]["usage"]
+          and reading_of(disabled, other["id"])["story"] == other_story,
+          "关闭自动阅读不删除故事或追加调用")
+    status, second = server.request("POST", path + "/step")
+    check(status == 200 and second["run"]["usage"]["calls"] == 15
+          and reading_of(second, other["id"])["story"] == other_story,
+          "关闭后下一窗口只自动呈现启用轨迹")
+    status, manually_presented = server.request("POST", reading_path + "/present")
+    check(status == 200 and manually_presented["run"]["revision"] == 2
+          and manually_presented["run"]["usage"]["windows"] == 2
+          and manually_presented["run"]["usage"]["calls"] == 16
+          and all(manually_presented[key] == second[key]
+                  for key in ("positions", "uses", "continuations", "story")),
+          "单独呈现当前世界不重跑人物、关系或窗口")
+    status, repeated = server.request("POST", reading_path + "/present")
+    check(status == 200 and repeated == manually_presented,
+          "同阅读同 revision 的呈现完全幂等且不计调用")
+    status, third = server.request("POST", path + "/readings", {
+        "title": "后加入的守门人入口", "start_position_id": "keeper", "enabled": False,
+    })
+    third_id = next(reading["id"] for reading in third["reading_tracks"]
+                    if reading["id"] not in {"main", other["id"]})
+    status, later_reading = server.request("POST", path + f"/readings/{third_id}/present")
+    check(status == 200 and [segment["revision"] for segment in reading_of(later_reading, third_id)["story"]] == [2]
+          and reading_of(later_reading, third_id)["story"][0]["focus_position_id"] == "keeper",
+          "后加入的入口从当前世界开始而不伪造旧历史")
+    for reading in later_reading["reading_tracks"]:
+        own_ids = {segment["id"] for segment in reading["story"]}
+        check(all(set(segment["reinterprets"]) <= own_ids for segment in reading["story"]),
+              "阅读重新理解指向限制在自己的正文历史")
+    status, before_restart_replay = server.request("GET", path + "/replay")
+    check(status == 200 and before_restart_replay["ok"], "手动呈现与启停事件可重放")
+    server.stop()
+    server.start()
+    status, restored = server.request("GET", path)
+    check(status == 200 and restored == later_reading, "服务重启后全部阅读、正文和用量保持完整")
+    status, restored_replay = server.request("GET", path + "/replay")
+    check(status == 200 and restored_replay["ok"]
+          and restored_replay["digest"] == before_restart_replay["digest"],
+          "多阅读重启后的语义摘要稳定")
+    status, enabled = server.request("PATCH", reading_path, {"enabled": True})
+    check(status == 200 and reading_of(enabled, other["id"])["enabled"], "恢复自动跟随不追加模型调用")
+    status, final = server.request("POST", path + "/step")
+    check(status == 200 and final["run"]["revision"] == 3
+          and final["run"]["usage"]["calls"] == 25
+          and [segment["revision"] for segment in reading_of(final, other["id"])["story"]] == [1, 2, 3]
+          and [segment["revision"] for segment in reading_of(final, third_id)["story"]] == [2],
+          "重新启用后两条阅读跟随同一新世界而第三条保留原历史")
+    status, final_replay = server.request("GET", path + "/replay")
+    check(status == 200 and final_replay["ok"], "全部阅读的持续承接可重新执行")
+    return final
+
+
 def verify(server: Server) -> None:
     status, health = server.request("GET", "/api/health")
     check(status == 200 and health.get("ok") is True, "真实 HTTP 健康检查")
     status, config = server.request("GET", "/api/config")
     check(status == 200 and config.get("configured") is False, "隔离配置不加载用户密钥")
-    expected_bounds = {"max_calls": 1000, "max_tokens": 512000, "max_parallel": 8, "max_windows": 1000}
-    check(config.get("budget_bounds") == expected_bounds, "公开配置声明统一的 512K 与调度预算上限")
+    expected_bounds = {"max_calls": 1000, "max_tokens": 5120000, "max_parallel": 8, "max_windows": 1000}
+    check(config.get("budget_bounds") == expected_bounds, "公开配置声明统一的 5.12M 与调度预算上限")
     assert_safe_projection(config)
     status, verification = server.request("GET", "/api/verify")
     check(status == 200 and verification.get("ok") is True and bool(verification.get("checks")) and all(
         item.get("passed") is True for item in verification.get("checks", [])
     ), "内置离线机制验收")
     status, rejected = server.request("POST", "/api/runs", {
-        "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 512001},
+        "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 5120001},
     })
     check(status == 422 and rejected["error"]["code"] == "REQUEST_INVALID",
-          "512001 Token 预算在创建前安全拒绝")
+          "5120001 Token 预算在创建前安全拒绝")
     status, run = server.request("POST", "/api/runs", {
-        "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 512000},
+        "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 5120000},
     })
-    check(status == 200 and run["run"]["revision"] == 0 and run["run"]["limits"]["max_tokens"] == 512000,
-          "创建并保存 512000 Token 的 fixture 对局")
+    check(status == 200 and run["run"]["revision"] == 0 and run["run"]["limits"]["max_tokens"] == 5120000,
+          "创建并保存 5120000 Token 的 fixture 对局")
     run_id = id_of(run)
     status, advanced = server.request("POST", f"/api/runs/{run_id}/step")
     check(status == 200 and advanced["run"]["revision"] == 1 and bool(advanced["story"]), "联合安装、续延与呈现完成一窗口")
@@ -296,7 +386,7 @@ def verify(server: Server) -> None:
     _, exhausted = server.request("GET", f"/api/runs/{id_of(limited)}")
     check(exhausted["run"]["status"] == "budget_exhausted"
           and exhausted["run"]["usage"]["calls"] <= 1, "调用前预算准入与耗尽暂停")
-    raised_limits = {"max_calls": 14, "max_tokens": 512000, "max_parallel": 1, "max_windows": 2}
+    raised_limits = {"max_calls": 14, "max_tokens": 5120000, "max_parallel": 1, "max_windows": 2}
     status, replenished = server.request("PATCH", f"/api/runs/{id_of(limited)}/limits", raised_limits)
     check(status == 200 and replenished["run"]["status"] == "paused"
           and replenished["run"]["last_error"] is None
@@ -329,8 +419,9 @@ def verify(server: Server) -> None:
             break
         time.sleep(0.05)
     check(paused["run"]["status"] != "running", "后台开始与协作式暂停")
+    parallel_reading_run = verify_readings(server)
     custom_runs = verify_custom_presets(server)
-    for snapshot in [background, limited, fork, advanced, *custom_runs]:
+    for snapshot in [background, limited, fork, advanced, parallel_reading_run, *custom_runs]:
         status, deleted = server.request("DELETE", f"/api/runs/{id_of(snapshot)}")
         check(status == 200 and deleted.get("deleted") is True, "删除指定非活跃存档")
     _, listing = server.request("GET", "/api/runs")

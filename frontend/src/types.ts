@@ -79,6 +79,21 @@ export interface Segment {
   expression_ids: string[];
   reinterprets: string[];
 }
+export interface ReadingState {
+  focus_position_id: string | null;
+  open_relations: unknown[];
+  interpretations: unknown[];
+}
+export interface ReadingTrack {
+  id: string;
+  title: string;
+  start_position_id: string | null;
+  created_revision: number;
+  enabled: boolean;
+  story: Segment[];
+  reading: ReadingState;
+  last_error: SafeError | null;
+}
 export interface Event {
   id: string;
   type: string;
@@ -95,16 +110,14 @@ export interface Snapshot {
   continuations: Continuation[];
   events: Event[];
   story: Segment[];
-  reading: {
-    focus_position_id: string | null;
-    open_relations: unknown[];
-    interpretations: unknown[];
-  };
+  reading: ReadingState;
+  reading_tracks?: ReadingTrack[];
   pending: null | {
     base_revision: number;
     proposals: Record<string, unknown>;
     realizations: Record<string, unknown>;
     committed: boolean;
+    presentations?: Record<string, unknown>;
   };
   audit: {
     shared_expressions: unknown[];

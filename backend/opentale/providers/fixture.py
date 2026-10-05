@@ -7,6 +7,7 @@ from collections import defaultdict
 from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, ReadingFrame
 
 from .base import ModelResult, ProviderError
+from .reading import eligible_candidates, shared_expression_ids, validate_presentation
 
 
 def _shared_use(frame: GenerationFrame) -> dict:
@@ -128,20 +129,11 @@ class FixtureProvider:
     async def present(self, frame: ReadingFrame) -> ModelResult[Presentation]:
         if not frame.candidates:
             raise ProviderError("FIXTURE_FRAME_INVALID", "还没有可以承接的叙述。")
-        participants: dict[str, set[str]] = defaultdict(set)
-        for candidate in frame.candidates:
-            for use in candidate.get("active_uses", []):
-                participants[use["expression_id"]].add(candidate["position_id"])
-        shared_ids = {expression_id for expression_id, positions in participants.items() if len(positions) >= 2}
-        # Compatibility for the old single-candidate fixture test, not custom-preset selection.
-        if not shared_ids and len(frame.candidates) == 1 and "e-letter" in participants:
-            shared_ids.add("e-letter")
-        eligible = [
-            candidate for candidate in frame.candidates
-            if shared_ids.intersection(use["expression_id"] for use in candidate.get("active_uses", []))
-        ]
-        if not eligible:
-            raise ProviderError("FIXTURE_FRAME_INVALID", "还没有可以共同承接的有效表达。")
+        shared_ids = shared_expression_ids(frame, legacy_letter=True)
+        try:
+            eligible = eligible_candidates(frame, legacy_letter=True)
+        except ProviderError as error:
+            raise ProviderError("FIXTURE_FRAME_INVALID", "还没有可以共同承接的有效表达。") from error
 
         def relevance(candidate: dict) -> tuple[int, bool, bool, int]:
             position_id = candidate["position_id"]
@@ -199,11 +191,11 @@ class FixtureProvider:
             text += "她又想起这些尚未结束的经历：" + _glimpse(remaining_values, "", budget=1000) + "。"
         if previous:
             text = "先前那一段生活再次被想起，却已经不能照原样理解下去。" + text
-        return ModelResult(
-            Presentation(
-                text=text,
-                focus_position_id=candidate["position_id"],
-                expression_ids=expression_ids,
-                reinterprets=[previous["id"]] if previous else [],
-            )
+        presentation = Presentation(
+            text=text,
+            focus_position_id=candidate["position_id"],
+            expression_ids=expression_ids,
+            reinterprets=[previous["id"]] if previous else [],
         )
+        validate_presentation(frame, presentation, legacy_letter=True)
+        return ModelResult(presentation)

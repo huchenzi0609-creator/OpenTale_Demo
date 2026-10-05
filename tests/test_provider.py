@@ -158,7 +158,9 @@ async def test_reading_provider_input_keeps_scopes_but_excludes_creator_provenan
         revision=1,
         candidates=[{"position_id": "p-a", "name": "折信人", "text": "她把信折好。",
                      "active_uses": [{"expression_id": "e-letter", "role": "共同生活", "values": ["她在灯下。"],
-                                      "source_position_id": "hidden-creator"}]}],
+                                      "source_position_id": "hidden-creator"}]},
+                    {"position_id": "p-b", "name": "读信人", "text": "她等在门外。",
+                     "active_uses": [{"expression_id": "e-letter", "role": "共同生活"}]}],
         previous_segments=[{"id": "segment-old", "text": "她曾经展开信。", "expression_ids": ["e-letter"],
                             "source_position_id": "hidden-creator"}],
         open_relations=[{"position_id": "p-a", "expression_id": "e-letter", "role": "共同生活",
@@ -634,6 +636,9 @@ async def test_narrative_stage_text_boundaries_preserve_usage_and_public_safety(
         frame = ReadingFrame(
             revision=1, candidates=[{
                 "position_id": "p-a", "name": "折信人", "text": "她停在灯下。",
+                "active_uses": [{"expression_id": "e-letter"}],
+            }, {
+                "position_id": "p-b", "name": "读信人", "text": "她等在门外。",
                 "active_uses": [{"expression_id": "e-letter"}],
             }], previous_segments=[], open_relations=[],
         )

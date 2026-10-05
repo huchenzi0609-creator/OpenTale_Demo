@@ -11,6 +11,8 @@ const EVENTS: Record<string, string> = {
   error: "安全中止",
   budget_exhausted: "达到预算",
   forked: "独立分支",
+  reading_created: "创建阅读路径",
+  reading_updated: "更新阅读设置",
 };
 
 export default function Diagnostics({

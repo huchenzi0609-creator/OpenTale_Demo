@@ -37,6 +37,16 @@ class ForkRun(Record):
     limits: Limits | None = None
 
 
+class CreateReading(Record):
+    title: str = Field(min_length=1, max_length=120)
+    start_position_id: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+
+
+class ConfigureReading(Record):
+    enabled: bool
+
+
 class Counterfactual(Record):
     target_position_id: str = Field(min_length=1, max_length=80)
     source_position_id: str = Field(min_length=1, max_length=80)
@@ -66,7 +76,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         yield
         await runner.shutdown()
 
-    app = FastAPI(title="OpenTale", version="0.2.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="OpenTale", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.root = store, runner, config_root
     app.state.presets = library
 
@@ -141,7 +151,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.2.0"}
+        return {"ok": True, "version": "0.3.0"}
 
     @app.get("/api/config")
     async def config():
@@ -214,6 +224,20 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
     @app.patch("/api/runs/{run_id}/limits")
     async def update_limits(run_id: str, body: Limits):
         return runner.update_limits(run_id, body)
+
+    @app.post("/api/runs/{run_id}/readings")
+    async def create_reading(run_id: str, body: CreateReading):
+        if contains_credential(body.model_dump(), runner.settings.api_key.get_secret_value()):
+            raise KernelError("PRIVATE_DATA_REJECTED", "密钥只能填写到本机配置文件，不能用于阅读配置。")
+        return runner.add_reading(run_id, body.title, body.start_position_id, body.enabled)
+
+    @app.patch("/api/runs/{run_id}/readings/{reading_id}")
+    async def configure_reading(run_id: str, reading_id: str, body: ConfigureReading):
+        return runner.set_reading_enabled(run_id, reading_id, body.enabled)
+
+    @app.post("/api/runs/{run_id}/readings/{reading_id}/present")
+    async def present_reading(run_id: str, reading_id: str):
+        return await runner.present_reading(run_id, reading_id)
 
     @app.post("/api/runs/{run_id}/step")
     async def step(run_id: str):

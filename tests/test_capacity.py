@@ -11,11 +11,11 @@ from opentale.replay import verify_replay
 from pydantic import ValidationError
 
 
-def test_decimal_512k_budget_is_accepted_and_excess_is_rejected():
+def test_decimal_512m_budget_is_accepted_and_excess_is_rejected():
     assert Limits().max_tokens == DEFAULT_TOKEN_BUDGET == 128000
-    assert Limits(**budget_bounds()).max_tokens == MAX_TOKEN_BUDGET == 512000
+    assert Limits(**budget_bounds()).max_tokens == MAX_TOKEN_BUDGET == 5120000
     with pytest.raises(ValidationError):
-        Limits(max_tokens=512001)
+        Limits(max_tokens=5120001)
 
 
 def test_api_publishes_bounds_and_accepts_512k_without_generating(tmp_path):
@@ -27,7 +27,7 @@ def test_api_publishes_bounds_and_accepts_512k_without_generating(tmp_path):
         })
         assert result.status_code == 200 and result.json()["run"]["usage"]["calls"] == 0
         rejected = client.post("/api/runs", json={
-            "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 512001},
+            "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 5120001},
         })
         assert rejected.status_code == 422
 

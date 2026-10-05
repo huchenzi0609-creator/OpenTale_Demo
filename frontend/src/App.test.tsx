@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { Snapshot } from "./types";
+import type { ReadingTrack, Segment, Snapshot } from "./types";
 
 const fixture = (): Snapshot => ({
   schema_version: 1,
@@ -188,6 +188,204 @@ async function createRun() {
   await screen.findByRole("heading", { name: "共同表达实验" });
 }
 
+const segment = (id: string, text: string, focus = "a", revision = 1): Segment => ({
+  id, revision, text, focus_position_id: focus, expression_ids: ["shared"], reinterprets: [],
+});
+const reading = (id: string, title: string, start: string | null,
+  story: Segment[] = [], enabled = true): ReadingTrack => ({
+  id, title, start_position_id: start, created_revision: 0, enabled, story,
+  reading: { focus_position_id: story.at(-1)?.focus_position_id ?? null, open_relations: [], interpretations: [] },
+  last_error: null,
+});
+
+describe("parallel readings", () => {
+  beforeEach(() => {
+    snapshot.continuations = snapshot.positions.map((position) => ({
+      position_id: position.id, frame_revision: 1, status: "ready", seed_text: "",
+      condition_fingerprint: "private-frame", dependencies: ["shared"],
+      surface: `${position.name}当前的续延`, resume_count: 1,
+    }));
+  });
+  it("creates a different starting reading without generating or copying the primary history", async () => {
+    snapshot.schema_version = 2;
+    snapshot.run.revision = 1;
+    snapshot.story = [segment("primary", "主阅读已经写下的历史。")];
+    snapshot.reading_tracks = [reading("main", "主阅读", "a", snapshot.story)];
+    requestOverrides["POST /api/runs/run-1/readings"] = () => response({ ...snapshot,
+      reading_tracks: [...snapshot.reading_tracks!, reading("secondary", "读信人的阅读", "b")] });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "＋ 新建阅读" }));
+    const form = screen.getByRole("form", { name: "新建独立阅读" });
+    expect(within(form).getByText(/新增只保存阅读设置，不调用模型/)).toBeInTheDocument();
+    fireEvent.change(within(form).getByLabelText("阅读名称"), { target: { value: "读信人的阅读" } });
+    fireEvent.change(within(form).getByLabelText("阅读起始人物"), { target: { value: "b" } });
+    fireEvent.click(within(form).getByRole("button", { name: "创建阅读（不调用模型）" }));
+    await screen.findByRole("region", { name: "阅读：读信人的阅读" });
+    expect(screen.getByLabelText("选择阅读")).toHaveValue("secondary");
+    expect(screen.queryByText("主阅读已经写下的历史。")).not.toBeInTheDocument();
+    expect(screen.getByText(/起始位置：读信人/)).toBeInTheDocument();
+    expect(screen.getByText(/完整窗口通常需要 8 次调用/)).toBeInTheDocument();
+    const create = fetchMock.mock.calls.find(([url]) => url === "/api/runs/run-1/readings");
+    expect(JSON.parse(create![1]!.body as string)).toEqual({ title: "读信人的阅读", start_position_id: "b", enabled: true });
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+    await waitFor(() => expect(screen.queryByRole("form", { name: "新建独立阅读" })).not.toBeInTheDocument());
+  });
+
+  it("manually presents just the selected reading and prevents a duplicate for the same revision", async () => {
+    snapshot.run.revision = 1;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a", [segment("first", "主阅读的正文。")]),
+      reading("secondary", "读信人的阅读", "b")];
+    requestOverrides["POST /api/runs/run-1/readings/secondary/present"] = () => response({ ...snapshot,
+      run: { ...snapshot.run, usage: { calls: 1, input_tokens: 100, output_tokens: 40 } },
+      reading_tracks: [snapshot.reading_tracks![0], reading("secondary", "读信人的阅读", "b",
+        [segment("second", "她从回信的背面，想起窗外的雨。", "b")])] });
+    await createRun();
+    fireEvent.change(screen.getByLabelText("选择阅读"), { target: { value: "secondary" } });
+    fireEvent.click(screen.getByRole("button", { name: "从当前世界生成一段" }));
+    await screen.findByText("她从回信的背面，想起窗外的雨。");
+    expect(screen.getByRole("button", { name: "本版本已呈现" })).toBeDisabled();
+    expect(screen.queryByText("主阅读的正文。")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/present"))).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start)$/.test(url))).toBe(false);
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("R1");
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("140 / 40,000");
+  });
+
+  it("serializes the final world after the window limit without requiring another world window", async () => {
+    snapshot.run.revision = 1;
+    snapshot.run.status = "budget_exhausted";
+    snapshot.run.limits.max_windows = 1;
+    snapshot.run.usage.windows = 1;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a", [segment("first", "已完成世界的主阅读。")]),
+      reading("secondary", "读信人的阅读", "b")];
+    requestOverrides["POST /api/runs/run-1/readings/secondary/present"] = () => response({ ...snapshot,
+      run: { ...snapshot.run, usage: { ...snapshot.run.usage, calls: 1 } },
+      reading_tracks: [snapshot.reading_tracks![0], reading("secondary", "读信人的阅读", "b",
+        [segment("second", "她的阅读从最终的世界开始。", "b")])] });
+    await createRun();
+    expect(screen.getByRole("button", { name: "单步" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "＋ 新建阅读" })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("选择阅读"), { target: { value: "secondary" } });
+    const present = screen.getByRole("button", { name: "从当前世界生成一段" });
+    expect(present).toBeEnabled();
+    fireEvent.click(present);
+    await screen.findByText("她的阅读从最终的世界开始。");
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("1 / 1");
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("R1");
+    expect(fetchMock.mock.calls.filter(([url]) => url.endsWith("/present"))).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start)$/.test(url))).toBe(false);
+  });
+
+  it.each(["calls", "tokens"])("prevents manual presentation when actual %s budget is consumed", async (budget) => {
+    snapshot.run.revision = 1;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a")];
+    if (budget === "calls") snapshot.run.usage.calls = snapshot.run.limits.max_calls;
+    else snapshot.run.usage = { ...snapshot.run.usage, input_tokens: 1000, reserved_tokens: 1000, unknown_tokens: 38000 };
+    await createRun();
+    expect(screen.getByRole("button", { name: "从当前世界生成一段" })).toBeDisabled();
+    expect(screen.getByText(/调用或 Token 预算已用尽/)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith("/present"))).toBe(false);
+  });
+
+  it("toggles automatic continuation without generation and retains each reading's prose", async () => {
+    snapshot.run.revision = 1;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a", [segment("first", "主阅读的正文。")]),
+      reading("secondary", "读信人的阅读", "b", [segment("second", "她读到了另一种过去。", "b")])];
+    requestOverrides["PATCH /api/runs/run-1/readings/secondary"] = () => response({ ...snapshot,
+      reading_tracks: snapshot.reading_tracks!.map((track) => track.id === "secondary" ? { ...track, enabled: false } : track) });
+    await createRun();
+    fireEvent.change(screen.getByLabelText("选择阅读"), { target: { value: "secondary" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "读信人的阅读自动续写" }));
+    await waitFor(() => expect(screen.getByRole("checkbox", { name: "读信人的阅读自动续写" })).not.toBeChecked());
+    expect(screen.getByText("她读到了另一种过去。")).toBeInTheDocument();
+    expect(screen.getByText(/完整窗口通常需要 7 次调用/)).toBeInTheDocument();
+    const patch = fetchMock.mock.calls.find(([url]) => url === "/api/runs/run-1/readings/secondary");
+    expect(patch![1]!.method).toBe("PATCH");
+    expect(JSON.parse(patch![1]!.body as string)).toEqual({ enabled: false });
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+  });
+
+  it("compares all reading paths side by side without requests or exposing technical bindings", async () => {
+    snapshot.run.revision = 1;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a", [segment("first", "主阅读的正文。")]),
+      reading("secondary", "读信人的阅读", "b", [segment("second", "她读到了另一种过去。", "b")]),
+      reading("third", "旁观者的阅读", "c", [segment("third", "两封信的边缘在他眼里重合。", "c")])];
+    await createRun();
+    const before = fetchMock.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "并排对照" }));
+    for (const title of ["主阅读", "读信人的阅读", "旁观者的阅读"])
+      expect(screen.getByRole("region", { name: `阅读：${title}` })).toBeInTheDocument();
+    const prose = screen.getByRole("region", { name: "叙事正文" });
+    expect(prose).toHaveTextContent("两封信的边缘在他眼里重合。");
+    expect(prose).not.toHaveTextContent("internal-source-239");
+    expect(prose).not.toHaveTextContent("fingerprint-original");
+    expect(fetchMock.mock.calls).toHaveLength(before);
+    fireEvent.click(screen.getByRole("button", { name: "返回单条阅读" }));
+    expect(screen.queryByText("她读到了另一种过去。")).not.toBeInTheDocument();
+  });
+
+  it.each(["empty surface", "pending status", "missing current realization", "stale frame"])(
+    "prevents presentation of incomplete current continuations: %s", async (incomplete) => {
+    snapshot.run.revision = 1;
+    snapshot.pending = { base_revision: 0, committed: true, proposals: {},
+      realizations: { a: "one", b: "two", c: "three" }, presentations: {} };
+    if (incomplete === "empty surface") snapshot.continuations[1].surface = "";
+    if (incomplete === "pending status") snapshot.continuations[1].status = "pending";
+    if (incomplete === "missing current realization") delete snapshot.pending.realizations.b;
+    if (incomplete === "stale frame") snapshot.continuations[1].frame_revision = 0;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a")];
+    await createRun();
+    expect(screen.getByRole("button", { name: "从当前世界生成一段" })).toBeDisabled();
+    expect(screen.getByText(/请先完成人物续延/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "＋ 新建阅读" })).toBeEnabled();
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith("/present"))).toBe(false);
+  });
+
+  it("allows the complete current world while the next batch is drafted but not installed", async () => {
+    snapshot.run.status = "paused";
+    snapshot.run.revision = 1;
+    snapshot.pending = { base_revision: 1, committed: false,
+      proposals: { a: { surface: "下一版本的未安装提案" } }, realizations: {}, presentations: {} };
+    snapshot.reading_tracks = [reading("main", "主阅读", "a"), reading("secondary", "读信人的阅读", "b")];
+    await createRun();
+    fireEvent.change(screen.getByLabelText("选择阅读"), { target: { value: "secondary" } });
+    expect(screen.getByRole("button", { name: "从当前世界生成一段" })).toBeEnabled();
+    expect(screen.getByText(/构想 1\/3/)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith("/present"))).toBe(false);
+  });
+
+  it("shows per-reading failure and partial presentation progress without losing successful prose", async () => {
+    snapshot.run.status = "error";
+    snapshot.run.revision = 2;
+    snapshot.continuations.forEach((continuation) => { continuation.frame_revision = 2; });
+    snapshot.pending = { base_revision: 1, committed: true, proposals: {},
+      realizations: { a: "one", b: "two", c: "three" }, presentations: { main: { text: "主阅读已完成。" } } };
+    snapshot.reading_tracks = [reading("main", "主阅读", "a", [segment("first", "主阅读已完成。", "a", 2)]),
+      { ...reading("secondary", "读信人的阅读", "b"), last_error: { code: "MODEL_OUTPUT_INVALID", message: "阅读承接需要重试。", retryable: true } }];
+    await createRun();
+    expect(screen.getByText(/呈现 1\/2/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "并排对照" }));
+    expect(screen.getByText("主阅读已完成。")).toBeInTheDocument();
+    const failed = screen.getByRole("region", { name: "阅读：读信人的阅读" });
+    expect(failed).toHaveTextContent("阅读承接需要重试。");
+    expect(within(failed).getByRole("button", { name: "从当前世界生成一段" })).toBeEnabled();
+    expect(within(screen.getByRole("region", { name: "阅读：主阅读" })).getByRole("button", { name: "本版本已呈现" })).toBeDisabled();
+  });
+
+  it("locks paid generation and configuration during an active world but permits local comparison", async () => {
+    snapshot.run.status = "running";
+    snapshot.run.phase = "presenting";
+    snapshot.run.revision = 1;
+    snapshot.reading_tracks = [reading("main", "主阅读", "a"), reading("secondary", "读信人的阅读", "b")];
+    await createRun();
+    expect(screen.getByRole("button", { name: "＋ 新建阅读" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: "主阅读自动续写" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "从当前世界生成一段" })).toBeDisabled();
+    expect(screen.getByText(/本条阅读等待或正在呈现/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "并排对照" })).toBeEnabled();
+  });
+});
+
 describe("OpenTale workbench", () => {
   it("shows a fork's inherited revision independently of its reset window budget", async () => {
     snapshot.run.revision = 4;
@@ -291,20 +489,20 @@ describe("OpenTale workbench", () => {
     expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeDisabled();
   });
 
-  it("allows the 512K fallback budget while rejecting an excess or a fractional limit", async () => {
+  it("allows the 5.12M fallback budget while rejecting an excess or a fractional limit", async () => {
     render(<App />);
     const create = await screen.findByRole("button", { name: "＋ 创建实验" });
     await waitFor(() => expect(create).toBeEnabled());
     expect(screen.getByLabelText("Token 上限")).toHaveValue(128000);
-    for (const [label, value] of [["Token 上限", 512000], ["调用上限", 1000],
+    for (const [label, value] of [["Token 上限", 5120000], ["调用上限", 1000],
       ["并行位置", 8], ["窗口上限", 1000]] as const) {
       fireEvent.change(screen.getByLabelText(label), { target: { value: String(value) } });
       expect(create).toBeEnabled();
     }
-    fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "512001" } });
+    fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "5120001" } });
     expect(create).toBeDisabled();
-    expect(create).toHaveAccessibleDescription(/512,000/);
-    fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "512000" } });
+    expect(create).toHaveAccessibleDescription(/5,120,000/);
+    fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "5120000" } });
     fireEvent.change(screen.getByLabelText("调用上限"), { target: { value: "1.5" } });
     expect(create).toBeDisabled();
   });

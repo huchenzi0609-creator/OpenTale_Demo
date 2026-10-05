@@ -10,7 +10,7 @@ export const DEFAULT_LIMITS: Limits = {
 /** Compatibility bounds for servers or cached configuration without budget metadata. */
 export const FALLBACK_BUDGET_BOUNDS: Limits = {
   max_calls: 1000,
-  max_tokens: 512000,
+  max_tokens: 5120000,
   max_parallel: 8,
   max_windows: 1000,
 };

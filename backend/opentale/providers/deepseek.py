@@ -26,6 +26,7 @@ from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, 
 from opentale.security import contains_credential as _contains_credential
 
 from .base import ModelResult, ProviderError
+from .reading import eligible_candidates, required_focus, shared_expression_ids, validate_presentation
 
 T = TypeVar("T", bound=BaseModel)
 # Compatibility aliases for callers inspecting this provider's transport bounds.
@@ -410,17 +411,29 @@ text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅
         return ModelResult(result.value.text, result.input_tokens, result.output_tokens)
 
     async def present(self, frame: ReadingFrame) -> ModelResult[Presentation]:
+        # Check the local entry and common scopes before spending any model call.
+        eligible_candidates(frame)
         instructions = f"""
 你是一个局部阅读位置。选择 candidates 中正在生效的一处叙述，形成下一段可读正文。
-沿已有共同表达的用法展开，让新段落改变此前某部分如何被读；不要求统一过去或总结所有动作。
-focus_position_id 必须来自候选；expression_ids 仅使用候选 active_uses 中已有的表达ID。
-reinterprets 可以为空，否则仅引用 previous_segments 中的段落ID，且正文应实际参与重读。
+这是同一世界中的一条独立连续阅读。previous_segments 是这条阅读已经呈现的全部可用历史。
+start_position_id 是这条阅读的最初立足点；首段 required_focus_position_id 非空时，必须从该人物处进入。
+起点决定从何处看见这片生活，不预设独立的新世界，不要求之后固定在此人物。
+后续按 current_focus、open_relations、正在生效的共同用法以及本条阅读的未完之处决定如何转移焦点。
+让所选位置的 active_uses 中的 values 实际影响人物怎样继续；相互牵连应发生在正文里。
+沿已有共同表达的用法展开，让新段落改变此前某部分如何被读；不要求统一过去、另编与条件无关的支线，
+或把全局材料逐项复述。可以保留同一表达的不同归属与不完全重合的经历。
+focus_position_id 必须来自候选，并遵守非空 required_focus_position_id。
+expression_ids 仅使用所选焦点 active_uses 中已有的表达ID，且至少包含一项 shared_expression_ids。
+reinterprets 可以为空，否则仅引用本条 previous_segments 中的段落ID，且正文应实际参与重读。
 所有ID只在结构字段输出。text 不含段落编号、节点编号、括号引用、诊断说明或来源标注。
 text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇幅，不必用满上限。
 """
         data = {
             "revision": frame.revision,
+            "start_position_id": frame.start_position_id,
+            "required_focus_position_id": required_focus(frame),
             "current_focus": frame.current_focus,
+            "shared_expression_ids": sorted(shared_expression_ids(frame)),
             "previous_segments": [
                 {
                     key: segment[key]
@@ -460,15 +473,7 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇�
             for use in candidate.get("active_uses", [])
         }
         segments = {segment["id"] for segment in frame.previous_segments}
-        if (
-            value.focus_position_id not in positions
-            or not set(value.expression_ids).issubset(expressions)
-            or not set(value.reinterprets).issubset(segments)
-        ):
-            raise ProviderError(
-                "MODEL_OUTPUT_INVALID", "模型提出了无效的阅读承接。", True,
-                usage=(result.input_tokens, result.output_tokens),
-            )
+        validate_presentation(frame, value, usage=(result.input_tokens, result.output_tokens))
         self._check_prose(
             value.text, positions | expressions | segments, usage=(result.input_tokens, result.output_tokens)
         )

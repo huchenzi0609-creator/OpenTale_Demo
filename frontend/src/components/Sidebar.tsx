@@ -87,7 +87,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
           O<span>↗</span>
         </span>
         <span>
-          OpenTale<small>NARRATIVE LAB / 0.2</small>
+          OpenTale<small>NARRATIVE LAB / 0.3</small>
         </span>
       </a>
       <div className="sidebar-heading">
@@ -163,6 +163,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
             </label>
           ))}
           </div>
+          <p className="helper">并行上限同时约束人物生成与阅读呈现。多条阅读共享同一实验预算。</p>
           {snapshot && <div className="run-budget-actions">
             <p className="helper">当前存档：{snapshot.run.title}。更新只修改本实验上限，保留已有用量、结果与恢复点，不调用模型。</p>
             <button className="button secondary full"
