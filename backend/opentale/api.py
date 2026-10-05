@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field
 
-from .config import ConfigError, load_settings
+from .config import ConfigError, load_settings_with_diagnostics
 from .domain import Limits, Record
 from .kernel import KernelError
 from .presets import PresetDefinition, PresetError, PresetLibrary, initialize
@@ -54,7 +54,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
     config_root = root or Path(os.environ.get("OPENTALE_ROOT", PROJECT_ROOT))
     directory = data_dir or Path(os.environ.get("OPENTALE_DATA_DIR", PROJECT_ROOT / "runtime"))
     store = Store(directory)
-    settings = load_settings(config_root)
+    settings, configuration_diagnostics = load_settings_with_diagnostics(config_root)
     runner = Runner(store, settings)
     library = PresetLibrary(PROJECT_ROOT / "presets", directory / "presets")
     store.recover()
@@ -143,16 +143,17 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/config")
     async def config():
-        return runner.settings.public()
+        return {**runner.settings.public(), "diagnostics": configuration_diagnostics}
 
     @app.post("/api/config/reload")
     async def reload_config():
-        nonlocal settings
+        nonlocal settings, configuration_diagnostics
         if any(runner.busy(state.run.id) for state in store.list()):
             raise KernelError("RUN_BUSY", "请先暂停所有运行任务，再重新加载配置。")
-        settings = load_settings(config_root)
+        # Publish settings and their safe provenance from the same successful read.
+        settings, configuration_diagnostics = load_settings_with_diagnostics(config_root)
         runner.settings = settings
-        return settings.public()
+        return {**settings.public(), "diagnostics": configuration_diagnostics}
 
     @app.get("/api/presets")
     async def presets():

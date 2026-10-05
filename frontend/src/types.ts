@@ -134,6 +134,14 @@ export interface PublicConfig {
   model: string;
   timeout_seconds: number;
   max_output_tokens: number;
+  diagnostics?: {
+    config_file_path: string;
+    config_file_exists: boolean;
+    file_api_key_present: boolean;
+    environment_api_key_override: boolean;
+    environment_api_key_empty_override: boolean;
+    credential_source: "environment" | "file" | "none";
+  };
 }
 export interface Verification {
   ok: boolean;

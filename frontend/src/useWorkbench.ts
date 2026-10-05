@@ -49,6 +49,8 @@ export function useWorkbench() {
   const [booting, setBooting] = useState(true);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [createError, setCreateError] = useState("");
+  const [runControlFocusRequest, setRunControlFocusRequest] = useState(0);
   const [notice, setNotice] = useState("");
   const [pollError, setPollError] = useState("");
   const [verification, setVerification] = useState<Verification | null>(null);
@@ -63,6 +65,10 @@ export function useWorkbench() {
   const active = snapshot?.run.status === "running";
   const anyActive = active || runs.some((run) => run.status === "running");
   const preset = presets.find((item) => item.id === presetId);
+
+  useEffect(() => {
+    setCreateError("");
+  }, [presetId, provider, limits, config?.configured]);
 
   useEffect(() => {
     let live = true;
@@ -175,14 +181,18 @@ export function useWorkbench() {
       ...current.filter((item) => item.id !== next.run.id),
     ]);
   }
-  async function perform(label: string, action: () => Promise<void>) {
+  async function perform(
+    label: string,
+    action: () => Promise<void>,
+    onError: (message: string) => void = setError,
+  ) {
     setBusy(label);
     setError("");
     setNotice("");
     try {
       await action();
     } catch (cause) {
-      setError(errorText(cause));
+      onError(errorText(cause));
     } finally {
       setBusy("");
     }
@@ -249,8 +259,9 @@ export function useWorkbench() {
       (snapshot.run.usage.unknown_tokens ?? 0)
     : 0;
 
-  const createRun = () =>
-    perform("创建实验", async () => {
+  const createRun = () => {
+    setCreateError("");
+    return perform("创建实验", async () => {
       adopt(
         await post<Snapshot>("/runs", {
           preset_id: presetId,
@@ -259,7 +270,9 @@ export function useWorkbench() {
         }),
       );
       setTab("story");
-    });
+      setRunControlFocusRequest((current) => current + 1);
+    }, setCreateError);
+  };
   async function savePreset(draft: PresetDraft, original?: Preset) {
     const payload = presetPayload(draft);
     const result = original
@@ -358,6 +371,8 @@ export function useWorkbench() {
     busy,
     error,
     setError,
+    createError,
+    runControlFocusRequest,
     notice,
     pollError,
     verification,

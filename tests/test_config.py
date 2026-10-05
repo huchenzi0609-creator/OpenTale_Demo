@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 
 import pytest
-from opentale.config import ConfigError, Settings, load_settings
+from opentale.config import (
+    ConfigError,
+    Settings,
+    config_diagnostics,
+    load_settings,
+    load_settings_with_diagnostics,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +62,108 @@ def test_environment_overrides_file_even_when_key_is_explicitly_empty(tmp_path, 
     settings = load_settings(tmp_path)
     assert settings.public()["configured"] is False
     assert settings.model == "unit-model"
+
+
+def test_missing_file_diagnostics_use_the_exact_path_and_only_allowlisted_metadata(tmp_path):
+    diagnostics = config_diagnostics(tmp_path)
+    assert diagnostics == {
+        "config_file_path": str((tmp_path / ".env.local").resolve()),
+        "config_file_exists": False,
+        "file_api_key_present": False,
+        "environment_api_key_override": False,
+        "environment_api_key_empty_override": False,
+        "credential_source": "none",
+    }
+
+
+def test_bom_configuration_is_loaded_and_diagnostics_never_return_values(tmp_path):
+    dummy = "fixture-credential-for-diagnostics"
+    (tmp_path / ".env.local").write_text(
+        f"OPENTALE_API_KEY={dummy}\n"
+        "OPENTALE_BASE_URL=https://example.test/private\n"
+        "UNKNOWN_FIELD_WITH_SECRET=private-unknown-content\n",
+        encoding="utf-8-sig",
+    )
+    settings, diagnostics = load_settings_with_diagnostics(tmp_path)
+    assert settings.api_key.get_secret_value() == dummy
+    assert settings.public()["configured"] is True
+    assert diagnostics["config_file_exists"] is True
+    assert diagnostics["file_api_key_present"] is True
+    assert diagnostics["credential_source"] == "file"
+    public = json.dumps(diagnostics)
+    for private_text in (
+        dummy, "example.test", "private-unknown-content", "UNKNOWN_FIELD_WITH_SECRET", "base_url",
+    ):
+        assert private_text not in public
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_empty_environment_override_is_diagnosed_without_falling_back(tmp_path, monkeypatch, value):
+    (tmp_path / ".env.local").write_text("OPENTALE_API_KEY=file-fixture-key\n", encoding="utf-8")
+    monkeypatch.setenv("OPENTALE_API_KEY", value)
+    settings, diagnostics = load_settings_with_diagnostics(tmp_path)
+    assert settings.public()["configured"] is False
+    assert diagnostics["file_api_key_present"] is True
+    assert diagnostics["environment_api_key_override"] is True
+    assert diagnostics["environment_api_key_empty_override"] is True
+    assert diagnostics["credential_source"] == "environment"
+    assert "file-fixture-key" not in json.dumps(diagnostics)
+
+
+def test_nonempty_environment_override_is_diagnosed_without_exposing_credentials(tmp_path, monkeypatch):
+    (tmp_path / ".env.local").write_text("OPENTALE_API_KEY=file-fixture-key\n", encoding="utf-8")
+    monkeypatch.setenv("OPENTALE_API_KEY", "environment-fixture-key")
+    settings, diagnostics = load_settings_with_diagnostics(tmp_path)
+    assert settings.api_key.get_secret_value() == "environment-fixture-key"
+    assert diagnostics["environment_api_key_override"] is True
+    assert diagnostics["environment_api_key_empty_override"] is False
+    assert diagnostics["credential_source"] == "environment"
+    assert "environment-fixture-key" not in json.dumps(diagnostics)
+
+
+@pytest.mark.parametrize("file_content", ["OPENTALE_API_KEY=\n", 'OPENTALE_API_KEY="   "\n',
+                                           "DEEPSEEK_API_KEY=wrong-field-fixture-key\n"])
+def test_blank_or_nonstandard_file_keys_are_not_reported_as_present(tmp_path, file_content):
+    (tmp_path / ".env.local").write_text(file_content, encoding="utf-8")
+    settings, diagnostics = load_settings_with_diagnostics(tmp_path)
+    assert settings.public()["configured"] is False
+    assert diagnostics["config_file_exists"] is True
+    assert diagnostics["file_api_key_present"] is False
+    assert diagnostics["credential_source"] == "none"
+    assert "wrong-field-fixture-key" not in json.dumps(diagnostics)
+
+
+def test_combined_settings_and_diagnostics_load_parse_the_file_once(tmp_path, monkeypatch):
+    import opentale.config as configuration
+
+    (tmp_path / ".env.local").write_text("OPENTALE_API_KEY=fixture-key\n", encoding="utf-8")
+    real_parser = configuration.dotenv_values
+    calls = []
+
+    def counted_parser(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_parser(*args, **kwargs)
+
+    monkeypatch.setattr(configuration, "dotenv_values", counted_parser)
+    settings, diagnostics = load_settings_with_diagnostics(tmp_path)
+    assert settings.public()["configured"] is True
+    assert diagnostics["file_api_key_present"] is True
+    assert len(calls) == 1
+
+
+def test_credentials_accidentally_in_directory_names_are_redacted_from_diagnostics(tmp_path, monkeypatch):
+    file_dummy = "file-fixture-key"
+    environment_dummy = "environment-fixture-key"
+    root = tmp_path / file_dummy / environment_dummy
+    root.mkdir(parents=True)
+    (root / ".env.local").write_text(f"OPENTALE_API_KEY={file_dummy}\n", encoding="utf-8")
+    monkeypatch.setenv("OPENTALE_API_KEY", environment_dummy)
+    settings, diagnostics = load_settings_with_diagnostics(root)
+    assert settings.public()["configured"] is True
+    public = json.dumps(diagnostics)
+    assert file_dummy not in public
+    assert environment_dummy not in public
+    assert diagnostics["config_file_path"].endswith("/[已隐藏]/[已隐藏]/.env.local")
 
 
 @pytest.mark.parametrize(

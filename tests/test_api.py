@@ -36,3 +36,45 @@ def test_cross_origin_write_rejected_and_live_requires_key(tmp_path):
         result = client.post("/api/runs", json={**request, "provider": "deepseek"})
         assert result.status_code == 503 and "API_KEY_MISSING" in result.text
         assert client.get("/api/verify").json()["ok"]
+
+
+def test_configuration_diagnostics_follow_reload_without_exposing_values(tmp_path, monkeypatch):
+    for field in (
+        "OPENTALE_API_KEY", "OPENTALE_BASE_URL", "OPENTALE_MODEL", "OPENTALE_TIMEOUT_SECONDS",
+        "OPENTALE_MAX_OUTPUT_TOKENS", "OPENTALE_PORT",
+    ):
+        monkeypatch.delenv(field, raising=False)
+    with TestClient(create_app(tmp_path, tmp_path / "data")) as client:
+        initial = client.get("/api/config").json()
+        assert initial["diagnostics"]["config_file_path"] == str(tmp_path / ".env.local")
+        assert not initial["diagnostics"]["config_file_exists"]
+        assert initial["diagnostics"]["credential_source"] == "none"
+
+        credential = "fixture-configuration-sentinel"
+        file = tmp_path / ".env.local"
+        file.write_text(f"OPENTALE_API_KEY={credential}\nOPENTALE_BASE_URL=https://example.test\n")
+        # GET describes the active snapshot; only explicit reload adopts the file.
+        assert not client.get("/api/config").json()["configured"]
+        loaded = client.post("/api/config/reload")
+        assert loaded.status_code == 200
+        current = loaded.json()
+        assert current["configured"]
+        assert current["diagnostics"]["file_api_key_present"]
+        assert current["diagnostics"]["credential_source"] == "file"
+        assert credential not in loaded.text and "example.test" not in loaded.text
+
+        file.write_text(f"OPENTALE_API_KEY={credential}\nOPENTALE_MODEL=invalid model\n")
+        invalid = client.post("/api/config/reload")
+        assert invalid.status_code == 422 and credential not in invalid.text
+        assert client.get("/api/config").json() == current
+
+        file.write_text(f"OPENTALE_API_KEY={credential}\n")
+        monkeypatch.setenv("OPENTALE_API_KEY", "")
+        overridden = client.post("/api/config/reload")
+        assert overridden.status_code == 200
+        metadata = overridden.json()
+        assert not metadata["configured"]
+        assert metadata["diagnostics"]["file_api_key_present"]
+        assert metadata["diagnostics"]["environment_api_key_empty_override"]
+        assert metadata["diagnostics"]["credential_source"] == "environment"
+        assert credential not in overridden.text

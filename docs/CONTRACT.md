@@ -34,7 +34,7 @@ An accepted batch must freshly rebind at least one shared position/expression/ro
 
 `make_provider(mode: str, settings: Settings)` constructs `fixture` or `deepseek`.
 
-Config `load_settings(root: Path) -> Settings`. `Settings` fields `api_key` (SecretStr), `base_url`, `model`, `timeout_seconds`, `max_output_tokens`, `port`. `Settings.public()` exposes only provider, configured boolean, model, timeout/max output, **no key and no base URL**. `.env.local` loaded without mutating global environment; environment overrides allowed. Config errors sanitized. Only HTTPS remote endpoints or HTTP loopback accepted. Changing configuration requires UI reload (allowed only if no live task).
+Config `load_settings(root: Path) -> Settings` remains compatible. `load_settings_with_diagnostics(root)` returns settings and safe provenance from the same read. `Settings` fields `api_key` (SecretStr), `base_url`, `model`, `timeout_seconds`, `max_output_tokens`, `port`. `Settings.public()` exposes only provider, configured boolean, model, timeout/max output, **no key and no base URL**. `.env.local` accepts UTF-8 with or without BOM and loads without mutating process environment. Environment overrides remain authoritative, including an explicitly empty key. Config errors are sanitized. Only HTTPS remote endpoints or HTTP loopback are accepted. Changing configuration requires UI reload (allowed only if no live task).
 
 ## HTTP API (root implements)
 
@@ -50,7 +50,7 @@ Preset writes accept up to 1 MiB of HTTP data; all other writes retain the small
 
 `GET /api/health` -> `{ok:true, version:"0.2.0"}`
 
-`GET /api/config`, `POST /api/config/reload` -> safe Settings.public.
+`GET /api/config`, `POST /api/config/reload` -> safe Settings.public plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
 
 `GET /api/presets` -> `{presets:[{id,name,description,positions:[{id,name,seed}],expressions:[...]}]}`
 

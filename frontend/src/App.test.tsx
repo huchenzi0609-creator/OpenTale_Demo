@@ -291,6 +291,117 @@ describe("OpenTale workbench", () => {
     expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeDisabled();
   });
 
+  it("explains missing live configuration next to creation and enables it after a safe reload", async () => {
+    requestOverrides["POST /api/config/reload"] = () => response({
+      provider: "deepseek", configured: true, model: "deepseek-flash",
+      timeout_seconds: 120, max_output_tokens: 2048,
+    });
+    render(<App />);
+    const setup = screen.getByRole("region", { name: "创建实验" });
+    await waitFor(() => expect(within(setup).getByRole("button", { name: "＋ 创建实验" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("生成方式"), { target: { value: "deepseek" } });
+    const create = within(setup).getByRole("button", { name: "＋ 创建实验" });
+    expect(create).toBeDisabled();
+    expect(create).toHaveAccessibleDescription(/DeepSeek 尚未配置/);
+    expect(within(setup).getByText(/DeepSeek 尚未配置/)).toBeInTheDocument();
+    expect(within(setup).getByText("OPENTALE_API_KEY")).toBeInTheDocument();
+    expect(within(setup).getByText(/Opentale_Demo\/\.env.local/)).toBeInTheDocument();
+    fireEvent.click(create);
+    expect(fetchMock.mock.calls.some(([url, options]) => url === "/api/runs" && options?.method === "POST")).toBe(false);
+    fireEvent.click(within(setup).getByRole("button", { name: "刷新模型配置" }));
+    await waitFor(() => expect(create).toBeEnabled());
+    expect(within(setup).queryByText(/DeepSeek 尚未配置/)).not.toBeInTheDocument();
+    fireEvent.click(create);
+    await screen.findByRole("region", { name: "运行控制" });
+    const request = fetchMock.mock.calls.find(([url, options]) => url === "/api/runs" && options?.method === "POST");
+    expect(JSON.parse(request![1]!.body as string).provider).toBe("deepseek");
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith("/start") || url.endsWith("/step"))).toBe(false);
+    expect(document.querySelector("input[type=password]")).toBeNull();
+  });
+
+  it("shows a creation failure locally once and preserves the existing experiment", async () => {
+    await createRun();
+    requestOverrides["POST /api/runs"] = () => response({
+      error: { code: "PRESET_NOT_FOUND", message: "所选预设已不存在，请重新选择。", retryable: false },
+    }, 404);
+    fireEvent.click(screen.getByRole("button", { name: "＋ 创建实验" }));
+    const setup = screen.getByRole("region", { name: "创建实验" });
+    expect(await within(setup).findByRole("alert")).toHaveTextContent("PRESET_NOT_FOUND");
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(within(screen.getByRole("main")).queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "运行控制" })).toHaveTextContent("共同表达实验");
+    expect(within(setup).getByRole("button", { name: "＋ 创建实验" })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("调用上限"), { target: { value: "16" } });
+    expect(within(setup).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      name: "an empty environment override",
+      diagnostics: {
+        config_file_exists: true, file_api_key_present: true,
+        environment_api_key_override: true, environment_api_key_empty_override: true,
+      },
+      explanation: /空环境变量覆盖了本机文件/,
+      remedy: /启动本地服务时移除/,
+    },
+    {
+      name: "a missing standard credential in the saved file",
+      diagnostics: {
+        config_file_exists: true, file_api_key_present: false,
+        environment_api_key_override: false, environment_api_key_empty_override: false,
+      },
+      explanation: /未读取到非空的 OPENTALE_API_KEY/,
+      remedy: /并确认已保存/,
+    },
+    {
+      name: "a missing configuration file",
+      diagnostics: {
+        config_file_exists: false, file_api_key_present: false,
+        environment_api_key_override: false, environment_api_key_empty_override: false,
+      },
+      explanation: /当前服务未找到模型配置文件/,
+      remedy: /创建配置文件/,
+    },
+  ])("explains $name using safe server diagnostics and the actual configuration path", async ({ diagnostics, explanation, remedy }) => {
+    const actualPath = "/private/local-experiment/.env.local";
+    requestOverrides["GET /api/config"] = () => response({
+      provider: "deepseek", configured: false, model: "deepseek-flash",
+      timeout_seconds: 120, max_output_tokens: 2048,
+      diagnostics: { ...diagnostics, config_file_path: actualPath, credential_source: "none" },
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("生成方式"), { target: { value: "deepseek" } });
+    const setup = screen.getByRole("region", { name: "创建实验" });
+    const create = within(setup).getByRole("button", { name: "＋ 创建实验" });
+    expect(create).toBeDisabled();
+    expect(create).toHaveAccessibleDescription(explanation);
+    expect(within(setup).getByText(remedy)).toBeInTheDocument();
+    expect(within(setup).getByText(actualPath)).toBeInTheDocument();
+    expect(document.querySelector("input[type=password]")).toBeNull();
+    expect(fetchMock.mock.calls.some(([url, options]) => url === "/api/runs" && options?.method === "POST")).toBe(false);
+  });
+
+  it("focuses and reveals newly created run controls without jumping on later updates", async () => {
+    const scroll = vi.fn();
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scroll });
+    try {
+      await createRun();
+      const controls = screen.getByRole("region", { name: "运行控制" });
+      expect(controls).toHaveFocus();
+      expect(scroll).toHaveBeenCalledTimes(1);
+      expect(scroll.mock.contexts[0]).toBe(controls);
+      fireEvent.click(screen.getByRole("button", { name: "单步" }));
+      await screen.findByText("他拿起信，窗外的雨停了。");
+      expect(scroll).toHaveBeenCalledTimes(1);
+    } finally {
+      if (descriptor) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", descriptor);
+      else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
+    }
+  });
+
   it("steps into prose while keeping technical provenance in its separate projection", async () => {
     await createRun();
     fireEvent.click(screen.getByRole("button", { name: "单步" }));

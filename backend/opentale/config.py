@@ -6,6 +6,7 @@ import ipaddress
 import os
 import re
 from pathlib import Path
+from typing import Literal, TypedDict
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
@@ -109,16 +110,72 @@ _ENV_FIELDS = {
 }
 
 
+class ConfigDiagnostics(TypedDict):
+    """A fixed allowlist of local configuration metadata, never credential contents."""
+
+    config_file_path: str
+    config_file_exists: bool
+    file_api_key_present: bool
+    environment_api_key_override: bool
+    environment_api_key_empty_override: bool
+    credential_source: Literal["environment", "file", "none"]
+
+
+def _read_configuration(root: Path) -> tuple[dict[str, object], ConfigDiagnostics]:
+    """Read file and allowlisted environment entries once for a consistent snapshot."""
+    try:
+        local_file = (root / ".env.local").resolve()
+        file_exists = local_file.exists()
+        local = (
+            dotenv_values(local_file, interpolate=False, encoding="utf-8-sig")
+            if file_exists else {}
+        )
+        environment = {name: os.environ[name] for name in _ENV_FIELDS if name in os.environ}
+        values = {
+            field: environment[variable] if variable in environment else local[variable]
+            for variable, field in _ENV_FIELDS.items()
+            if variable in environment or local.get(variable) is not None
+        }
+        file_key = (local.get("OPENTALE_API_KEY") or "").strip()
+        environment_key = (environment.get("OPENTALE_API_KEY") or "").strip()
+        file_key_present = bool(file_key)
+        environment_override = "OPENTALE_API_KEY" in environment
+        public_path = str(local_file)
+        for credential in sorted({file_key, environment_key} - {""}, key=len, reverse=True):
+            public_path = public_path.replace(credential, "[已隐藏]")
+        diagnostics: ConfigDiagnostics = {
+            "config_file_path": public_path,
+            "config_file_exists": file_exists,
+            "file_api_key_present": file_key_present,
+            "environment_api_key_override": environment_override,
+            "environment_api_key_empty_override": (
+                environment_override and not environment_key
+            ),
+            "credential_source": (
+                "environment" if environment_override else "file" if file_key_present else "none"
+            ),
+        }
+        return values, diagnostics
+    except (OSError, UnicodeError, ValueError):
+        raise ConfigError() from None
+
+
+def load_settings_with_diagnostics(root: Path) -> tuple[Settings, ConfigDiagnostics]:
+    """Load settings and their metadata together; no interpolation or environment mutation."""
+    values, diagnostics = _read_configuration(root)
+    try:
+        return Settings.model_validate(values), diagnostics
+    except (ValueError, ValidationError):
+        raise ConfigError() from None
+
+
 def load_settings(root: Path) -> Settings:
     """Load one ignored file without interpolating it or mutating process environment."""
-    try:
-        local_file = root / ".env.local"
-        local = dotenv_values(local_file, interpolate=False) if local_file.exists() else {}
-        values = {
-            field: os.environ[variable] if variable in os.environ else local[variable]
-            for variable, field in _ENV_FIELDS.items()
-            if variable in os.environ or local.get(variable) is not None
-        }
-        return Settings.model_validate(values)
-    except (OSError, UnicodeError, ValueError, ValidationError):
-        raise ConfigError() from None
+    settings, _ = load_settings_with_diagnostics(root)
+    return settings
+
+
+def config_diagnostics(root: Path) -> ConfigDiagnostics:
+    """Inspect only source metadata; use the combined loader when settings are also needed."""
+    _, diagnostics = _read_configuration(root)
+    return diagnostics

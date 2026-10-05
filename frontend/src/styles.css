@@ -267,6 +267,31 @@ details p {
 .full {
   width: 100%;
 }
+.creation-feedback {
+  grid-column: 1 / -1;
+  overflow-wrap: anywhere;
+}
+.creation-config-help {
+  margin-top: 10px;
+}
+.creation-error {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #f2d5c8;
+  border-radius: 7px;
+  background: #fff0e9;
+  color: #9d5840;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.creation-error strong,
+.creation-error span {
+  display: block;
+}
+.run-toolbar:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 4px;
+}
 .text-button {
   padding: 3px 0;
   background: transparent;

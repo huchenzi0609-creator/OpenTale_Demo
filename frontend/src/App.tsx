@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { useWorkbench } from "./useWorkbench";
 import Sidebar from "./components/Sidebar";
 import StoryReader from "./components/StoryReader";
@@ -49,7 +50,14 @@ export default function App() {
     verify,
     reconnect,
     runAction,
+    runControlFocusRequest,
   } = workbench;
+  const runControls = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!runControlFocusRequest || !runControls.current) return;
+    runControls.current.focus({ preventScroll: true });
+    runControls.current.scrollIntoView?.({ block: "start", behavior: "auto" });
+  }, [runControlFocusRequest]);
   return (
     <div className="app-shell">
       <Sidebar model={workbench} />
@@ -153,7 +161,7 @@ export default function App() {
           </section>
         ) : (
           <>
-            <section className="run-toolbar panel" aria-label="运行控制">
+            <section className="run-toolbar panel" aria-label="运行控制" tabIndex={-1} ref={runControls}>
               <div className="run-identity">
                 <p className="eyebrow">
                   {snapshot.run.provider === "fixture"

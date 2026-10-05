@@ -34,12 +34,43 @@ export default function Sidebar({ model }: { model: Workbench }) {
     preset,
     disabled,
     validLimits,
+    createError,
     createRun,
     savePreset,
     reloadConfig,
     reloadLibrary,
     selectRun,
   } = model;
+  const needsConfig = provider === "deepseek" && !config?.configured;
+  const diagnostics = config?.diagnostics;
+  const keyPath = diagnostics?.config_file_path ?? KEY_PATH;
+  const configBlockReason = !config
+    ? "尚未取得模型配置状态，暂时无法创建实时实验。"
+    : diagnostics?.environment_api_key_empty_override
+      ? "OPENTALE_API_KEY 的空环境变量覆盖了本机文件，DeepSeek 尚未配置。"
+      : diagnostics && !diagnostics.config_file_exists
+        ? "当前服务未找到模型配置文件，DeepSeek 尚未配置。"
+        : diagnostics && !diagnostics.file_api_key_present
+          ? "配置文件中未读取到非空的 OPENTALE_API_KEY，DeepSeek 尚未配置。"
+          : "DeepSeek 尚未配置，暂时无法创建实时实验。";
+  const configHelp = diagnostics?.environment_api_key_empty_override
+    ? <>启动本地服务时移除 <code>OPENTALE_API_KEY</code> 的空环境覆盖，再刷新模型配置。本机配置文件为 <code>{keyPath}</code>。</>
+    : diagnostics && !diagnostics.config_file_exists
+      ? <>请在当前服务读取的本机路径 <code>{keyPath}</code> 创建配置文件，填写 <code>OPENTALE_API_KEY</code> 并保存，再刷新模型配置。</>
+      : diagnostics && !diagnostics.file_api_key_present
+        ? <>请检查当前服务读取的本机文件 <code>{keyPath}</code> 中是否填写了 <code>OPENTALE_API_KEY</code>，并确认已保存，再刷新模型配置。</>
+        : <>请检查本机文件 <code>{keyPath}</code> 的 <code>OPENTALE_API_KEY</code> 配置，保存后刷新模型配置。</>;
+  const createDisabledReason = booting
+    ? "正在读取本地服务与预设，完成后即可创建实验。"
+    : disabled
+      ? `正在${busy}，完成后可创建实验。`
+      : !preset
+        ? "尚无可用的初始叙事，请选择或保存一份预设。"
+        : !validLimits
+          ? "预算须为范围内的正整数：调用 ≤ 200，Token ≤ 500,000，并行 ≤ 6，窗口 ≤ 100。"
+          : needsConfig
+            ? configBlockReason
+            : "";
   return (
     <aside className="sidebar">
       <a className="brand" href="#main" aria-label="OpenTale 进入实验">
@@ -131,25 +162,30 @@ export default function Sidebar({ model }: { model: Workbench }) {
         {provider === "deepseek" && preset && <p className="helper budget-estimate">
           {preset.positions.length} 位人物的完整窗口通常需要 {preset.positions.length * 2 + 1} 次调用，重试另计。请先用少量窗口验证。
         </p>}
-        {!validLimits && (
-          <p className="helper">
-            预算须为范围内的正整数：调用 ≤ 200，Token ≤ 500,000，并行 ≤ 6，窗口
-            ≤ 100。
-          </p>
-        )}
         <button
           className="button primary full"
-          disabled={
-            disabled ||
-            booting ||
-            !presetId ||
-            !validLimits ||
-            (provider === "deepseek" && !config?.configured)
-          }
+          disabled={!!createDisabledReason}
+          aria-describedby={[
+            createDisabledReason && "create-disabled-reason",
+            needsConfig && "create-config-help",
+            createError && "create-error",
+          ].filter(Boolean).join(" ") || undefined}
           onClick={() => void createRun()}
         >
           {busy === "创建实验" ? "正在创建…" : "＋ 创建实验"}
         </button>
+        {createDisabledReason && <p className="helper creation-feedback" id="create-disabled-reason" role="status">
+          {createDisabledReason}
+        </p>}
+        {needsConfig && <div className="creation-feedback creation-config-help" id="create-config-help">
+          <p className="helper">{configHelp} 也可选择离线夹具，直接创建实验。</p>
+          <button className="text-button" disabled={disabled || anyActive}
+            onClick={() => void reloadConfig()}>刷新模型配置</button>
+          {anyActive && <p className="helper">请先暂停运行中的实验，再刷新配置。</p>}
+        </div>}
+        {createError && <p className="creation-feedback creation-error" id="create-error" role="alert">
+          <strong>实验未能创建</strong><span>{createError}</span>
+        </p>}
       </section>
       <section className="config-panel" aria-label="API 配置状态">
         <div className="panel-row">
@@ -170,7 +206,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
             将 API key 填写到此文件的 <code>OPENTALE_API_KEY</code>{" "}
             字段。此处不提供密钥输入，也不读取密钥内容。
           </p>
-          <code className="file-path">{KEY_PATH}</code>
+          <code className="file-path">{keyPath}</code>
         </details>
         <button
           className="text-button"
