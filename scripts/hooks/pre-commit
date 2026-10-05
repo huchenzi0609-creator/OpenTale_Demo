@@ -1,0 +1,8 @@
+#!/bin/sh
+# Public source/index only: private staged paths are rejected without opening them.
+set -eu
+opentale_root="$(git rev-parse --show-toplevel)"
+if [ -x "$opentale_root/.venv/bin/python" ]; then
+    exec "$opentale_root/.venv/bin/python" "$opentale_root/scripts/check_secrets.py"
+fi
+exec python3 "$opentale_root/scripts/check_secrets.py"

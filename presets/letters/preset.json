@@ -1,0 +1,7 @@
+{
+  "id": "letters",
+  "name": "尚未写出的信",
+  "description": "一封信同时被写、被折、被读。三个局部可以各自承担不同的过去与来源，关系从表达中继续形成。",
+  "positions": [{"id":"writer","name":"闻舟"},{"id":"keeper","name":"许衡"},{"id":"reader","name":"阿澄"}],
+  "expressions": [{"id":"e-letter","text":"他把信折好，放在空椅子上。第一行写着：给尚未出生的你。"}]
+}

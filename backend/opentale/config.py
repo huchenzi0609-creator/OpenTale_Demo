@@ -1,0 +1,124 @@
+"""Backend-only configuration loading with a deliberately small public projection."""
+
+from __future__ import annotations
+
+import ipaddress
+import os
+import re
+from pathlib import Path
+from urllib.parse import urlsplit
+
+from dotenv import dotenv_values
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
+
+
+class ConfigError(Exception):
+    """A configuration failure that never includes user-supplied values."""
+
+    code = "CONFIG_INVALID"
+
+    def __init__(self, message: str = "配置无效，请检查本地配置文件中的地址与参数。") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class Settings(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    api_key: SecretStr = Field(default=SecretStr(""), exclude=True, repr=False)
+    base_url: str = Field(default="https://api.deepseek.com", repr=False)
+    model: str = Field(default="deepseek-flash", repr=False)
+    timeout_seconds: float = Field(default=90, ge=5, le=300)
+    max_output_tokens: int = Field(default=1600, ge=128, le=8192)
+    port: int = Field(default=8231, ge=1024, le=65535)
+
+    @field_validator("api_key", mode="before")
+    @classmethod
+    def validate_key(cls, value: object) -> SecretStr:
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if (
+            not isinstance(raw, str)
+            or len(raw) > 8192
+            or any(c in raw for c in "\r\n\x00")
+            or not raw.isascii()
+            or any(ord(c) < 32 or ord(c) > 126 for c in raw)
+        ):
+            raise ValueError("API credential format is invalid")
+        return SecretStr(raw.strip())
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value):
+            raise ValueError("Model identifier is invalid")
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        if any(c.isspace() or ord(c) < 32 for c in value):
+            raise ValueError("Endpoint format is invalid")
+        try:
+            parts = urlsplit(value)
+            hostname = parts.hostname
+            port = parts.port
+        except ValueError:
+            raise ValueError("Endpoint format is invalid") from None
+        if (
+            not hostname
+            or parts.scheme not in {"https", "http"}
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or (port is not None and not 1 <= port <= 65535)
+            or "\\" in value
+            or any(segment in {".", ".."} for segment in parts.path.split("/"))
+        ):
+            raise ValueError("Endpoint format is invalid")
+        if parts.scheme == "http":
+            loopback = hostname.lower() == "localhost"
+            try:
+                loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                pass
+            if not loopback:
+                raise ValueError("Remote endpoint requires HTTPS")
+        return value.rstrip("/")
+
+    def public(self) -> dict[str, object]:
+        """The only configuration representation permitted in APIs and exports."""
+        key = self.api_key.get_secret_value()
+        return {
+            "provider": "deepseek",
+            "configured": bool(key),
+            "model": "[已隐藏]" if key and key in self.model else self.model,
+            "timeout_seconds": self.timeout_seconds,
+            "max_output_tokens": self.max_output_tokens,
+            "port": self.port,
+        }
+
+
+_ENV_FIELDS = {
+    "OPENTALE_API_KEY": "api_key",
+    "OPENTALE_BASE_URL": "base_url",
+    "OPENTALE_MODEL": "model",
+    "OPENTALE_TIMEOUT_SECONDS": "timeout_seconds",
+    "OPENTALE_MAX_OUTPUT_TOKENS": "max_output_tokens",
+    "OPENTALE_PORT": "port",
+}
+
+
+def load_settings(root: Path) -> Settings:
+    """Load one ignored file without interpolating it or mutating process environment."""
+    try:
+        local_file = root / ".env.local"
+        local = dotenv_values(local_file, interpolate=False) if local_file.exists() else {}
+        values = {
+            field: os.environ[variable] if variable in os.environ else local[variable]
+            for variable, field in _ENV_FIELDS.items()
+            if variable in os.environ or local.get(variable) is not None
+        }
+        return Settings.model_validate(values)
+    except (OSError, UnicodeError, ValueError, ValidationError):
+        raise ConfigError() from None

@@ -1,0 +1,372 @@
+import { useEffect, useRef, useState } from "react";
+import { ApiError, post, request } from "./api";
+import type {
+  Counterfactual,
+  Limits,
+  Preset,
+  Provider,
+  PublicConfig,
+  ReplayVerification,
+  RunSummary,
+  Snapshot,
+  Verification,
+} from "./types";
+
+const DEFAULT_LIMITS: Limits = {
+  max_calls: 24,
+  max_tokens: 40000,
+  max_parallel: 3,
+  max_windows: 8,
+};
+const MAX_LIMITS: Limits = {
+  max_calls: 200,
+  max_tokens: 500000,
+  max_parallel: 6,
+  max_windows: 100,
+};
+const errorText = (error: unknown) =>
+  error instanceof ApiError
+    ? `${error.message}（${error.code}）`
+    : "操作未能完成，请稍后重试。";
+
+/** Owns server interaction, recoverable state and bounded polling; prose remains a separate view. */
+export function useWorkbench() {
+  const [config, setConfig] = useState<PublicConfig | null>(null);
+  const [presets, setPresets] = useState<Preset[]>([]);
+  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [presetId, setPresetId] = useState("");
+  const [provider, setProvider] = useState<Provider>("fixture");
+  const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [selectedRunId, setSelectedRunId] = useState("");
+  const [selectedPosition, setSelectedPosition] = useState("");
+  const [tab, setTab] = useState<"story" | "structure" | "diagnostics">(
+    "story",
+  );
+  const [booting, setBooting] = useState(true);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [pollError, setPollError] = useState("");
+  const [verification, setVerification] = useState<Verification | null>(null);
+  const [replayVerification, setReplayVerification] =
+    useState<ReplayVerification | null>(null);
+  const [counterfactual, setCounterfactual] = useState<Counterfactual | null>(
+    null,
+  );
+  const [counterSource, setCounterSource] = useState("");
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const selection = useRef(0);
+  const active = snapshot?.run.status === "running";
+  const anyActive = active || runs.some((run) => run.status === "running");
+  const preset = presets.find((item) => item.id === presetId);
+
+  useEffect(() => {
+    let live = true;
+    void Promise.allSettled([
+      request<PublicConfig>("/config"),
+      request<{ presets: Preset[] }>("/presets"),
+      request<{ runs: RunSummary[] }>("/runs"),
+    ]).then((results) => {
+      if (!live) return;
+      const [configuration, catalog, library] = results;
+      if (configuration.status === "fulfilled") setConfig(configuration.value);
+      if (catalog.status === "fulfilled") {
+        setPresets(catalog.value.presets);
+        setPresetId(catalog.value.presets[0]?.id ?? "");
+      }
+      if (library.status === "fulfilled") setRuns(library.value.runs);
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") setError(errorText(failed.reason));
+      setBooting(false);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (
+      !snapshot ||
+      !selectedPosition ||
+      !snapshot.positions.some((position) => position.id === selectedPosition)
+    ) {
+      setSelectedPosition(snapshot?.positions[0]?.id ?? "");
+    }
+  }, [snapshot, selectedPosition]);
+
+  useEffect(() => {
+    if (
+      !snapshot?.positions.some(
+        (position) =>
+          position.id === counterSource && position.id !== selectedPosition,
+      )
+    ) {
+      setCounterSource(
+        snapshot?.positions.find((position) => position.id !== selectedPosition)
+          ?.id ?? "",
+      );
+    }
+    setCounterfactual(null);
+  }, [
+    selectedPosition,
+    counterSource,
+    snapshot?.run.id,
+    snapshot?.run.revision,
+  ]);
+
+  useEffect(() => {
+    setReplayVerification(null);
+  }, [snapshot?.run.id, snapshot?.run.revision]);
+
+  useEffect(() => {
+    if (!selectedRunId || !active) return;
+    let disposed = false;
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
+    const poll = async () => {
+      try {
+        const next = await request<Snapshot>(
+          `/runs/${encodeURIComponent(selectedRunId)}`,
+          { signal: controller.signal },
+        );
+        if (disposed) return;
+        failures = 0;
+        setPollError("");
+        setSnapshot(next);
+        setRuns((current) =>
+          current.map((run) => (run.id === next.run.id ? next.run : run)),
+        );
+        if (next.run.status !== "running") return;
+      } catch (cause) {
+        if (disposed) return;
+        failures += 1;
+        setPollError(`自动刷新暂时中断，将重试。${errorText(cause)}`);
+      }
+      if (!disposed)
+        timer = setTimeout(poll, Math.min(8000, 2000 * 2 ** failures));
+    };
+    timer = setTimeout(poll, 2000);
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [selectedRunId, active]);
+
+  async function refreshLibrary() {
+    const result = await request<{ runs: RunSummary[] }>("/runs");
+    setRuns(result.runs);
+  }
+  function adopt(next: Snapshot) {
+    selection.current += 1;
+    setSnapshot(next);
+    setSelectedRunId(next.run.id);
+    setDeleteArmed(false);
+    setCounterfactual(null);
+    setPollError("");
+    setRuns((current) => [
+      next.run,
+      ...current.filter((item) => item.id !== next.run.id),
+    ]);
+  }
+  async function perform(label: string, action: () => Promise<void>) {
+    setBusy(label);
+    setError("");
+    setNotice("");
+    try {
+      await action();
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setBusy("");
+    }
+  }
+  async function selectRun(id: string) {
+    const ticket = ++selection.current;
+    setSelectedRunId(id);
+    setSnapshot(null);
+    setDeleteArmed(false);
+    setError("");
+    setPollError("");
+    setCounterfactual(null);
+    if (!id) return;
+    await perform("加载存档", async () => {
+      const next = await request<Snapshot>(`/runs/${encodeURIComponent(id)}`);
+      if (ticket === selection.current) setSnapshot(next);
+    });
+  }
+  async function runAction(action: "step" | "start" | "pause") {
+    if (!snapshot) return;
+    const id = snapshot.run.id;
+    await perform(
+      action === "step"
+        ? "执行局部窗口"
+        : action === "start"
+          ? "开始运行"
+          : "请求暂停",
+      async () => {
+        try {
+          const next = await post<Snapshot>(
+            `/runs/${encodeURIComponent(id)}/${action}`,
+          );
+          adopt(next);
+        } catch (cause) {
+          try {
+            const next = await request<Snapshot>(
+              `/runs/${encodeURIComponent(id)}`,
+            );
+            adopt(next);
+          } catch {
+            /* Preserve the last usable snapshot. */
+          }
+          throw cause;
+        }
+        await refreshLibrary();
+        if (action === "pause")
+          setNotice("暂停请求已发送；正在执行的操作会在安全边界结束。");
+      },
+    );
+  }
+  const disabled = !!busy;
+  const frozen = disabled || active;
+  const exhausted = snapshot?.run.status === "budget_exhausted";
+  const validLimits = (Object.keys(limits) as (keyof Limits)[]).every(
+    (field) =>
+      Number.isInteger(limits[field]) &&
+      limits[field] >= 1 &&
+      limits[field] <= MAX_LIMITS[field],
+  );
+  const tokenUsage = snapshot
+    ? snapshot.run.usage.input_tokens +
+      snapshot.run.usage.output_tokens +
+      (snapshot.run.usage.reserved_tokens ?? 0) +
+      (snapshot.run.usage.unknown_tokens ?? 0)
+    : 0;
+
+  const createRun = () =>
+    perform("创建实验", async () => {
+      adopt(
+        await post<Snapshot>("/runs", {
+          preset_id: presetId,
+          provider,
+          limits,
+        }),
+      );
+      setTab("story");
+    });
+  const reloadConfig = () =>
+    perform("重新加载配置", async () => {
+      setConfig(await post<PublicConfig>("/config/reload"));
+      setNotice("配置状态已刷新。");
+    });
+  const forkRun = () =>
+    perform("创建分支", async () => {
+      if (!snapshot) return;
+      adopt(
+        await post<Snapshot>(`/runs/${snapshot.run.id}/fork`, {
+          title: `${snapshot.run.title} · 分支`,
+        }),
+      );
+      setNotice("已创建独立分支，原实验保留。");
+    });
+  const deleteRun = () =>
+    perform("删除存档", async () => {
+      if (!snapshot) return;
+      await request(`/runs/${snapshot.run.id}`, { method: "DELETE" });
+      setSnapshot(null);
+      setSelectedRunId("");
+      setDeleteArmed(false);
+      await refreshLibrary();
+      setNotice("本地存档已删除。");
+    });
+  const verify = () =>
+    perform("离线验证", async () => {
+      setVerification(await request<Verification>("/verify"));
+    });
+  const compare = () =>
+    perform("反事实检验", async () => {
+      if (!snapshot) return;
+      setCounterfactual(
+        await post<Counterfactual>(`/runs/${snapshot.run.id}/counterfactual`, {
+          target_position_id: selectedPosition,
+          source_position_id: counterSource,
+        }),
+      );
+    });
+  const replay = () =>
+    perform("记录重执行", async () => {
+      if (!snapshot || active) return;
+      setReplayVerification(
+        await request<ReplayVerification>(`/runs/${snapshot.run.id}/replay`),
+      );
+    });
+  const reloadLibrary = () => perform("刷新列表", refreshLibrary);
+  const reconnect = () =>
+    perform("重新连接", async () => {
+      const [configuration, catalog, library] = await Promise.all([
+        request<PublicConfig>("/config"),
+        request<{ presets: Preset[] }>("/presets"),
+        request<{ runs: RunSummary[] }>("/runs"),
+      ]);
+      setConfig(configuration);
+      setPresets(catalog.presets);
+      setRuns(library.runs);
+      if (!catalog.presets.some((item) => item.id === presetId))
+        setPresetId(catalog.presets[0]?.id ?? "");
+      setNotice("本地服务已重新连接。");
+    });
+  return {
+    config,
+    presets,
+    runs,
+    presetId,
+    setPresetId,
+    provider,
+    setProvider,
+    limits,
+    setLimits,
+    snapshot,
+    selectedRunId,
+    selectedPosition,
+    setSelectedPosition,
+    tab,
+    setTab,
+    booting,
+    busy,
+    error,
+    setError,
+    notice,
+    pollError,
+    verification,
+    setVerification,
+    counterfactual,
+    replayVerification,
+    counterSource,
+    setCounterSource,
+    deleteArmed,
+    setDeleteArmed,
+    active,
+    anyActive,
+    preset,
+    disabled,
+    frozen,
+    exhausted,
+    validLimits,
+    tokenUsage,
+    createRun,
+    reloadConfig,
+    forkRun,
+    deleteRun,
+    verify,
+    compare,
+    replay,
+    reloadLibrary,
+    reconnect,
+    selectRun,
+    runAction,
+  };
+}
+
+export type Workbench = ReturnType<typeof useWorkbench>;

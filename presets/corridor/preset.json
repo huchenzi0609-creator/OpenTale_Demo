@@ -1,0 +1,7 @@
+{
+  "id":"corridor",
+  "name":"灯下的回廊",
+  "description":"一扇尚未打开的门被几处生活共同承接。门后的等待、门前的记忆与谁正回家，允许取得不同归属。",
+  "positions":[{"id":"writer","name":"林栖"},{"id":"keeper","name":"陈默"},{"id":"reader","name":"小岚"}],
+  "expressions":[{"id":"e-letter","text":"门外响过一次脚步声。她把灯留着，没有走过去开门。"}]
+}
