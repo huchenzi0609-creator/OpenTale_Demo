@@ -36,8 +36,8 @@ class Usage(Record):
 class Binding(Record):
     source_position_id: str
     source_expression_id: str
-    value: str = Field(min_length=1, max_length=1600)
-    anchor: str = Field(min_length=1, max_length=1600)
+    value: str = Field(min_length=1, max_length=12000)
+    anchor: str = Field(min_length=1, max_length=12000)
     revision: int
 
 

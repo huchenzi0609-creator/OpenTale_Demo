@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, post, request } from "./api";
+import { presetPayload, type PresetDraft } from "./presetDraft";
 import type {
   Counterfactual,
   Limits,
   Preset,
+  PresetCatalog,
   Provider,
   PublicConfig,
   ReplayVerification,
@@ -33,6 +35,7 @@ const errorText = (error: unknown) =>
 export function useWorkbench() {
   const [config, setConfig] = useState<PublicConfig | null>(null);
   const [presets, setPresets] = useState<Preset[]>([]);
+  const [presetErrors, setPresetErrors] = useState<NonNullable<PresetCatalog["errors"]>>([]);
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [presetId, setPresetId] = useState("");
   const [provider, setProvider] = useState<Provider>("fixture");
@@ -65,7 +68,7 @@ export function useWorkbench() {
     let live = true;
     void Promise.allSettled([
       request<PublicConfig>("/config"),
-      request<{ presets: Preset[] }>("/presets"),
+      request<PresetCatalog>("/presets"),
       request<{ runs: RunSummary[] }>("/runs"),
     ]).then((results) => {
       if (!live) return;
@@ -73,6 +76,7 @@ export function useWorkbench() {
       if (configuration.status === "fulfilled") setConfig(configuration.value);
       if (catalog.status === "fulfilled") {
         setPresets(catalog.value.presets);
+        setPresetErrors(catalog.value.errors ?? []);
         setPresetId(catalog.value.presets[0]?.id ?? "");
       }
       if (library.status === "fulfilled") setRuns(library.value.runs);
@@ -256,6 +260,21 @@ export function useWorkbench() {
       );
       setTab("story");
     });
+  async function savePreset(draft: PresetDraft, original?: Preset) {
+    const payload = presetPayload(draft);
+    const result = original
+      ? await request<{ preset: Preset }>(`/presets/${encodeURIComponent(original.id)}`, {
+          method: "PUT",
+          body: JSON.stringify({ ...payload, expected_version: original.version }),
+        })
+      : await post<{ preset: Preset }>("/presets", payload);
+    setPresets((current) => [
+      ...current.filter((item) => item.id !== result.preset.id), result.preset,
+    ]);
+    setPresetId(result.preset.id);
+    setError("");
+    setNotice(`已保存预设「${result.preset.name}」。点击“创建实验”使用；已有存档保持原样。`);
+  }
   const reloadConfig = () =>
     perform("重新加载配置", async () => {
       setConfig(await post<PublicConfig>("/config/reload"));
@@ -307,11 +326,12 @@ export function useWorkbench() {
     perform("重新连接", async () => {
       const [configuration, catalog, library] = await Promise.all([
         request<PublicConfig>("/config"),
-        request<{ presets: Preset[] }>("/presets"),
+        request<PresetCatalog>("/presets"),
         request<{ runs: RunSummary[] }>("/runs"),
       ]);
       setConfig(configuration);
       setPresets(catalog.presets);
+      setPresetErrors(catalog.errors ?? []);
       setRuns(library.runs);
       if (!catalog.presets.some((item) => item.id === presetId))
         setPresetId(catalog.presets[0]?.id ?? "");
@@ -320,6 +340,7 @@ export function useWorkbench() {
   return {
     config,
     presets,
+    presetErrors,
     runs,
     presetId,
     setPresetId,
@@ -356,6 +377,7 @@ export function useWorkbench() {
     validLimits,
     tokenUsage,
     createRun,
+    savePreset,
     reloadConfig,
     forkRun,
     deleteRun,

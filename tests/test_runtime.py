@@ -21,6 +21,13 @@ async def test_two_windows_reinterpret_and_recovery_replays(snapshot, settings, 
         "sources" not in relation and "use_id" not in relation
         for relation in runner.reading_frame(first).open_relations
     )
+    assert all(
+        not use["expression_id"].startswith("seed-")
+        for candidate in runner.reading_frame(first).candidates
+        for use in candidate["active_uses"]
+    )
+    for position in first.positions:
+        assert position.seed not in runner.reading_frame(first).model_dump_json()
     second = await runner.step(snapshot.run.id)
     assert second.run.revision == 2 and second.run.usage.calls == 14
     assert second.reading.interpretations[0]["segment_id"] == first.story[0].id

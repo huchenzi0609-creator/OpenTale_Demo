@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from opentale.config import Settings
 from opentale.domain import GenerationFrame, Presentation, Proposal, ReadingFrame
+from opentale.security import contains_credential as _contains_credential
 
 from .base import ModelResult, ProviderError
 
@@ -61,20 +62,6 @@ def _strict_json(raw: str | bytes) -> object:
         raise ValueError("Non-JSON numeric constant")
 
     return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
-
-
-def _contains_credential(value: object, credential: str) -> bool:
-    """Inspect decoded values too: JSON escapes must not bypass the output boundary."""
-    if isinstance(value, str):
-        return credential in value
-    if isinstance(value, dict):
-        return any(
-            _contains_credential(key, credential) or _contains_credential(item, credential)
-            for key, item in value.items()
-        )
-    if isinstance(value, (list, tuple)):
-        return any(_contains_credential(item, credential) for item in value)
-    return False
 
 
 def _actor_frame(frame: GenerationFrame) -> dict[str, object]:

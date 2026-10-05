@@ -1,5 +1,9 @@
+import { useState } from "react";
+import type { EditorMode } from "../presetDraft";
+import type { Preset } from "../types";
 import type { Provider } from "../types";
 import type { Workbench } from "../useWorkbench";
+import PresetEditor from "./PresetEditor";
 const KEY_PATH =
   "/Users/huchenzi/Ready4AI/Project_OpenTale/Opentale_Demo/.env.local";
 
@@ -11,9 +15,11 @@ const STATUS: Record<string, string> = {
   budget_exhausted: "预算已用尽",
 };
 export default function Sidebar({ model }: { model: Workbench }) {
+  const [editor, setEditor] = useState<{ mode: EditorMode; source?: Preset } | null>(null);
   const {
     config,
     presets,
+    presetErrors,
     runs,
     presetId,
     setPresetId,
@@ -29,6 +35,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
     disabled,
     validLimits,
     createRun,
+    savePreset,
     reloadConfig,
     reloadLibrary,
     selectRun,
@@ -40,7 +47,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
           O<span>↗</span>
         </span>
         <span>
-          OpenTale<small>NARRATIVE LAB / 0.1</small>
+          OpenTale<small>NARRATIVE LAB / 0.2</small>
         </span>
       </a>
       <div className="sidebar-heading">
@@ -56,11 +63,28 @@ export default function Sidebar({ model }: { model: Workbench }) {
         >
           {presets.map((item) => (
             <option value={item.id} key={item.id}>
-              {item.name}
+              {item.name}{item.origin === "custom" ? " · 自定义" : ""}
             </option>
           ))}
         </select>
         {preset && <p className="helper">{preset.description}</p>}
+        {presetErrors.length > 0 && <details className="preset-catalog-errors">
+          <summary>有 {presetErrors.length} 份自定义预设未能载入</summary>
+          {presetErrors.map((item) => <p className="helper" key={item.id}>{item.id}：{item.message}（{item.code}）</p>)}
+        </details>}
+        <div className="preset-actions">
+          <button className="button secondary full" disabled={disabled || booting}
+            onClick={() => setEditor({ mode: "create" })}>＋ 自定义实验</button>
+          <div className="preset-action-row">
+            <button className="text-button" disabled={disabled || booting || !preset}
+              onClick={() => preset && setEditor({ mode: "copy", source: preset })}>复制编辑</button>
+            {preset?.editable && <button className="text-button" disabled={disabled || booting}
+              onClick={() => setEditor({ mode: "edit", source: preset })}>编辑当前预设</button>}
+          </div>
+          <p className="helper">自定义人物 Markdown 与共同表达；内置预设可复制编辑。</p>
+          {preset?.storage_path && <details><summary>预设文件与版本</summary><code>{preset.storage_path}</code>
+            <p className="helper">当前版本：{preset.version}。私人文件仅保存在本地，不纳入 Git。</p></details>}
+        </div>
         <label htmlFor="provider">生成方式</label>
         <select
           id="provider"
@@ -104,6 +128,9 @@ export default function Sidebar({ model }: { model: Workbench }) {
             </label>
           ))}
         </div>
+        {provider === "deepseek" && preset && <p className="helper budget-estimate">
+          {preset.positions.length} 位人物的完整窗口通常需要 {preset.positions.length * 2 + 1} 次调用，重试另计。请先用少量窗口验证。
+        </p>}
         {!validLimits && (
           <p className="helper">
             预算须为范围内的正整数：调用 ≤ 200，Token ≤ 500,000，并行 ≤ 6，窗口
@@ -189,6 +216,8 @@ export default function Sidebar({ model }: { model: Workbench }) {
         <br />
         <span>共同构成 · 条件回流 · 承接呈现</span>
       </div>
+      {editor && <PresetEditor mode={editor.mode} source={editor.source}
+        onClose={() => setEditor(null)} onSave={savePreset} />}
     </aside>
   );
 }

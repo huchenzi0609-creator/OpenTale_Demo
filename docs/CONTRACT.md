@@ -1,4 +1,4 @@
-# OpenTale Demo v0.1 — module contract
+# OpenTale Demo v0.2 — module contract
 
 ## Architecture and ownership
 
@@ -38,7 +38,17 @@ Config `load_settings(root: Path) -> Settings`. `Settings` fields `api_key` (Sec
 
 ## HTTP API (root implements)
 
-`GET /api/health` -> `{ok:true, version:"0.1.0"}`
+### Custom preset editor (v0.2)
+
+`GET /api/presets` also reads private custom groups from `<data_dir>/presets`. Each preset includes `origin:builtin|custom`, `editable:boolean`, `version:string|null`; custom presets include `storage_path` pointing to their current version directory. `errors` lists safe diagnostics for malformed custom groups while other presets stay usable.
+
+`POST /api/presets` creates a custom group. `PUT /api/presets/{id}` updates a custom group with required `expected_version` to reject lost updates. Both return `{preset: enrichedPreset}`. Input definition: `{id,name,description,positions:[{id,name,seed}],expressions:[{id,text,role}]}`. Positions: 3–8, IDs lowercase ASCII identifier/underscore up to 40 chars, name up to 80 chars, Markdown seed 1–12000 chars. Expressions: 1–6, safe slug IDs up to 64 chars excluding `seed-` and `expr-` prefixes, text 1–6000 chars, open role up to 80 chars (default `共同生活`). Preset ID safe slug up to 64, name up to 100, description up to 2000. IDs must be unique; all text fields trimmed/nonblank where required.
+
+Builtins are read-only in the web editor; copy to a new ID to customize. Save generates private `preset.json`, per-character `character.json` (ID/name only), and `character.md`. A version is fully written before an atomic `current.json` pointer replacement; failed or conflicting saves leave the prior version active. Old versions remain for recovery. Custom creation/editing does not call a model and never modifies already-created snapshots. All initial expressions are shared among the selected positions in v0.2; custom topology/spawn remains out of scope.
+
+Preset writes accept up to 1 MiB of HTTP data; all other writes retain the smaller request bound. No credential-entry field is added; parsed preset values containing the configured credential are rejected before persistence.
+
+`GET /api/health` -> `{ok:true, version:"0.2.0"}`
 
 `GET /api/config`, `POST /api/config/reload` -> safe Settings.public.
 

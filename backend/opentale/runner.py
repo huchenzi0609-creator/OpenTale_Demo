@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from .config import Settings
 from .domain import Event, Pending, Presentation, ReadingFrame, Snapshot
-from .kernel import KernelError, frame_for, install_presentation, validate_proposal, without_source
+from .kernel import KernelError, audit_for, frame_for, install_presentation, validate_proposal, without_source
 from .kernel import install_batch as install
 from .providers import ModelResult, ProviderError, make_provider
 from .storage import Store
@@ -262,6 +262,7 @@ class Runner:
                 ) from None
 
     def reading_frame(self, state: Snapshot) -> ReadingFrame:
+        shared_ids = {entry["expression_id"] for entry in audit_for(state)["shared_expressions"]}
         return ReadingFrame(
             revision=state.run.revision,
             candidates=[
@@ -269,7 +270,11 @@ class Runner:
                     "position_id": p.id,
                     "name": p.name,
                     "text": next(c.surface for c in state.continuations if c.position_id == p.id),
-                    "active_uses": frame_for(state, p.id).active_uses,
+                    "active_uses": [
+                        use
+                        for use in frame_for(state, p.id).active_uses
+                        if use["expression_id"] in shared_ids
+                    ],
                 }
                 for p in state.positions
             ],

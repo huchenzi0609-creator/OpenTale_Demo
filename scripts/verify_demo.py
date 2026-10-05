@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -98,6 +99,135 @@ def assert_safe_projection(value: dict) -> None:
     check(visit(value), "公开投影不含配置密钥、请求头或推理字段")
 
 
+def verify_custom_presets(server: Server) -> list[dict]:
+    """Only inspect this verifier's own isolated, generated preset materials."""
+    draft = {
+        "id": "verification-river",
+        "name": "河边的几处生活",
+        "description": "仅用于隔离 HTTP 验收的自定义材料。",
+        "positions": [
+            {"id": f"person_{index}", "name": f"河边人{index}", "seed": f"# 人物 {index}\n\n她记得河水涨过台阶。"}
+            for index in range(4)
+        ],
+        "expressions": [
+            {"id": "river-source", "text": "河水涨过台阶。", "role": "彼此正在承担的过往"},
+            {"id": "stone-source", "text": "石头有了裂缝。", "role": "另一种来处"},
+        ],
+    }
+    draft["positions"][0]["seed"] = ("# 私人生活\n\n" + "她记得涨水的夏日。" * 2000)[:12000]
+    status, created = server.request("POST", "/api/presets", draft)
+    check(status == 200 and created["preset"]["origin"] == "custom"
+          and created["preset"]["editable"] is True, "HTTP 保存自定义预设与长 Markdown")
+    original = created["preset"]
+    status, catalog = server.request("GET", "/api/presets")
+    check(status == 200 and original in catalog["presets"] and not catalog["errors"], "目录读取完整自定义资料")
+    _, empty = server.request("GET", "/api/runs")
+    existing_ids = {run["id"] for run in empty["runs"]}
+
+    directory = Path(original["storage_path"])
+    expected_root = (server.directory / "data" / "presets").resolve()
+    check(directory.is_relative_to(expected_root), "自定义文件只写入隔离的私人预设目录")
+    manifest = json.loads((directory / "preset.json").read_text(encoding="utf-8"))
+    materials_match = manifest["positions"] == [
+        {"id": position["id"], "name": position["name"]} for position in draft["positions"]
+    ]
+    for position in draft["positions"]:
+        character = directory / "characters" / position["id"]
+        materials_match &= (character / "character.md").read_text(encoding="utf-8") == position["seed"]
+        materials_match &= json.loads((character / "character.json").read_text(encoding="utf-8")) == {
+            "id": position["id"], "name": position["name"],
+        }
+    check(materials_match, "人物 MD 与仅 ID/name 的 JSON 分别落盘")
+    check(all(
+        stat.S_IMODE(path.stat().st_mode) == (0o700 if path.is_dir() else 0o600)
+        for path in [expected_root, *expected_root.rglob("*")]
+    ), "隔离预设目录 700 与明文文件 600 权限")
+    _, after_save = server.request("GET", "/api/runs")
+    check({run["id"] for run in after_save["runs"]} == existing_ids,
+          "保存预设不创建或启动模型实验")
+
+    status, custom = server.request("POST", "/api/runs", {
+        "preset_id": draft["id"], "provider": "fixture",
+        "limits": {"max_calls": 80, "max_tokens": 40000, "max_parallel": 4, "max_windows": 6},
+    })
+    check(status == 200 and custom["run"]["usage"]["calls"] == 0
+          and len(custom["positions"]) == 4, "自定义预设创建实验时不调用模型")
+    custom_id = id_of(custom)
+    edited = json.loads(json.dumps(draft))
+    edited["name"] = "河边的第二稿"
+    edited["positions"][0]["seed"] = "# 新的过往\n\n她记得另一场夏日的雨。"
+    edited["expressions"][0]["text"] = "河水已经退到台阶下。"
+    status, updated = server.request("PUT", f"/api/presets/{draft['id']}", {
+        **edited, "expected_version": original["version"],
+    })
+    check(status == 200 and updated["preset"]["version"] != original["version"],
+          "带当前版本的预设编辑发布完整新版本")
+    current = updated["preset"]
+    _, untouched = server.request("GET", f"/api/runs/{custom_id}")
+    check(untouched == custom, "编辑预设不回写已创建实验")
+    status, conflict = server.request("PUT", f"/api/presets/{draft['id']}", {
+        **draft, "expected_version": original["version"],
+    })
+    check(status == 409 and conflict["error"]["code"] == "PRESET_CONFLICT", "过时编辑版本安全拒绝")
+    status, conflict = server.request("POST", "/api/presets", draft)
+    check(status == 409 and conflict["error"]["code"] == "PRESET_CONFLICT", "新建重复预设标识安全拒绝")
+    for method, path, body in [
+        ("POST", "/api/presets", {**draft, "id": "letters"}),
+        ("PUT", "/api/presets/letters", {**draft, "id": "letters", "expected_version": original["version"]}),
+    ]:
+        status, readonly = server.request(method, path, body)
+        check(status == 409 and readonly["error"]["code"] == "PRESET_READ_ONLY", "内置预设不可覆盖")
+    _, catalog = server.request("GET", "/api/presets")
+    check(current in catalog["presets"] and (directory / "characters" / "person_0" / "character.md").read_text(
+        encoding="utf-8"
+    ) == draft["positions"][0]["seed"], "冲突后当前资料与历史版本保持完整")
+    pointer = directory.parent.parent / "current.json"
+    check(json.loads(pointer.read_text(encoding="utf-8"))["version"] == current["version"],
+          "当前指针指向已完整保存的新版本")
+    status, new_run = server.request("POST", "/api/runs", {"preset_id": draft["id"], "provider": "fixture"})
+    check(status == 200 and new_run["positions"][0]["seed"] == edited["positions"][0]["seed"],
+          "后续新实验采用修改后的资料")
+
+    for revision in (1, 2):
+        status, custom_advanced = server.request("POST", f"/api/runs/{custom_id}/step")
+        check(status == 200 and custom_advanced["run"]["revision"] == revision,
+              "任意共享表达 ID 连续执行自定义窗口")
+    targets = custom_advanced["audit"]["joint_targets"]
+    check(len(targets) == 4 and all(len(target["sources"]) == 3 for target in targets)
+          and all(target["expression_id"] == "river-source" for target in targets),
+          "自定义用法接受全部同伴的共同输入")
+    check(all(set(segment["expression_ids"]) == {"river-source", "stone-source"}
+              and "那封信" not in segment["text"] for segment in custom_advanced["story"]),
+          "呈现承接自定义共享载体且不强制变成书信")
+    status, counterfactual = server.request("POST", f"/api/runs/{custom_id}/counterfactual", {
+        "target_position_id": "person_0", "source_position_id": "person_1",
+    })
+    check(status == 200 and counterfactual["structural_effect"] is True
+          and counterfactual["semantic_fixture_effect"] is True, "自定义载体的反事实回流有效")
+    _, unchanged = server.request("GET", f"/api/runs/{custom_id}")
+    check(unchanged == custom_advanced, "自定义消融不修改原档")
+    status, replay = server.request("GET", f"/api/runs/{custom_id}/replay")
+    check(status == 200 and replay.get("ok") is True, "自定义预设的语义事件可重新执行")
+    status, fork = server.request("POST", f"/api/runs/{custom_id}/fork", {"title": "自定义验收分支"})
+    check(status == 200 and id_of(fork) != custom_id, "自定义存档可建立独立分支")
+    status, fork_advanced = server.request("POST", f"/api/runs/{id_of(fork)}/step")
+    _, unchanged = server.request("GET", f"/api/runs/{custom_id}")
+    check(status == 200 and fork_advanced["run"]["revision"] == 3 and unchanged == custom_advanced,
+          "自定义分支继续不修改原档")
+
+    server.stop()
+    server.start()
+    status, catalog = server.request("GET", "/api/presets")
+    check(status == 200 and current in catalog["presets"] and not catalog["errors"],
+          "服务重启后自定义目录及 Markdown 完整恢复")
+    status, restored = server.request("GET", f"/api/runs/{custom_id}")
+    check(status == 200 and restored == custom_advanced, "重启后旧资料实验仍保持原运行状态")
+    status, restored_replay = server.request("GET", f"/api/runs/{custom_id}/replay")
+    check(status == 200 and restored_replay.get("ok") is True
+          and restored_replay.get("digest") == replay.get("digest"), "重启后自定义事件重放摘要稳定")
+    return [fork_advanced, new_run, custom_advanced]
+
+
 def verify(server: Server) -> None:
     status, health = server.request("GET", "/api/health")
     check(status == 200 and health.get("ok") is True, "真实 HTTP 健康检查")
@@ -167,7 +297,8 @@ def verify(server: Server) -> None:
             break
         time.sleep(0.05)
     check(paused["run"]["status"] != "running", "后台开始与协作式暂停")
-    for snapshot in [background, limited, fork, advanced]:
+    custom_runs = verify_custom_presets(server)
+    for snapshot in [background, limited, fork, advanced, *custom_runs]:
         status, deleted = server.request("DELETE", f"/api/runs/{id_of(snapshot)}")
         check(status == 200 and deleted.get("deleted") is True, "删除指定非活跃存档")
     _, listing = server.request("GET", "/api/runs")

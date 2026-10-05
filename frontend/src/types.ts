@@ -118,7 +118,15 @@ export interface Preset {
   name: string;
   description: string;
   positions: Position[];
-  expressions: Expression[];
+  expressions: { id: string; text: string; role?: string }[];
+  origin?: "builtin" | "custom";
+  editable?: boolean;
+  version?: string | null;
+  storage_path?: string;
+}
+export interface PresetCatalog {
+  presets: Preset[];
+  errors?: { id: string; code: string; message: string }[];
 }
 export interface PublicConfig {
   provider: string;
