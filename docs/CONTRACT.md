@@ -30,7 +30,9 @@ An accepted batch must freshly rebind at least one shared position/expression/ro
 
 `ModelResult[T]` exposes `value`, `input_tokens`, `output_tokens` (defaults 0). Runner owns reservation, accounting and persisting partial results. A provider call is charged even on failure; failed token counts may be unknown.
 
-`ProviderError` exposes safe `code`, `message`, `retryable` only. Never expose raw exception strings, HTTP bodies, prompts or headers. Timeouts, HTTP failures, malformed JSON, excessive outputs and schema errors are bounded, sanitized failures. No unbounded internal retries. Fixture provider has no network. DeepSeek reads Settings from config, uses non-thinking JSON generation by default and discards reasoning content. Do not impose CoT requirements.
+`ProviderError.public()` exposes safe `code`, `message`, `retryable` only. Optional internal `usage: tuple[int,int]|None` carries validated input/output token counts for rejected but billed responses; Runner settles known counts exactly and conservatively retains estimates for unknown results. Never expose raw exception strings, HTTP bodies, prompts or headers. Timeouts, HTTP failures, malformed JSON, excessive outputs and schema errors are bounded, sanitized failures. No unbounded internal retries. Fixture provider has no network. DeepSeek reads Settings from config, uses non-thinking JSON generation by default and discards reasoning content. Do not impose CoT requirements.
+
+DeepSeek proposal transport is provider-local: narrative fragments carry explicit target/expression/role assignments. Compilation concatenates the exact fragment text and uses it unchanged as value/anchor; current position/revision come from the frame. The prompt schema enumerates current writable targets and expressions per target. Compatible legacy Proposal responses still undergo exact validation. Stored `Proposal`, kernel semantics and executable replay remain unchanged; compilation never guesses targets, fabricates prose or drops invalid operations. An existing shared interface may be recommended for coordination, while additional roles stay open.
 
 `make_provider(mode: str, settings: Settings)` constructs `fixture` or `deepseek`.
 
@@ -51,6 +53,8 @@ Preset writes accept up to 1 MiB of HTTP data; all other writes retain the small
 `GET /api/health` -> `{ok:true, version:"0.2.0"}`
 
 `GET /api/config`, `POST /api/config/reload` -> safe Settings.public plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
+
+`POST /api/runs/{id}/fork` accepts optional `title` and `limits: Limits`. Omitted limits inherit the parent. Explicit limits must pass the ordinary budget bounds, apply only to the new branch and do not trigger generation. Pending accepted work and semantic evidence are retained; branch usage starts at zero while the parent's usage remains recorded.
 
 `GET /api/presets` -> `{presets:[{id,name,description,positions:[{id,name,seed}],expressions:[...]}]}`
 

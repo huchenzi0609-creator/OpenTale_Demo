@@ -7,7 +7,7 @@ import pytest
 from opentale.config import Settings
 from opentale.domain import GenerationFrame, ReadingFrame
 from opentale.providers import DeepSeekProvider, FixtureProvider, ProviderError, make_provider
-from opentale.providers.deepseek import MAX_RESPONSE_BYTES
+from opentale.providers.deepseek import MAX_RESPONSE_BYTES, _proposal_schema, _shared_interface
 from pydantic import BaseModel
 
 TEST_CREDENTIAL = "unit-test-only-credential"
@@ -184,6 +184,7 @@ async def test_http_errors_are_safe_and_never_expose_response_body(status, retry
     finally:
         await client.aclose()
     assert caught.value.retryable is retryable
+    assert caught.value.usage is None
     exposed = json.dumps(caught.value.public()) + str(caught.value) + caplog.text
     assert TEST_CREDENTIAL not in exposed and "RAW_PRIVATE_BODY" not in exposed
     assert "secret-prompt" not in exposed and "evil.test" not in exposed
@@ -201,6 +202,7 @@ async def test_timeout_is_retryable_without_exposing_exception_request():
         await client.aclose()
     assert caught.value.code == "PROVIDER_TIMEOUT"
     assert caught.value.retryable
+    assert caught.value.usage is None
     assert TEST_CREDENTIAL not in str(caught.value)
     assert caught.value.__cause__ is None
 
@@ -294,6 +296,7 @@ async def test_truncation_is_distinguished_from_schema_error():
     finally:
         await client.aclose()
     assert caught.value.code == "MODEL_OUTPUT_TRUNCATED"
+    assert caught.value.usage == (80, 40)
 
 
 async def test_response_size_limit_applies_before_decoding():
@@ -382,3 +385,205 @@ def test_factory_has_explicit_modes_and_safe_unknown_mode():
     with pytest.raises(ProviderError) as caught:
         make_provider(TEST_CREDENTIAL, Settings())
     assert TEST_CREDENTIAL not in str(caught.value)
+
+
+def fragment_reply(text="写信人正在写第一句。", *, targets=None):
+    if targets is None:
+        targets = [
+            {"target_position_id": target, "expression_id": "e-letter", "role": "共同生活"}
+            for target in ("p-b", "p-c")
+        ]
+    return {"fragments": [{"text": text, "targets": targets}]}
+
+
+async def test_fragment_proposal_compiles_exact_unicode_prose_once_without_changing_runtime_contract():
+    text = "写信人想起了 café 与 cafe\u0301。\n读信人没有把「……」说完。"
+    payload = fragment_reply(text)
+    payload["fragments"].insert(0, {"text": "折信人暂且停在灯下。", "targets": []})
+    payload["fragments"][1]["targets"][1]["role"] = "尚未说出的约定"
+    captured = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        captured.append(body)
+        return httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
+
+    provider, client = provider_with_handler(handler)
+    try:
+        result = await provider.propose(generation_frame(revision=7))
+    finally:
+        await client.aclose()
+    assert result.value.position_id == "p-a" and result.value.based_on_revision == 7
+    assert result.value.text == "折信人暂且停在灯下。\n" + text
+    assert len(result.value.operations) == 2
+    assert all(operation.value == operation.anchor == text for operation in result.value.operations)
+    assert all(operation.anchor in result.value.text for operation in result.value.operations)
+    assert result.value.operations[1].role == "尚未说出的约定"
+    assert (result.input_tokens, result.output_tokens) == (80, 40)
+    schema = json.loads(captured[0]["messages"][0]["content"].split("JSON schema:\n", 1)[1])
+    assert schema["required"] == ["fragments"]
+    assert "Proposal" not in schema.get("$defs", {})
+    assert "based_on_revision" not in schema["properties"]
+
+
+def test_fragment_schema_restricts_expression_choices_to_their_actual_target_scope():
+    frame = generation_frame()
+    frame.peer_interfaces = [
+        {"position_id": "p-b", "expression_id": "seed-p-b", "role": "主体背景"},
+        {"position_id": "p-c", "expression_id": "seed-p-c", "role": "主体背景"},
+    ]
+    variants = _proposal_schema(frame)["$defs"]["_FragmentTarget"]["oneOf"]
+    scopes = {variant["properties"]["target_position_id"]["const"]: variant["properties"] for variant in variants}
+    assert set(scopes) == {"p-b", "p-c"}
+    assert set(scopes["p-b"]["expression_id"]["enum"]) == {"e-letter", "seed-p-b"}
+    assert set(scopes["p-c"]["expression_id"]["enum"]) == {"e-letter", "seed-p-c"}
+    assert "enum" not in scopes["p-b"]["role"]  # Narrative roles remain open.
+
+
+@pytest.mark.parametrize("invalid,reason", [
+    ("self", "TARGET_UNKNOWN"), ("unknown_target", "TARGET_UNKNOWN"),
+    ("expression", "EXPRESSION_UNAVAILABLE"), ("wrong_peer_seed", "EXPRESSION_UNAVAILABLE"),
+    ("empty", "NO_PEER_OPERATION"), ("blank", "EMPTY_FRAGMENT"),
+    ("fragment_length", "FRAGMENT_TOO_LONG"), ("total_length", "PROPOSAL_TOO_LARGE"),
+    ("operation_count", "TOO_MANY_OPERATIONS"),
+])
+async def test_fragment_proposals_reject_invalid_scopes_or_limits_without_repair_or_dropped_targets(invalid, reason):
+    frame = generation_frame()
+    frame.peer_interfaces = [{"position_id": "p-c", "expression_id": "seed-p-c", "role": "主体背景"}]
+    payload = fragment_reply()
+    fragment = payload["fragments"][0]
+    if invalid == "self":
+        fragment["targets"][0]["target_position_id"] = "p-a"
+    elif invalid == "unknown_target":
+        fragment["targets"][0]["target_position_id"] = "not-a-peer"
+    elif invalid == "expression":
+        fragment["targets"][0]["expression_id"] = "use-letter"
+    elif invalid == "wrong_peer_seed":
+        fragment["targets"][0]["expression_id"] = "seed-p-c"
+    elif invalid == "empty":
+        fragment["targets"] = []
+    elif invalid == "blank":
+        fragment["text"] = " \n\t"
+    elif invalid == "fragment_length":
+        fragment["text"] = "字" * 1601
+    elif invalid == "total_length":
+        payload["fragments"].append({"text": "字" * 3500, "targets": []})
+    elif invalid == "operation_count":
+        fragment["targets"] *= 6
+        payload["fragments"].append({"text": "写信人尚未落笔。", "targets": fragment["targets"][:1]})
+    provider, client = provider_with_handler(
+        lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
+    )
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.propose(frame)
+    finally:
+        await client.aclose()
+    assert caught.value.code == "MODEL_OUTPUT_INVALID"
+    assert reason in caught.value.message
+    assert caught.value.usage == (80, 40)
+    assert "not-a-peer" not in str(caught.value) and "写信人尚未落笔" not in str(caught.value)
+
+
+async def test_fragment_proposal_accepts_exact_runtime_text_and_operation_boundaries():
+    payload = fragment_reply("字" * 1600)
+    payload["fragments"][0]["targets"] *= 6
+    payload["fragments"].append({"text": "句" * 1899, "targets": []})
+    provider, client = provider_with_handler(
+        lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
+    )
+    try:
+        value = (await provider.propose(generation_frame())).value
+    finally:
+        await client.aclose()
+    assert len(value.operations) == 12 and len(value.text) == 3500
+    assert all(len(operation.anchor) == 1600 for operation in value.operations)
+
+
+@pytest.mark.parametrize("field", ["text", "target_position_id", "expression_id", "role"])
+async def test_fragment_fields_keep_escaped_credentials_out_of_results_and_diagnostics(field):
+    payload = fragment_reply()
+    if field == "text":
+        payload["fragments"][0]["text"] = TEST_CREDENTIAL
+    else:
+        payload["fragments"][0]["targets"][0][field] = TEST_CREDENTIAL
+    escaped = "".join(f"\\u{ord(character):04x}" for character in TEST_CREDENTIAL)
+    content = json.dumps(payload, ensure_ascii=False).replace(TEST_CREDENTIAL, escaped)
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=response(content)))
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.propose(generation_frame())
+    finally:
+        await client.aclose()
+    assert caught.value.code == "MODEL_OUTPUT_INVALID" and caught.value.usage == (80, 40)
+    assert TEST_CREDENTIAL not in str(caught.value) + json.dumps(caught.value.public())
+
+
+@pytest.mark.parametrize("content", ["not json", '{"text":"CoT 参考233"}', '{"text":""}'])
+async def test_valid_envelope_settles_rejected_generation_with_exact_safe_usage(content):
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=response(content)))
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.realize(generation_frame())
+    finally:
+        await client.aclose()
+    assert caught.value.usage == (80, 40)
+    assert set(caught.value.public()) == {"code", "message", "retryable"}
+
+
+@pytest.mark.parametrize("envelope", [
+    {"choices": [], "usage": {"prompt_tokens": 80, "completion_tokens": 40}},
+    {"choices": [{"message": {"content": "not json"}, "finish_reason": "stop"}],
+     "usage": {"prompt_tokens": True, "completion_tokens": 40}},
+])
+async def test_invalid_envelope_keeps_usage_unknown(envelope):
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=envelope))
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.realize(generation_frame())
+    finally:
+        await client.aclose()
+    assert caught.value.usage is None
+
+
+def test_shared_interface_recommendation_uses_only_existing_matching_roles_with_stable_tie_break():
+    frame = generation_frame()
+    frame.active_uses.append({"expression_id": "a-first", "role": "共同生活"})
+    frame.peer_interfaces = [
+        {"position_id": position_id, "expression_id": expression_id, "role": "共同生活"}
+        for expression_id in ("a-first", "e-letter") for position_id in ("p-b", "p-c")
+    ]
+    selected = _shared_interface(frame)
+    assert selected == {"expression_id": "a-first", "role": "共同生活", "target_position_ids": ["p-b", "p-c"]}
+    frame.peer_interfaces.reverse()
+    assert _shared_interface(frame) == selected
+    frame.peer_interfaces = [{"position_id": "p-b", "expression_id": "a-first", "role": "共同生活"}]
+    assert _shared_interface(frame) is None
+
+
+async def test_proposal_prompt_offers_joint_scope_but_excludes_peer_private_content():
+    frame = generation_frame()
+    frame.peer_interfaces = [
+        {"position_id": target, "expression_id": "e-letter", "role": "共同生活", "text": "PRIVATE_PEER_TEXT"}
+        for target in ("p-b", "p-c")
+    ]
+
+    def handler(request):
+        actor = json.loads(json.loads(request.content)["messages"][1]["content"])
+        assert actor["recommended_shared_interface"] == {
+            "expression_id": "e-letter", "role": "共同生活", "target_position_ids": ["p-b", "p-c"],
+        }
+        assert "PRIVATE_PEER_TEXT" not in json.dumps(actor)
+        return httpx.Response(200, json=response(json.dumps(fragment_reply(), ensure_ascii=False)))
+
+    provider, client = provider_with_handler(handler)
+    try:
+        assert len((await provider.propose(frame)).value.operations) == 2
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("usage", [(True, 4), (-1, 4), (1, 5_000_001), (3,), [3, 4], ("3", 4)])
+def test_provider_error_accepts_only_a_pair_of_bounded_integer_usage_counts(usage):
+    with pytest.raises(ValueError, match="Invalid provider usage accounting"):
+        ProviderError("MODEL_OUTPUT_INVALID", "safe", True, usage=usage)

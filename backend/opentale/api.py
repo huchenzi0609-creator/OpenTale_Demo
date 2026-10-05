@@ -33,6 +33,7 @@ class CreateRun(Record):
 
 class ForkRun(Record):
     title: str | None = Field(default=None, min_length=1, max_length=120)
+    limits: Limits | None = None
 
 
 class Counterfactual(Record):
@@ -219,7 +220,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
     async def fork(run_id: str, body: ForkRun):
         if runner.busy(run_id):
             raise KernelError("RUN_BUSY", "请先暂停，再从稳定阶段建立分支。")
-        state = store.fork(run_id, body.title)
+        state = store.fork(run_id, body.title, limits=body.limits)
         runner.event(state, "forked", from_run_id=run_id)
         return state
 

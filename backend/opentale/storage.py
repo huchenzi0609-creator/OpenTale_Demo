@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from uuid import uuid4
 
-from .domain import Event, Snapshot, now
+from .domain import Event, Limits, Snapshot, now
 
 
 class StorageError(Exception):
@@ -89,7 +89,7 @@ class Store:
             rows = db.execute("SELECT event FROM events WHERE run_id=? ORDER BY rowid", (run_id,)).fetchall()
         return [Event.model_validate_json(row[0]) for row in rows]
 
-    def fork(self, run_id: str, title: str | None = None) -> Snapshot:
+    def fork(self, run_id: str, title: str | None = None, *, limits: Limits | None = None) -> Snapshot:
         state = self.load(run_id).model_copy(deep=True)
         state.run.fork_of = run_id
         state.run.id = uuid4().hex
@@ -105,5 +105,7 @@ class Store:
         state.run.usage.unknown_tokens = 0
         state.run.usage.failed_calls = 0
         state.run.usage.windows = 0
+        if limits is not None:
+            state.run.limits = limits.model_copy(deep=True)
         self.save(state)
         return state

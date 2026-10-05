@@ -96,9 +96,16 @@ class Runner:
         self.store.save(state)
         try:
             result = await call()
-        except BaseException:
+        except BaseException as error:
             usage.reserved_tokens -= estimate
-            usage.unknown_tokens += estimate
+            # A rejected output can still carry trustworthy provider billing counts.
+            # Only transport/envelope failures with unknown usage retain the reservation.
+            known_usage = error.usage if isinstance(error, ProviderError) else None
+            if known_usage is None:
+                usage.unknown_tokens += estimate
+            else:
+                usage.input_tokens += known_usage[0]
+                usage.output_tokens += known_usage[1]
             usage.failed_calls += 1
             self.store.save(state)
             raise
