@@ -4,8 +4,20 @@ import json
 
 import httpx
 import pytest
+from opentale.capacity import (
+    MAX_FRAGMENT_TARGETS,
+    MAX_MODEL_CONTENT_CHARS,
+    MAX_MODEL_REQUEST_CHARS,
+    MAX_OPERATION_TEXT_CHARS,
+    MAX_PRESENTATION_TEXT_CHARS,
+    MAX_PROPOSAL_FRAGMENTS,
+    MAX_PROPOSAL_OPERATIONS,
+    MAX_PROPOSAL_TEXT_CHARS,
+    MAX_REALIZATION_TEXT_CHARS,
+)
 from opentale.config import Settings
 from opentale.domain import GenerationFrame, ReadingFrame
+from opentale.kernel import frame_for, install_batch
 from opentale.providers import DeepSeekProvider, FixtureProvider, ProviderError, make_provider
 from opentale.providers.deepseek import MAX_RESPONSE_BYTES, _proposal_schema, _shared_interface
 from pydantic import BaseModel
@@ -309,6 +321,23 @@ async def test_response_size_limit_applies_before_decoding():
     finally:
         await client.aclose()
     assert caught.value.code == "MODEL_OUTPUT_TOO_LARGE"
+    assert caught.value.usage is None
+
+
+async def test_response_byte_boundary_accepts_complete_safe_envelope():
+    envelope = response('{"text":"她继续读起那封信。"}')
+    envelope["padding"] = ""
+    empty = json.dumps(envelope).encode("utf-8")
+    envelope["padding"] = "a" * (MAX_RESPONSE_BYTES - len(empty))
+    raw = json.dumps(envelope).encode("utf-8")
+    assert len(raw) == MAX_RESPONSE_BYTES
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, content=raw))
+    try:
+        result = await provider.realize(generation_frame())
+    finally:
+        await client.aclose()
+    assert result.value == "她继续读起那封信。"
+    assert (result.input_tokens, result.output_tokens) == (80, 40)
 
 
 async def test_missing_key_makes_no_network_request():
@@ -465,11 +494,11 @@ async def test_fragment_proposals_reject_invalid_scopes_or_limits_without_repair
     elif invalid == "blank":
         fragment["text"] = " \n\t"
     elif invalid == "fragment_length":
-        fragment["text"] = "字" * 1601
+        fragment["text"] = "字" * (MAX_OPERATION_TEXT_CHARS + 1)
     elif invalid == "total_length":
-        payload["fragments"].append({"text": "字" * 3500, "targets": []})
+        payload["fragments"].append({"text": "字" * MAX_PROPOSAL_TEXT_CHARS, "targets": []})
     elif invalid == "operation_count":
-        fragment["targets"] *= 6
+        fragment["targets"] *= MAX_PROPOSAL_OPERATIONS // 2
         payload["fragments"].append({"text": "写信人尚未落笔。", "targets": fragment["targets"][:1]})
     provider, client = provider_with_handler(
         lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
@@ -486,9 +515,11 @@ async def test_fragment_proposals_reject_invalid_scopes_or_limits_without_repair
 
 
 async def test_fragment_proposal_accepts_exact_runtime_text_and_operation_boundaries():
-    payload = fragment_reply("字" * 1600)
-    payload["fragments"][0]["targets"] *= 6
-    payload["fragments"].append({"text": "句" * 1899, "targets": []})
+    payload = fragment_reply("字" * MAX_OPERATION_TEXT_CHARS)
+    payload["fragments"][0]["targets"] *= MAX_PROPOSAL_OPERATIONS // 2
+    payload["fragments"].append({
+        "text": "句" * (MAX_PROPOSAL_TEXT_CHARS - MAX_OPERATION_TEXT_CHARS - 1), "targets": [],
+    })
     provider, client = provider_with_handler(
         lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
     )
@@ -496,8 +527,180 @@ async def test_fragment_proposal_accepts_exact_runtime_text_and_operation_bounda
         value = (await provider.propose(generation_frame())).value
     finally:
         await client.aclose()
-    assert len(value.operations) == 12 and len(value.text) == 3500
-    assert all(len(operation.anchor) == 1600 for operation in value.operations)
+    assert len(value.operations) == MAX_PROPOSAL_OPERATIONS and len(value.text) == MAX_PROPOSAL_TEXT_CHARS
+    assert all(len(operation.anchor) == MAX_OPERATION_TEXT_CHARS for operation in value.operations)
+
+
+async def test_more_than_twelve_operations_compile_and_install_without_omitting_any_binding(snapshot):
+    writer = snapshot.positions[0].id
+    frame = frame_for(snapshot, writer)
+    peers = [peer["id"] for peer in frame.peers]
+    fragments = [
+        {
+            "text": f"写信人留下第 {index + 1} 处尚未说完的话。",
+            "targets": [
+                {"target_position_id": peer, "expression_id": "e-letter", "role": "共同生活"}
+                for peer in peers
+            ],
+        }
+        for index in range(12)
+    ]
+    def handler(request):
+        prompt = json.loads(request.content)["messages"][0]["content"]
+        assert f"总计 1–{MAX_PROPOSAL_OPERATIONS} 项" in prompt
+        assert f"至多 {MAX_PROPOSAL_FRAGMENTS} 个片段" in prompt
+        assert f"单片段至多 {MAX_OPERATION_TEXT_CHARS} 字符" in prompt
+        assert f"{MAX_PROPOSAL_TEXT_CHARS} 字符" in prompt
+        return httpx.Response(200, json=response(json.dumps({"fragments": fragments}, ensure_ascii=False)))
+
+    provider, client = provider_with_handler(handler)
+    try:
+        generated = (await provider.propose(frame)).value
+    finally:
+        await client.aclose()
+    assert len(generated.operations) == 24
+    fixture = FixtureProvider()
+    proposals = [generated] + [
+        (await fixture.propose(frame_for(snapshot, position.id))).value
+        for position in snapshot.positions if position.id != writer
+    ]
+    installed = install_batch(snapshot, proposals, snapshot.run.revision)
+    bindings = [
+        binding for use in installed.uses for binding in use.bindings
+        if binding.revision == installed.run.revision and binding.source_position_id == writer
+    ]
+    assert len(bindings) == 24
+    assert sorted(binding.value for binding in bindings) == sorted(op.value for op in generated.operations)
+    assert all(binding.value == binding.anchor and binding.anchor in generated.text for binding in bindings)
+
+
+def test_schema_uses_the_same_wider_capacity_bounds_as_fragment_compilation():
+    schema = _proposal_schema(generation_frame())
+    assert schema["properties"]["fragments"]["maxItems"] == MAX_PROPOSAL_FRAGMENTS
+    fragment = schema["$defs"]["_Fragment"]
+    assert fragment["properties"]["text"]["maxLength"] == MAX_PROPOSAL_TEXT_CHARS
+    assert fragment["properties"]["targets"]["maxItems"] == MAX_FRAGMENT_TARGETS
+    assert fragment["allOf"][0]["then"]["properties"]["text"]["maxLength"] == MAX_OPERATION_TEXT_CHARS
+
+
+async def test_per_fragment_target_overflow_is_safe_and_accounts_for_validated_usage():
+    payload = fragment_reply()
+    target = payload["fragments"][0]["targets"][0]
+    payload["fragments"][0]["targets"] = [target] * (MAX_FRAGMENT_TARGETS + 1)
+    provider, client = provider_with_handler(
+        lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
+    )
+    try:
+        with pytest.raises(ProviderError) as caught:
+            await provider.propose(generation_frame())
+    finally:
+        await client.aclose()
+    assert caught.value.code == "MODEL_OUTPUT_INVALID"
+    assert caught.value.usage == (80, 40)
+    assert target["target_position_id"] not in json.dumps(caught.value.public())
+
+
+@pytest.mark.parametrize("count", [MAX_PROPOSAL_FRAGMENTS, MAX_PROPOSAL_FRAGMENTS + 1])
+async def test_fragment_count_boundary_retains_actual_usage(count):
+    payload = fragment_reply()
+    payload["fragments"] += [{"text": "她暂且停在灯下。", "targets": []}] * (count - 1)
+    provider, client = provider_with_handler(
+        lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
+    )
+    try:
+        if count == MAX_PROPOSAL_FRAGMENTS:
+            value = (await provider.propose(generation_frame())).value
+            assert len(value.operations) == 2
+            assert value.text.count("她暂且停在灯下。") == count - 1
+        else:
+            with pytest.raises(ProviderError) as caught:
+                await provider.propose(generation_frame())
+            assert caught.value.code == "MODEL_OUTPUT_INVALID"
+            assert caught.value.usage == (80, 40)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("stage,limit", [
+    ("realize", MAX_REALIZATION_TEXT_CHARS), ("present", MAX_PRESENTATION_TEXT_CHARS),
+])
+@pytest.mark.parametrize("over", [0, 1])
+async def test_narrative_stage_text_boundaries_preserve_usage_and_public_safety(stage, limit, over):
+    text = "字" * (limit + over)
+    payload = {"text": text}
+    frame = generation_frame()
+    if stage == "present":
+        payload.update({"focus_position_id": "p-a", "expression_ids": ["e-letter"], "reinterprets": []})
+        frame = ReadingFrame(
+            revision=1, candidates=[{
+                "position_id": "p-a", "name": "折信人", "text": "她停在灯下。",
+                "active_uses": [{"expression_id": "e-letter"}],
+            }], previous_segments=[], open_relations=[],
+        )
+    provider, client = provider_with_handler(
+        lambda request: httpx.Response(200, json=response(json.dumps(payload, ensure_ascii=False)))
+    )
+    try:
+        if over:
+            with pytest.raises(ProviderError) as caught:
+                await getattr(provider, stage)(frame)
+            assert caught.value.code == "MODEL_OUTPUT_INVALID"
+            assert caught.value.usage == (80, 40)
+            assert text not in str(caught.value) + json.dumps(caught.value.public())
+        else:
+            result = await getattr(provider, stage)(frame)
+            assert (result.value if stage == "realize" else result.value.text) == text
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("over", [0, 1])
+async def test_decoded_content_character_boundary_keeps_validated_usage(over):
+    class ContentPayload(BaseModel):
+        padding: str
+
+    empty_length = len(json.dumps({"padding": ""}))
+    content = json.dumps({"padding": "a" * (MAX_MODEL_CONTENT_CHARS - empty_length + over)})
+    assert len(content) == MAX_MODEL_CONTENT_CHARS + over
+    provider, client = provider_with_handler(lambda request: httpx.Response(200, json=response(content)))
+    try:
+        if over:
+            with pytest.raises(ProviderError) as caught:
+                await provider._request("只输出 json。", {}, ContentPayload)
+            assert caught.value.code == "MODEL_OUTPUT_TOO_LARGE"
+            assert caught.value.usage == (80, 40)
+        else:
+            result = await provider._request("只输出 json。", {}, ContentPayload)
+            assert len(result.value.padding) == MAX_MODEL_CONTENT_CHARS - empty_length
+    finally:
+        await client.aclose()
+
+
+async def test_request_character_boundary_is_checked_before_dispatch_and_creates_no_unknown_usage():
+    class ContentPayload(BaseModel):
+        padding: str
+
+    captured = []
+
+    def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=response('{"padding":"ok"}'))
+
+    provider, client = provider_with_handler(handler)
+    try:
+        await provider._request("只输出 json。", {"padding": ""}, ContentPayload)
+        messages = captured[0]["messages"]
+        base_length = sum(len(message["content"]) for message in messages)
+        padding = "a" * (MAX_MODEL_REQUEST_CHARS - base_length)
+        await provider._request("只输出 json。", {"padding": padding}, ContentPayload)
+        assert sum(len(message["content"]) for message in captured[-1]["messages"]) == MAX_MODEL_REQUEST_CHARS
+        with pytest.raises(ProviderError) as caught:
+            await provider._request("只输出 json。", {"padding": padding + "a"}, ContentPayload)
+        assert caught.value.code == "CONTEXT_TOO_LARGE"
+        assert caught.value.usage is None
+        assert len(captured) == 2
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.parametrize("field", ["text", "target_position_id", "expression_id", "role"])

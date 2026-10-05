@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { DEFAULT_LIMITS, LIMIT_FIELDS, budgetRangeText } from "../budgetLimits";
 import type { EditorMode } from "../presetDraft";
 import type { Preset } from "../types";
 import type { Provider } from "../types";
@@ -27,6 +28,14 @@ export default function Sidebar({ model }: { model: Workbench }) {
     setProvider,
     limits,
     setLimits,
+    snapshot,
+    maximumLimits,
+    minimumRunLimits,
+    validRunLimits,
+    limitsChanged,
+    budgetError,
+    updateRunLimits,
+    resetRunLimits,
     selectedRunId,
     booting,
     busy,
@@ -67,7 +76,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
       : !preset
         ? "尚无可用的初始叙事，请选择或保存一份预设。"
         : !validLimits
-          ? "预算须为范围内的正整数：调用 ≤ 200，Token ≤ 500,000，并行 ≤ 6，窗口 ≤ 100。"
+          ? budgetRangeText(maximumLimits)
           : needsConfig
             ? configBlockReason
             : "";
@@ -131,24 +140,19 @@ export default function Sidebar({ model }: { model: Workbench }) {
             ? "确定性文本用于验证结构机制，不代表模型的叙事效果。"
             : "创建后开始或单步才会调用模型。下方预算是本次实验的硬上限。"}
         </p>
-        <div className="budget-grid">
-          {(
-            [
-              ["max_calls", "调用上限", 200],
-              ["max_tokens", "Token 上限", 500000],
-              ["max_parallel", "并行位置", 6],
-              ["max_windows", "窗口上限", 100],
-            ] as const
-          ).map(([field, label, maximum]) => (
+        <div id="experiment-budget" role="group" aria-label="实验预算">
+          <p className="helper">新实验默认 Token 预算为 {DEFAULT_LIMITS.max_tokens.toLocaleString("zh-CN")}，上限 {maximumLimits.max_tokens.toLocaleString("zh-CN")}（按 Token 数计）。加载存档后，下方显示该实验已保存的预算。</p>
+          <div className="budget-grid">
+          {LIMIT_FIELDS.map(([field, label]) => (
             <label key={field} htmlFor={field}>
               {label}
               <input
                 id={field}
                 type="number"
                 min="1"
-                max={maximum}
+                max={maximumLimits[field]}
                 value={limits[field]}
-                disabled={disabled}
+                disabled={disabled || anyActive}
                 onChange={(event) =>
                   setLimits((current) => ({
                     ...current,
@@ -158,6 +162,26 @@ export default function Sidebar({ model }: { model: Workbench }) {
               />
             </label>
           ))}
+          </div>
+          {snapshot && <div className="run-budget-actions">
+            <p className="helper">当前存档：{snapshot.run.title}。更新只修改本实验上限，保留已有用量、结果与恢复点，不调用模型。</p>
+            <button className="button secondary full"
+              disabled={disabled || anyActive || !validRunLimits || !limitsChanged}
+              onClick={() => void updateRunLimits()}>
+              {busy === "更新实验预算" ? "正在更新…" : "更新本实验预算"}
+            </button>
+            <button className="text-button" disabled={disabled || anyActive || !limitsChanged}
+              onClick={resetRunLimits}>恢复已保存预算</button>
+            {!validRunLimits && !anyActive && <p className="helper creation-feedback" role="status">
+              {validLimits
+                ? `上限不能低于本档已用量。本档最低上限：调用 ${minimumRunLimits.max_calls}，Token ${minimumRunLimits.max_tokens.toLocaleString("zh-CN")}，窗口 ${minimumRunLimits.max_windows}；各上限须为正整数。`
+                : budgetRangeText(maximumLimits)}
+            </p>}
+            {budgetError && <p className="creation-feedback creation-error" role="alert">
+              <strong>预算未能更新</strong><span>{budgetError}</span>
+            </p>}
+          </div>}
+          {anyActive && <p className="helper creation-feedback" role="status">请先暂停运行中的实验，再修改预算。</p>}
         </div>
         {provider === "deepseek" && preset && <p className="helper budget-estimate">
           {preset.positions.length} 位人物的完整窗口通常需要 {preset.positions.length * 2 + 1} 次调用，重试另计。请先用少量窗口验证。

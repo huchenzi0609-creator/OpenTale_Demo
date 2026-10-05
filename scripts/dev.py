@@ -7,6 +7,7 @@ The script never reads private configuration and never forwards provider errors.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import shutil
@@ -29,13 +30,35 @@ class DevError(Exception):
 
 
 def assert_port_free(port: int) -> None:
-    with socket.socket() as probe:
-        try:
+    try:
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+                probe.listen(1)
+                return
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise
+        # On macOS a reused loopback bind/listen can coexist with a wildcard
+        # listener. Check reachability first, without sending application data.
+        with socket.socket() as connection:
+            connection.settimeout(0.2)
+            result = connection.connect_ex(("127.0.0.1", port))
+            if result == 0:
+                raise OSError(errno.EADDRINUSE, "listener exists")
+            if result != errno.ECONNREFUSED:
+                raise OSError(result, "listener could not be safely excluded")
+        with socket.socket() as probe:
+            # Match uvicorn's restart semantics: closed connections in TIME_WAIT
+            # must not look like a live server. A reused bind alone can succeed
+            # beside another bound socket, so verify that listening is possible.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
-        except PermissionError:
-            raise SystemExit("当前进程没有本机回环监听权限；请在允许本地服务监听的终端或环境中启动。") from None
-        except OSError:
-            raise SystemExit(f"端口 {port} 已被占用；请指定 --port 使用其他端口。") from None
+            probe.listen(1)
+    except PermissionError:
+        raise SystemExit("当前进程没有本机回环监听权限；请在允许本地服务监听的终端或环境中启动。") from None
+    except OSError:
+        raise SystemExit(f"端口 {port} 已被占用；请指定 --port 使用其他端口。") from None
 
 
 def server_command(port: int, token: str | None = None) -> list[str]:

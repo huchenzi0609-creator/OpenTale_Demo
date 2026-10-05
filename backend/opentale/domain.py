@@ -7,6 +7,19 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .capacity import (
+    DEFAULT_TOKEN_BUDGET,
+    MAX_BINDING_TEXT_CHARS,
+    MAX_CALL_BUDGET,
+    MAX_OPERATION_TEXT_CHARS,
+    MAX_PARALLEL_POSITIONS,
+    MAX_PRESENTATION_TEXT_CHARS,
+    MAX_PROPOSAL_OPERATIONS,
+    MAX_PROPOSAL_TEXT_CHARS,
+    MAX_TOKEN_BUDGET,
+    MAX_WINDOW_BUDGET,
+)
+
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -17,10 +30,10 @@ class Record(BaseModel):
 
 
 class Limits(Record):
-    max_calls: int = Field(default=24, ge=1, le=200)
-    max_tokens: int = Field(default=40000, ge=1, le=500000)
-    max_parallel: int = Field(default=3, ge=1, le=6)
-    max_windows: int = Field(default=8, ge=1, le=100)
+    max_calls: int = Field(default=24, ge=1, le=MAX_CALL_BUDGET)
+    max_tokens: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=1, le=MAX_TOKEN_BUDGET)
+    max_parallel: int = Field(default=3, ge=1, le=MAX_PARALLEL_POSITIONS)
+    max_windows: int = Field(default=8, ge=1, le=MAX_WINDOW_BUDGET)
 
 
 class Usage(Record):
@@ -36,8 +49,8 @@ class Usage(Record):
 class Binding(Record):
     source_position_id: str
     source_expression_id: str
-    value: str = Field(min_length=1, max_length=12000)
-    anchor: str = Field(min_length=1, max_length=12000)
+    value: str = Field(min_length=1, max_length=MAX_BINDING_TEXT_CHARS)
+    anchor: str = Field(min_length=1, max_length=MAX_BINDING_TEXT_CHARS)
     revision: int
 
 
@@ -79,15 +92,15 @@ class Operation(Record):
     target_position_id: str
     expression_id: str
     role: str = Field(min_length=1, max_length=80)
-    value: str = Field(min_length=1, max_length=1600)
-    anchor: str = Field(min_length=1, max_length=1600)
+    value: str = Field(min_length=1, max_length=MAX_OPERATION_TEXT_CHARS)
+    anchor: str = Field(min_length=1, max_length=MAX_OPERATION_TEXT_CHARS)
 
 
 class Proposal(Record):
     position_id: str
     based_on_revision: int
-    text: str = Field(min_length=1, max_length=3500)
-    operations: list[Operation] = Field(min_length=1, max_length=12)
+    text: str = Field(min_length=1, max_length=MAX_PROPOSAL_TEXT_CHARS)
+    operations: list[Operation] = Field(min_length=1, max_length=MAX_PROPOSAL_OPERATIONS)
 
 
 class GenerationFrame(Record):
@@ -111,7 +124,7 @@ class ReadingFrame(Record):
 
 
 class Presentation(Record):
-    text: str = Field(min_length=1, max_length=10000)
+    text: str = Field(min_length=1, max_length=MAX_PRESENTATION_TEXT_CHARS)
     focus_position_id: str
     expression_ids: list[str] = Field(min_length=1)
     reinterprets: list[str] = Field(default_factory=list)

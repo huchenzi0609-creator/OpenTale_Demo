@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, post, request } from "./api";
+import { DEFAULT_LIMITS, budgetBounds, limitsValid, sameLimits } from "./budgetLimits";
 import { presetPayload, type PresetDraft } from "./presetDraft";
 import type {
   Counterfactual,
@@ -14,18 +15,6 @@ import type {
   Verification,
 } from "./types";
 
-const DEFAULT_LIMITS: Limits = {
-  max_calls: 24,
-  max_tokens: 40000,
-  max_parallel: 3,
-  max_windows: 8,
-};
-const MAX_LIMITS: Limits = {
-  max_calls: 200,
-  max_tokens: 500000,
-  max_parallel: 6,
-  max_windows: 100,
-};
 const errorText = (error: unknown) =>
   error instanceof ApiError
     ? `${error.message}（${error.code}）`
@@ -50,6 +39,7 @@ export function useWorkbench() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [createError, setCreateError] = useState("");
+  const [budgetError, setBudgetError] = useState("");
   const [runControlFocusRequest, setRunControlFocusRequest] = useState(0);
   const [notice, setNotice] = useState("");
   const [pollError, setPollError] = useState("");
@@ -69,6 +59,10 @@ export function useWorkbench() {
   useEffect(() => {
     setCreateError("");
   }, [presetId, provider, limits, config?.configured]);
+
+  useEffect(() => {
+    setBudgetError("");
+  }, [limits, selectedRunId]);
 
   useEffect(() => {
     let live = true;
@@ -172,6 +166,7 @@ export function useWorkbench() {
   function adopt(next: Snapshot) {
     selection.current += 1;
     setSnapshot(next);
+    setLimits({ ...next.run.limits });
     setSelectedRunId(next.run.id);
     setDeleteArmed(false);
     setCounterfactual(null);
@@ -208,7 +203,10 @@ export function useWorkbench() {
     if (!id) return;
     await perform("加载存档", async () => {
       const next = await request<Snapshot>(`/runs/${encodeURIComponent(id)}`);
-      if (ticket === selection.current) setSnapshot(next);
+      if (ticket === selection.current) {
+        setSnapshot(next);
+        setLimits({ ...next.run.limits });
+      }
     });
   }
   async function runAction(action: "step" | "start" | "pause") {
@@ -246,18 +244,43 @@ export function useWorkbench() {
   const disabled = !!busy;
   const frozen = disabled || active;
   const exhausted = snapshot?.run.status === "budget_exhausted";
-  const validLimits = (Object.keys(limits) as (keyof Limits)[]).every(
-    (field) =>
-      Number.isInteger(limits[field]) &&
-      limits[field] >= 1 &&
-      limits[field] <= MAX_LIMITS[field],
-  );
+  const maximumLimits = budgetBounds(config);
+  const validLimits = limitsValid(limits, maximumLimits);
   const tokenUsage = snapshot
     ? snapshot.run.usage.input_tokens +
       snapshot.run.usage.output_tokens +
       (snapshot.run.usage.reserved_tokens ?? 0) +
       (snapshot.run.usage.unknown_tokens ?? 0)
     : 0;
+  const minimumRunLimits: Limits = {
+    max_calls: Math.max(1, snapshot?.run.usage.calls ?? 0),
+    max_tokens: Math.max(1, tokenUsage),
+    max_parallel: 1,
+    max_windows: Math.max(1, snapshot?.run.usage.windows ?? 0),
+  };
+  const validRunLimits = limitsValid(limits, maximumLimits, minimumRunLimits);
+  const limitsChanged = !!snapshot && !sameLimits(limits, snapshot.run.limits);
+
+  const updateRunLimits = () => {
+    if (!snapshot || anyActive || disabled || !validRunLimits || !limitsChanged) return;
+    const id = snapshot.run.id;
+    const nextLimits = { ...limits };
+    setBudgetError("");
+    return perform("更新实验预算", async () => {
+      const next = await request<Snapshot>(`/runs/${encodeURIComponent(id)}/limits`, {
+        method: "PATCH",
+        body: JSON.stringify(nextLimits),
+      });
+      adopt(next);
+      setNotice("本实验预算已更新，已有结果、用量与恢复点保留；未调用模型。");
+    }, setBudgetError);
+  };
+  const resetRunLimits = () => {
+    if (snapshot && !anyActive && !disabled) {
+      setLimits({ ...snapshot.run.limits });
+      setBudgetError("");
+    }
+  };
 
   const createRun = () => {
     setCreateError("");
@@ -372,6 +395,7 @@ export function useWorkbench() {
     error,
     setError,
     createError,
+    budgetError,
     runControlFocusRequest,
     notice,
     pollError,
@@ -390,8 +414,14 @@ export function useWorkbench() {
     frozen,
     exhausted,
     validLimits,
+    maximumLimits,
+    minimumRunLimits,
+    validRunLimits,
+    limitsChanged,
     tokenUsage,
     createRun,
+    updateRunLimits,
+    resetRunLimits,
     savePreset,
     reloadConfig,
     forkRun,

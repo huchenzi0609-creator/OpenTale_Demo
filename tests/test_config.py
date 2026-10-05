@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from opentale.capacity import MAX_MODEL_OUTPUT_TOKENS
 from opentale.config import (
     ConfigError,
     Settings,
@@ -204,3 +205,17 @@ def test_invalid_scalar_configuration_does_not_expose_file_values(tmp_path, line
         load_settings(tmp_path)
     assert "fixture-credential" not in str(caught.value)
     assert line not in str(caught.value)
+
+
+def test_output_ceiling_is_wider_without_raising_the_default_or_loading_real_secrets(tmp_path):
+    assert Settings().max_output_tokens == 1600
+    (tmp_path / ".env.local").write_text(
+        f"OPENTALE_MAX_OUTPUT_TOKENS={MAX_MODEL_OUTPUT_TOKENS}\n", encoding="utf-8"
+    )
+    assert load_settings(tmp_path).max_output_tokens == MAX_MODEL_OUTPUT_TOKENS
+    (tmp_path / ".env.local").write_text(
+        f"OPENTALE_MAX_OUTPUT_TOKENS={MAX_MODEL_OUTPUT_TOKENS + 1}\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as caught:
+        load_settings(tmp_path)
+    assert caught.value.code == "CONFIG_INVALID"

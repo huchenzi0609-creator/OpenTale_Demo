@@ -233,13 +233,23 @@ def verify(server: Server) -> None:
     check(status == 200 and health.get("ok") is True, "真实 HTTP 健康检查")
     status, config = server.request("GET", "/api/config")
     check(status == 200 and config.get("configured") is False, "隔离配置不加载用户密钥")
+    expected_bounds = {"max_calls": 1000, "max_tokens": 512000, "max_parallel": 8, "max_windows": 1000}
+    check(config.get("budget_bounds") == expected_bounds, "公开配置声明统一的 512K 与调度预算上限")
     assert_safe_projection(config)
     status, verification = server.request("GET", "/api/verify")
     check(status == 200 and verification.get("ok") is True and bool(verification.get("checks")) and all(
         item.get("passed") is True for item in verification.get("checks", [])
     ), "内置离线机制验收")
-    status, run = server.request("POST", "/api/runs", {"preset_id": "letters", "provider": "fixture"})
-    check(status == 200 and run["run"]["revision"] == 0, "创建 fixture 对局")
+    status, rejected = server.request("POST", "/api/runs", {
+        "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 512001},
+    })
+    check(status == 422 and rejected["error"]["code"] == "REQUEST_INVALID",
+          "512001 Token 预算在创建前安全拒绝")
+    status, run = server.request("POST", "/api/runs", {
+        "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 512000},
+    })
+    check(status == 200 and run["run"]["revision"] == 0 and run["run"]["limits"]["max_tokens"] == 512000,
+          "创建并保存 512000 Token 的 fixture 对局")
     run_id = id_of(run)
     status, advanced = server.request("POST", f"/api/runs/{run_id}/step")
     check(status == 200 and advanced["run"]["revision"] == 1 and bool(advanced["story"]), "联合安装、续延与呈现完成一窗口")
@@ -286,8 +296,30 @@ def verify(server: Server) -> None:
     _, exhausted = server.request("GET", f"/api/runs/{id_of(limited)}")
     check(exhausted["run"]["status"] == "budget_exhausted"
           and exhausted["run"]["usage"]["calls"] <= 1, "调用前预算准入与耗尽暂停")
+    raised_limits = {"max_calls": 14, "max_tokens": 512000, "max_parallel": 1, "max_windows": 2}
+    status, replenished = server.request("PATCH", f"/api/runs/{id_of(limited)}/limits", raised_limits)
+    check(status == 200 and replenished["run"]["status"] == "paused"
+          and replenished["run"]["last_error"] is None
+          and replenished["run"]["limits"] == raised_limits
+          and replenished["run"]["usage"] == exhausted["run"]["usage"]
+          and replenished["pending"] == exhausted["pending"]
+          and replenished["run"]["revision"] == exhausted["run"]["revision"],
+          "耗尽后保存预算保留恢复点与用量且不发起生成")
+    status, resumed = server.request("POST", f"/api/runs/{id_of(limited)}/step")
+    check(status == 200 and resumed["run"]["revision"] == 1 and resumed["run"]["usage"]["windows"] == 1,
+          "预算补充后原存档继续完成窗口")
+    status, rejected = server.request("PATCH", f"/api/runs/{id_of(limited)}/limits", {
+        **raised_limits, "max_calls": 1,
+    })
+    _, after_rejection = server.request("GET", f"/api/runs/{id_of(limited)}")
+    check(status == 422 and rejected["error"]["code"] == "BUDGET_BELOW_USAGE" and after_rejection == resumed,
+          "已有调用不能被降额抹除且拒绝后存档不变")
+    status, resumed_replay = server.request("GET", f"/api/runs/{id_of(limited)}/replay")
+    check(status == 200 and resumed_replay.get("ok") is True,
+          "预算保存与恢复事件不破坏语义重放")
     status, background = server.request("POST", "/api/runs", {"preset_id": "letters", "provider": "fixture"})
-    check(status == 200, "创建后台控制对局")
+    check(status == 200 and background["run"]["limits"]["max_tokens"] == 128000,
+          "创建后台控制对局采用 128000 Token 默认预算")
     server.request("POST", f"/api/runs/{id_of(background)}/start")
     server.request("POST", f"/api/runs/{id_of(background)}/pause")
     deadline = time.monotonic() + 10

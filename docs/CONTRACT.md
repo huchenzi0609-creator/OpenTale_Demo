@@ -18,7 +18,9 @@ An accepted batch must freshly rebind at least one shared position/expression/ro
 - `GenerationFrame`: `position_id`, `name`, `revision`, `seed_text`, `active_uses: list[dict]`, `condition_fingerprint`, `recent_surface: list[str]`, `peers: list[dict]`, `peer_interfaces: list[dict]`. Actor `active_uses` contain expression_id, expression text, role and binding values; exclude technical binding source provenance. Peer interfaces expose only position_id/expression_id/role writable handles, no private biography content. Seed profile is an active initial use, not a separate immutable prompt.
 - `ReadingFrame`: `revision`, `candidates: list[dict]` (position_id, name, text, active uses), `previous_segments: list[dict]`, `open_relations: list[dict]`, `current_focus: str | None`.
 - `Presentation`: `text`, `focus_position_id`, `expression_ids: list[str]`, `reinterprets: list[str]` (existing story segment IDs). No technical references inside prose.
-- `Limits`: `max_calls=24`, `max_tokens=40000`, `max_parallel=3`, `max_windows=8`; all positive and bounded by server (calls<=200, tokens<=500000, parallel<=6, windows<=100).
+- `Limits`: `max_calls=24`, `max_tokens=128000`, `max_parallel=3`, `max_windows=8`; all positive and bounded by server (calls<=1000, tokens<=512000, parallel<=8, windows<=1000). 512K means decimal 512,000 total experiment tokens.
+
+Application capacities share `opentale.capacity`: Proposal operations<=256, wire fragments<=128, Operation value/anchor<=16000 chars, Proposal text<=32000 chars, Binding value/anchor<=32000 chars, realization<=32000 chars and Presentation text<=64000 chars. Provider input<=512000 chars, response content<=256000 chars, response bytes<=2 MiB. The configured single-response output parameter permits 128..32768 tokens (default1600), independently of the experiment budget; existing local settings are never rewritten. Role/identifier and reference validity constraints remain unchanged.
 
 ## Provider adapter (`opentale.providers`)
 
@@ -52,7 +54,7 @@ Preset writes accept up to 1 MiB of HTTP data; all other writes retain the small
 
 `GET /api/health` -> `{ok:true, version:"0.2.0"}`
 
-`GET /api/config`, `POST /api/config/reload` -> safe Settings.public plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
+`GET /api/config`, `POST /api/config/reload` -> safe Settings.public, `budget_bounds:{max_calls:1000,max_tokens:512000,max_parallel:8,max_windows:1000}`, plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
 
 `POST /api/runs/{id}/fork` accepts optional `title` and `limits: Limits`. Omitted limits inherit the parent. Explicit limits must pass the ordinary budget bounds, apply only to the new branch and do not trigger generation. Pending accepted work and semantic evidence are retained; branch usage starts at zero while the parent's usage remains recorded.
 
@@ -73,13 +75,15 @@ Preset writes accept up to 1 MiB of HTTP data; all other writes retain the small
  audit:{shared_expressions:[],effective_edges:[],joint_targets:[],last_batch:[]}}
 ```
 
-Events `{id,type,revision,at,data}`. Types `created`, `window_started`, `proposal_ready`, `batch_installed`, `continuation_resumed`, `presented`, `paused`, `error`, `budget_exhausted`, `forked`. Technical evidence stays in event.data. Story segment `{id,revision,text,focus_position_id,expression_ids:[],reinterprets:[]}`. Status `idle|running|paused|error|budget_exhausted`; phase `idle|drafting|realizing|presenting`.
+Events `{id,type,revision,at,data}`. Types `created`, `window_started`, `proposal_ready`, `batch_installed`, `continuation_resumed`, `presented`, `paused`, `error`, `budget_exhausted`, `forked`, `limits_updated`. Technical evidence stays in event.data. Story segment `{id,revision,text,focus_position_id,expression_ids:[],reinterprets:[]}`. Status `idle|running|paused|error|budget_exhausted`; phase `idle|drafting|realizing|presenting`.
+
+`PATCH /api/runs/{id}/limits` body `Limits` -> updated full Snapshot. Only a stable run may be changed; RUN_BUSY rejects active execution. The budget must not fall below used calls, input/output/unknown/reserved token occupancy or completed windows (BUDGET_BELOW_USAGE). It preserves pending results, paid usage, semantic state and the original run ID, records limits_updated, and never invokes a provider. A budget-exhausted run becomes paused and clears only its old BUDGET_EXHAUSTED warning; other model errors remain as historical recovery context. Widened schemas accept existing snapshots without migration.
 
 `POST /api/runs/{id}/step` -> full snapshot after one complete/recovered window. On safe errors, return 422 `{error:{code,message,retryable}}`; stored snapshot retains recoverable state.
 
 `POST /api/runs/{id}/start` -> snapshot, background loop; `POST /pause` -> snapshot, cooperative pause at operation boundary. Resuming uses pending results. Same run cannot execute overlapping steps.
 
-`POST /api/runs/{id}/fork` body `{title?:str}` -> independent snapshot; no merge/global-history authority.
+`POST /api/runs/{id}/fork` body `{title?:str,limits?:Limits}` -> independent snapshot; no merge/global-history authority.
 
 `DELETE /api/runs/{id}` -> `{deleted:true}`, forbidden while active.
 

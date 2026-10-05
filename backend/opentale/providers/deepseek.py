@@ -9,6 +9,18 @@ from typing import TypeVar
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
 
+from opentale.capacity import (
+    MAX_FRAGMENT_TARGETS,
+    MAX_MODEL_CONTENT_CHARS,
+    MAX_MODEL_REQUEST_CHARS,
+    MAX_MODEL_RESPONSE_BYTES,
+    MAX_OPERATION_TEXT_CHARS,
+    MAX_PRESENTATION_TEXT_CHARS,
+    MAX_PROPOSAL_FRAGMENTS,
+    MAX_PROPOSAL_OPERATIONS,
+    MAX_PROPOSAL_TEXT_CHARS,
+    MAX_REALIZATION_TEXT_CHARS,
+)
 from opentale.config import Settings
 from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, ReadingFrame
 from opentale.security import contains_credential as _contains_credential
@@ -16,14 +28,15 @@ from opentale.security import contains_credential as _contains_credential
 from .base import ModelResult, ProviderError
 
 T = TypeVar("T", bound=BaseModel)
-MAX_RESPONSE_BYTES = 262_144
-MAX_CONTENT_CHARS = 32_000
-MAX_REQUEST_CHARS = 80_000
+# Compatibility aliases for callers inspecting this provider's transport bounds.
+MAX_RESPONSE_BYTES = MAX_MODEL_RESPONSE_BYTES
+MAX_CONTENT_CHARS = MAX_MODEL_CONTENT_CHARS
+MAX_REQUEST_CHARS = MAX_MODEL_REQUEST_CHARS
 
 
 class _Surface(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    text: str = Field(min_length=1, max_length=8000)
+    text: str = Field(min_length=1, max_length=MAX_REALIZATION_TEXT_CHARS)
 
 
 class _FragmentTarget(BaseModel):
@@ -35,13 +48,13 @@ class _FragmentTarget(BaseModel):
 
 class _Fragment(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    text: str = Field(min_length=1, max_length=3500)
-    targets: list[_FragmentTarget] = Field(max_length=12)
+    text: str = Field(min_length=1, max_length=MAX_PROPOSAL_TEXT_CHARS)
+    targets: list[_FragmentTarget] = Field(max_length=MAX_FRAGMENT_TARGETS)
 
 
 class _FragmentProposal(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    fragments: list[_Fragment] = Field(min_length=1, max_length=24)
+    fragments: list[_Fragment] = Field(min_length=1, max_length=MAX_PROPOSAL_FRAGMENTS)
 
 
 class _ProposalResponse(RootModel[_FragmentProposal | Proposal]):
@@ -76,6 +89,10 @@ def _proposal_schema(frame: GenerationFrame) -> dict:
         raise ProviderError("GENERATION_FRAME_INVALID", "当前局部没有可承接的同伴接口。")
     schema = _FragmentProposal.model_json_schema()
     schema["$defs"]["_FragmentTarget"] = {"oneOf": targets}
+    schema["$defs"]["_Fragment"]["allOf"] = [{
+        "if": {"properties": {"targets": {"minItems": 1}}},
+        "then": {"properties": {"text": {"maxLength": MAX_OPERATION_TEXT_CHARS}}},
+    }]
     return schema
 
 
@@ -107,7 +124,9 @@ class _Usage(BaseModel):
 
 class _Message(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True)
-    content: str = Field(min_length=1, max_length=MAX_CONTENT_CHARS)
+    # The transport byte cap bounds allocation. Check the content character cap only
+    # after the whole envelope (including strict usage counts) has been validated.
+    content: str = Field(min_length=1)
 
 
 class _Choice(BaseModel):
@@ -232,6 +251,8 @@ class DeepSeekProvider:
                 raise ProviderError("PROVIDER_RESPONSE_INVALID", "服务商返回了无效响应。", True) from None
             usage = (envelope.usage.prompt_tokens, envelope.usage.completion_tokens)
             choice = envelope.choices[0]
+            if len(choice.message.content) > MAX_CONTENT_CHARS:
+                raise ProviderError("MODEL_OUTPUT_TOO_LARGE", "模型正文超出安全长度。", True)
             if choice.finish_reason == "length":
                 raise ProviderError("MODEL_OUTPUT_TRUNCATED", "模型输出被截断，可适当提高输出预算后重试。", True)
             if choice.finish_reason != "stop":
@@ -281,7 +302,7 @@ class DeepSeekProvider:
             raise ProviderError("MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage)
 
     async def propose(self, frame: GenerationFrame) -> ModelResult[Proposal]:
-        instructions = """
+        instructions = f"""
 在当前叙述的未完成处生成一份短叙述，并把叙述中的构想直接转用到 peers 的当前条件。
 本窗口要求多来源共同作用于同一个目标用法，不把单输入的顺序接龙称为联合生成。
 若有至少两个 peers，选取他们已有的同一个共同 expression_id 与当前 role，
@@ -289,15 +310,17 @@ class DeepSeekProvider:
 若输入有 recommended_shared_interface，优先承接它的 expression_id 与 role，
 在其中至少两位 target_position_ids 的生活中写出本次构想；不同人物不必经历相同情节。
 这些操作从当前叙述中形成，只改变内容与承接，不预先规定剧情；可以额外转用开放角色或主体背景。
-输出 fragments 数组；每个片段写一次 text，并附 targets 数组。无承接的铺垫片段可用 targets: []。
-所有片段的 targets 总计 1–12 项。target_position_id 必须来自 peers 且不是自身；
+输出 fragments 数组，至多 {MAX_PROPOSAL_FRAGMENTS} 个片段；每个片段写一次 text，并附 targets 数组。
+无承接的铺垫片段可用 targets: []。所有片段的 targets 总计 1–{MAX_PROPOSAL_OPERATIONS} 项；
+每个片段的 targets 至多 {MAX_FRAGMENT_TARGETS} 项。target_position_id 必须来自 peers 且不是自身；
 expression_id 是表达的 ID，不是 active_uses 中的用法 id；按 schema 选择对应目标允许的 ID。
 role 沿用当前作用或给出相容的开放作用；多个 targets 可直接承接同一片段。
 peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允许转用目标的主体背景，
 让本次表达参与目标如何构成自身；这种变更保持局部归属，不裁定全网共同的真实身份或过去。
 有 targets 的片段 text 将原样成为这些目标人物那里实际成立的内容，写清对应人物和正在发生的生活。
 不要额外输出 value、anchor、position_id、based_on_revision 或 operations，也不要重复抄写原文。
-有承接的单片段至多 1600 字符，拼接后的全部叙述至多 3500 字符；保持短而自然。
+有承接的单片段至多 {MAX_OPERATION_TEXT_CHARS} 字符，拼接后的全部叙述（含换行）至多
+{MAX_PROPOSAL_TEXT_CHARS} 字符；按生活的需要决定长度，不必用满上限。
 只构想下一处正在发生的生活，不告诉人物它是模型、被控制或被技术生成。
 """
         data = _actor_frame(frame)
@@ -323,7 +346,7 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
             for fragment in wire.fragments:
                 if not fragment.text.strip():
                     invalid("EMPTY_FRAGMENT")
-                if fragment.targets and len(fragment.text) > 1600:
+                if fragment.targets and len(fragment.text) > MAX_OPERATION_TEXT_CHARS:
                     invalid("FRAGMENT_TOO_LONG")
                 for target in fragment.targets:
                     # Mechanical compilation uses the model's prose verbatim. There is no
@@ -338,10 +361,10 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
                     ))
             if not operations:
                 invalid("NO_PEER_OPERATION")
-            if len(operations) > 12:
+            if len(operations) > MAX_PROPOSAL_OPERATIONS:
                 invalid("TOO_MANY_OPERATIONS")
             text = "\n".join(fragment.text for fragment in wire.fragments)
-            if len(text) > 3500:
+            if len(text) > MAX_PROPOSAL_TEXT_CHARS:
                 invalid("PROPOSAL_TOO_LARGE")
             value = Proposal(
                 position_id=frame.position_id, based_on_revision=frame.revision,
@@ -373,9 +396,10 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
         return ModelResult(value, result.input_tokens, result.output_tokens)
 
     async def realize(self, frame: GenerationFrame) -> ModelResult[str]:
-        instructions = """
-从已经重构的 active_uses 条件继续当前未完成 seed_text，输出 {"text":"自然语言正文"}。
-正文为短段第三人称叙述，承接正在生效的 values，尤其同一表达上的多个 values。
+        instructions = f"""
+从已经重构的 active_uses 条件继续当前未完成 seed_text，输出 {{"text":"自然语言正文"}}。
+正文为第三人称叙述，承接正在生效的 values，尤其同一表达上的多个 values。
+text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅，不必用满上限。
 这次变化应影响人物当前如何继续；不要仅把条件列表逐条复述，不要解释技术来源。
 """
         result = await self._request(instructions, _actor_frame(frame), _Surface)
@@ -386,12 +410,13 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
         return ModelResult(result.value.text, result.input_tokens, result.output_tokens)
 
     async def present(self, frame: ReadingFrame) -> ModelResult[Presentation]:
-        instructions = """
+        instructions = f"""
 你是一个局部阅读位置。选择 candidates 中正在生效的一处叙述，形成下一段可读正文。
 沿已有共同表达的用法展开，让新段落改变此前某部分如何被读；不要求统一过去或总结所有动作。
 focus_position_id 必须来自候选；expression_ids 仅使用候选 active_uses 中已有的表达ID。
 reinterprets 可以为空，否则仅引用 previous_segments 中的段落ID，且正文应实际参与重读。
 所有ID只在结构字段输出。text 不含段落编号、节点编号、括号引用、诊断说明或来源标注。
+text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇幅，不必用满上限。
 """
         data = {
             "revision": frame.revision,

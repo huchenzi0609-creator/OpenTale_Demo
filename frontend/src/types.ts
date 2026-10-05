@@ -134,6 +134,7 @@ export interface PublicConfig {
   model: string;
   timeout_seconds: number;
   max_output_tokens: number;
+  budget_bounds?: Limits;
   diagnostics?: {
     config_file_path: string;
     config_file_exists: boolean;

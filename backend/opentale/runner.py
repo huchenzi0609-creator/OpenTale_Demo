@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from .config import Settings
-from .domain import Event, Pending, Presentation, ReadingFrame, Snapshot
+from .domain import Event, Limits, Pending, Presentation, ReadingFrame, Snapshot
 from .kernel import KernelError, audit_for, frame_for, install_presentation, validate_proposal, without_source
 from .kernel import install_batch as install
 from .providers import ModelResult, ProviderError, make_provider
@@ -39,6 +39,28 @@ class Runner:
         if not self.busy(run_id):
             state.run.status = "paused"
             self.event(state, "paused", boundary="idle")
+        return state
+
+    def update_limits(self, run_id: str, limits: Limits) -> Snapshot:
+        """Change admission bounds at a stable checkpoint without resetting paid work."""
+        state = self.store.load(run_id)
+        if self.busy(run_id) or state.run.status == "running":
+            raise KernelError("RUN_BUSY", "请先暂停本实验，再更新预算。")
+        usage = state.run.usage
+        occupied = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
+        if (
+            limits.max_calls < usage.calls
+            or limits.max_tokens < occupied
+            or limits.max_windows < usage.windows
+        ):
+            raise KernelError("BUDGET_BELOW_USAGE", "新预算不能小于本实验已用调用、Token 占用或已完成窗口。")
+        previous = state.run.limits.model_dump()
+        state.run.limits = limits.model_copy(deep=True)
+        if state.run.status == "budget_exhausted":
+            state.run.status = "paused"
+            if state.run.last_error and state.run.last_error.get("code") == "BUDGET_EXHAUSTED":
+                state.run.last_error = None
+        self.event(state, "limits_updated", previous=previous, limits=state.run.limits.model_dump())
         return state
 
     async def start(self, run_id: str) -> Snapshot:
@@ -131,7 +153,7 @@ class Runner:
             try:
                 provider = make_provider(state.run.provider, self.settings)
                 if state.run.usage.windows >= state.run.limits.max_windows:
-                    raise KernelError("BUDGET_EXHAUSTED", "本实验的局部窗口额度已用完，可建立分支继续。")
+                    raise KernelError("BUDGET_EXHAUSTED", "本实验的局部窗口额度已用完，可提高窗口预算后继续。")
                 if state.run.usage.calls + self._needed_calls(state) > state.run.limits.max_calls:
                     raise KernelError("BUDGET_EXHAUSTED", "剩余调用额度不足以完成一个窗口；没有发起新调用。")
                 if state.pending is None:

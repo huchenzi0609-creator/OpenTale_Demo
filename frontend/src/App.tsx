@@ -263,6 +263,10 @@ export default function App() {
                 </strong>
               </div>
             </section>
+            <p className="budget-note">
+              <a href="#experiment-budget">调整本实验预算 ↗</a>
+              {active && <span> · 请先暂停运行。</span>}
+            </p>
             {!!(
               (snapshot.run.usage.reserved_tokens ?? 0) +
               (snapshot.run.usage.unknown_tokens ?? 0) +
