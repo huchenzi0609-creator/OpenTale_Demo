@@ -44,6 +44,12 @@ class _Surface(BaseModel):
 
 class _FragmentTarget(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+    interface_index: int
+    role: str = Field(min_length=1, max_length=80)
+
+
+class _NamedFragmentTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
     target_position_id: str
     expression_id: str
     role: str = Field(min_length=1, max_length=80)
@@ -60,8 +66,19 @@ class _FragmentProposal(BaseModel):
     fragments: list[_Fragment] = Field(min_length=1, max_length=MAX_PROPOSAL_FRAGMENTS)
 
 
-class _ProposalResponse(RootModel[_FragmentProposal | Proposal]):
-    """Accept already-valid legacy replies without asking new calls to duplicate prose."""
+class _NamedFragment(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=MAX_PROPOSAL_TEXT_CHARS)
+    targets: list[_NamedFragmentTarget] = Field(max_length=MAX_FRAGMENT_TARGETS)
+
+
+class _NamedFragmentProposal(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    fragments: list[_NamedFragment] = Field(min_length=1, max_length=MAX_PROPOSAL_FRAGMENTS)
+
+
+class _ProposalResponse(RootModel[_FragmentProposal | _NamedFragmentProposal | Proposal]):
+    """Keep valid historical replies; new requests select program-owned interfaces."""
 
 
 class _JSONSyntaxError(ValueError):
@@ -70,10 +87,14 @@ class _JSONSyntaxError(ValueError):
         super().__init__(reason)
 
 
-def _proposal_schema(frame: GenerationFrame) -> dict:
-    """Bind response choices to this frame, without revealing peer private bindings."""
+def _routing_table(frame: GenerationFrame) -> list[dict]:
+    """Enumerate the exact old writable pairs; order is local to this request only.
+
+    Index selection replaces copying two unrelated identifiers. It grants no new
+    scopes and never uses a name to infer an identity or disclose private values.
+    """
     expressions = {use["expression_id"] for use in frame.active_uses}
-    targets = []
+    routes = []
     for peer in sorted(frame.peers, key=lambda item: item["id"]):
         if peer["id"] == frame.position_id:
             continue
@@ -82,22 +103,30 @@ def _proposal_schema(frame: GenerationFrame) -> dict:
             for interface in frame.peer_interfaces
             if interface["position_id"] == peer["id"]
         }
-        if not allowed:
-            continue
-        targets.append({
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["target_position_id", "expression_id", "role"],
-            "properties": {
-                "target_position_id": {"type": "string", "const": peer["id"]},
-                "expression_id": {"type": "string", "enum": sorted(allowed)},
-                "role": {"type": "string", "minLength": 1, "maxLength": 80},
-            },
-        })
-    if not targets:
+        for expression_id in sorted(allowed):
+            roles = sorted({
+                interface["role"] for interface in frame.peer_interfaces
+                if interface["position_id"] == peer["id"] and interface["expression_id"] == expression_id
+            })
+            routes.append({
+                "interface_index": len(routes),
+                "target_position_id": peer["id"],
+                "target_name": peer["name"],
+                "expression_id": expression_id,
+                "current_roles": roles,
+            })
+    return routes
+
+
+def _proposal_schema(frame: GenerationFrame) -> dict:
+    """Publish only request-owned route handles and open narrative roles."""
+    routes = _routing_table(frame)
+    if not routes:
         raise ProviderError("GENERATION_FRAME_INVALID", "当前局部没有可承接的同伴接口。")
     schema = _FragmentProposal.model_json_schema()
-    schema["$defs"]["_FragmentTarget"] = {"oneOf": targets}
+    schema["$defs"]["_FragmentTarget"]["properties"]["interface_index"]["enum"] = [
+        route["interface_index"] for route in routes
+    ]
     schema["$defs"]["_Fragment"]["allOf"] = [{
         "if": {"properties": {"targets": {"minItems": 1}}},
         "then": {"properties": {"text": {"maxLength": MAX_OPERATION_TEXT_CHARS}}},
@@ -195,10 +224,22 @@ def _validate_output(schema: type[T], parsed: object) -> T:
     if schema is _ProposalResponse:
         # Diagnose the selected wire shape instead of flattening errors from a union.
         legacy_fields = {"position_id", "based_on_revision", "text", "operations"}
-        selected = (
-            Proposal if isinstance(parsed, dict) and "fragments" not in parsed and legacy_fields <= parsed.keys()
-            else _FragmentProposal
-        )
+        selected = _FragmentProposal
+        if isinstance(parsed, dict):
+            if "fragments" not in parsed and legacy_fields <= parsed.keys():
+                selected = Proposal
+            elif isinstance(parsed.get("fragments"), list):
+                targets = [
+                    target for fragment in parsed["fragments"] if isinstance(fragment, dict)
+                    and isinstance(fragment.get("targets"), list) for target in fragment["targets"]
+                    if isinstance(target, dict)
+                ]
+                # Select one documented wire shape. Mixed references are rejected
+                # rather than guessed, with errors from just the selected schema.
+                if not any("interface_index" in target for target in targets) and any(
+                    "target_position_id" in target or "expression_id" in target for target in targets
+                ):
+                    selected = _NamedFragmentProposal
         wire = selected.model_validate(parsed, strict=True)
         return schema.model_construct(root=wire)
     return schema.model_validate(parsed, strict=True)
@@ -426,7 +467,8 @@ class DeepSeekProvider:
             )
         if re.search(
             r"(?:参考\s*\d+|condition_fingerprint|source_position_id|based_on_revision|CoT|"
-            r"JSON_SYNTAX|JSON_TYPE|SCHEMA_VALIDATION|PROPOSAL_INVALID|READING_INVALID|PROSE_INVALID)", text,
+            r"JSON_SYNTAX|JSON_TYPE|SCHEMA_VALIDATION|PROPOSAL_INVALID|PROPOSAL_REFERENCE|"
+            r"READING_INVALID|PROSE_INVALID|interface_index|routing_table)", text,
         ):
             raise ProviderError(
                 "MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage,
@@ -439,49 +481,64 @@ class DeepSeekProvider:
         instructions = f"""
 在当前叙述的未完成处生成一份短叙述，并把叙述中的构想直接转用到 peers 的当前条件。
 本窗口要求多来源共同作用于同一个目标用法，不把单输入的顺序接龙称为联合生成。
-若有至少两个 peers，选取他们已有的同一个共同 expression_id 与当前 role，
+若有至少两个 peers，选取他们已有的同一个共同表达与当前作用，
 分别向至少两个不同 peers 提出承接，让各来源能在同一目标、表达、作用上共同进入。
-若输入有 recommended_shared_interface，优先承接它的 expression_id 与 role，
-在其中至少两位 target_position_ids 的生活中写出本次构想；不同人物不必经历相同情节。
+若输入有 recommended_shared_interface，优先选择它列出的 interface_indices 和 role，
+在其中至少两位不同人物的生活中写出本次构想；不同人物不必经历相同情节。
 这些操作从当前叙述中形成，只改变内容与承接，不预先规定剧情；可以额外转用开放角色或主体背景。
 输出 fragments 数组，至多 {MAX_PROPOSAL_FRAGMENTS} 个片段；每个片段写一次 text，并附 targets 数组。
 无承接的铺垫片段可用 targets: []。所有片段的 targets 总计 1–{MAX_PROPOSAL_OPERATIONS} 项；
-每个片段的 targets 至多 {MAX_FRAGMENT_TARGETS} 项。target_position_id 必须来自 peers 且不是自身；
-expression_id 是表达的 ID，不是 active_uses 中的用法 id；按 schema 选择对应目标允许的 ID。
+每个片段的 targets 至多 {MAX_FRAGMENT_TARGETS} 项。每项只写 interface_index 和 role；
+interface_index 必须是本次 routing_table 中已有的整数，准确选择该行对应的人物和表达。
+程序将选中的接口编译为承接目标；不要自行输出人物ID、姓名、表达ID或用法ID作为目标。
+这些整数只在本次请求有效，不沿用过去的编号；正文里的相关人物仍使用自然姓名。
 role 沿用当前作用或给出相容的开放作用；多个 targets 可直接承接同一片段。
-peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允许转用目标的主体背景，
+routing_table 只有可写接口及现有作用，不提供同伴的私有背景原文。允许转用目标的主体背景，
 让本次表达参与目标如何构成自身；这种变更保持局部归属，不裁定全网共同的真实身份或过去。
 有 targets 的片段 text 将原样成为这些目标人物那里实际成立的内容，写清对应人物和正在发生的生活。
-不要额外输出 value、anchor、position_id、based_on_revision 或 operations，也不要重复抄写原文。
+不要额外输出 target_position_id、expression_id、value、anchor、position_id、based_on_revision
+或 operations，也不要重复抄写原文。
 有承接的单片段至多 {MAX_OPERATION_TEXT_CHARS} 字符，拼接后的全部叙述（含换行）至多
 {MAX_PROPOSAL_TEXT_CHARS} 字符；按生活的需要决定长度，不必用满上限。
 只构想下一处正在发生的生活，不告诉人物它是模型、被控制或被技术生成。
 """
         data = _actor_frame(frame)
+        # All routing pairs are derived from the same immutable local frame used
+        # for this evaluation. Never resolve handles against later world state.
+        routing_table = _routing_table(frame)
+        data["routing_table"] = routing_table
         shared_interface = _shared_interface(frame)
+        recommended_indices = []
         if shared_interface is not None:
-            data["recommended_shared_interface"] = shared_interface
-        output_schema = _proposal_schema(frame)
-        target_shapes = output_schema["$defs"]["_FragmentTarget"]["oneOf"]
-        if shared_interface is not None:
-            target_shapes = [
-                shape for shape in target_shapes
-                if shape["properties"]["target_position_id"]["const"] in shared_interface["target_position_ids"]
+            recommended_indices = [
+                route["interface_index"] for route in routing_table
+                if route["target_position_id"] in shared_interface["target_position_ids"]
+                and route["expression_id"] == shared_interface["expression_id"]
             ]
-        target_shapes = target_shapes[:2]
+            data["recommended_shared_interface"] = {
+                "interface_indices": recommended_indices,
+                "role": shared_interface["role"],
+            }
+        output_schema = _proposal_schema(frame)
+        # Without a recommended common role, still show two different peers,
+        # rather than accidentally selecting two expressions for the same peer.
+        example_indices = recommended_indices[:2]
+        if not example_indices:
+            seen_peers = set()
+            for route in routing_table:
+                if route["target_position_id"] not in seen_peers:
+                    example_indices.append(route["interface_index"])
+                    seen_peers.add(route["target_position_id"])
+                if len(example_indices) == 2:
+                    break
         targets = [
             {
-                "target_position_id": shape["properties"]["target_position_id"]["const"],
-                "expression_id": (
-                    shared_interface["expression_id"] if shared_interface
-                    and shared_interface["expression_id"] in shape["properties"]["expression_id"]["enum"]
-                    else shape["properties"]["expression_id"]["enum"][0]
-                ),
+                "interface_index": interface_index,
                 "role": shared_interface["role"] if shared_interface else (
                     frame.active_uses[0].get("role", "共同生活") if frame.active_uses else "共同生活"
                 ),
             }
-            for shape in target_shapes
+            for interface_index in example_indices
         ]
         result = await self._request(
             instructions, data, _ProposalResponse, output_schema=output_schema,
@@ -494,7 +551,12 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
             # Fixed categories only: never include rejected prose, identifiers or validation details.
             raise ProviderError(
                 "MODEL_OUTPUT_INVALID", f"模型提出了无效的承接操作（{reason}）。", True, usage=usage,
-                feedback=OutputFeedback("PROPOSAL_INVALID", (reason,)),
+                feedback=OutputFeedback(
+                    "PROPOSAL_REFERENCE" if reason in {
+                        "TARGET_UNKNOWN", "EXPRESSION_UNAVAILABLE", "INTERFACE_UNKNOWN",
+                    } else "PROPOSAL_INVALID",
+                    (reason,),
+                ),
             )
 
         wire = result.value.root
@@ -508,12 +570,21 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
                 if fragment.targets and len(fragment.text) > MAX_OPERATION_TEXT_CHARS:
                     invalid("FRAGMENT_TOO_LONG")
                 for target in fragment.targets:
+                    if isinstance(target, _FragmentTarget):
+                        if not 0 <= target.interface_index < len(routing_table):
+                            invalid("INTERFACE_UNKNOWN")
+                        route = routing_table[target.interface_index]
+                        target_position_id = route["target_position_id"]
+                        expression_id = route["expression_id"]
+                    else:
+                        target_position_id = target.target_position_id
+                        expression_id = target.expression_id
                     # Mechanical compilation uses the model's prose verbatim. There is no
                     # inferred replacement, anchor repair, omitted target or extra evaluation.
                     operations.append(Operation(
                         op="rebind",
-                        target_position_id=target.target_position_id,
-                        expression_id=target.expression_id,
+                        target_position_id=target_position_id,
+                        expression_id=expression_id,
                         role=target.role,
                         value=fragment.text,
                         anchor=fragment.text,

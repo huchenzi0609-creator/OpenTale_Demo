@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 _CATEGORIES = frozenset({
-    "JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION", "PROPOSAL_INVALID",
+    "JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION", "PROPOSAL_INVALID", "PROPOSAL_REFERENCE",
     "READING_INVALID", "PROSE_INVALID",
 })
 _FIELDS = frozenset({
-    "text", "fragments", "targets", "target_position_id", "expression_id", "role",
+    "text", "fragments", "targets", "target_position_id", "expression_id", "role", "interface_index",
     "position_id", "based_on_revision", "operations", "op", "value", "anchor",
     "focus_position_id", "expression_ids", "reinterprets",
 })
@@ -22,7 +22,7 @@ _ERROR_TYPES = frozenset({
 _REASONS = frozenset({
     "INVALID_JSON", "DUPLICATE_FIELD", "NON_JSON_NUMBER", "ROOT_NOT_OBJECT",
     "EMPTY_FRAGMENT", "FRAGMENT_TOO_LONG", "NO_PEER_OPERATION", "TOO_MANY_OPERATIONS",
-    "PROPOSAL_TOO_LARGE", "POSITION_MISMATCH", "REVISION_MISMATCH", "TARGET_UNKNOWN",
+    "PROPOSAL_TOO_LARGE", "POSITION_MISMATCH", "REVISION_MISMATCH", "TARGET_UNKNOWN", "INTERFACE_UNKNOWN",
     "EXPRESSION_UNAVAILABLE", "ANCHOR_NOT_IN_TEXT", "READING_SCOPE_INVALID",
     "TECHNICAL_PROSE", "SCHEMA_INVALID", "WRAPPING_TOO_DEEP",
 })
@@ -37,6 +37,12 @@ class OutputFeedback:
         if (
             type(self.category) is not str or self.category not in _CATEGORIES
             or type(self.issues) is not tuple or len(self.issues) > 8
+        ):
+            raise ValueError("Invalid safe output feedback")
+        if self.category == "PROPOSAL_REFERENCE" and (
+            len(self.issues) != 1 or type(self.issues[0]) is not str or self.issues[0] not in {
+                "TARGET_UNKNOWN", "EXPRESSION_UNAVAILABLE", "INTERFACE_UNKNOWN",
+            }
         ):
             raise ValueError("Invalid safe output feedback")
         for issue in self.issues:

@@ -19,7 +19,12 @@ from opentale.config import Settings
 from opentale.domain import GenerationFrame, ReadingFrame
 from opentale.kernel import frame_for, install_batch
 from opentale.providers import DeepSeekProvider, FixtureProvider, ProviderError, make_provider
-from opentale.providers.deepseek import MAX_RESPONSE_BYTES, _proposal_schema, _shared_interface
+from opentale.providers.deepseek import (
+    MAX_RESPONSE_BYTES,
+    _proposal_schema,
+    _routing_table,
+    _shared_interface,
+)
 from pydantic import BaseModel
 
 TEST_CREDENTIAL = "unit-test-only-credential"
@@ -463,12 +468,15 @@ def test_fragment_schema_restricts_expression_choices_to_their_actual_target_sco
         {"position_id": "p-b", "expression_id": "seed-p-b", "role": "主体背景"},
         {"position_id": "p-c", "expression_id": "seed-p-c", "role": "主体背景"},
     ]
-    variants = _proposal_schema(frame)["$defs"]["_FragmentTarget"]["oneOf"]
-    scopes = {variant["properties"]["target_position_id"]["const"]: variant["properties"] for variant in variants}
-    assert set(scopes) == {"p-b", "p-c"}
-    assert set(scopes["p-b"]["expression_id"]["enum"]) == {"e-letter", "seed-p-b"}
-    assert set(scopes["p-c"]["expression_id"]["enum"]) == {"e-letter", "seed-p-c"}
-    assert "enum" not in scopes["p-b"]["role"]  # Narrative roles remain open.
+    routes = _routing_table(frame)
+    scopes = {(route["target_position_id"], route["expression_id"]) for route in routes}
+    assert scopes == {
+        ("p-b", "e-letter"), ("p-b", "seed-p-b"), ("p-c", "e-letter"), ("p-c", "seed-p-c"),
+    }
+    props = _proposal_schema(frame)["$defs"]["_FragmentTarget"]["properties"]
+    assert set(props) == {"interface_index", "role"}
+    assert props["interface_index"]["enum"] == list(range(4))
+    assert "enum" not in props["role"]  # Narrative roles remain open.
 
 
 @pytest.mark.parametrize("invalid,reason", [
@@ -779,7 +787,7 @@ async def test_proposal_prompt_offers_joint_scope_but_excludes_peer_private_cont
     def handler(request):
         actor = json.loads(json.loads(request.content)["messages"][1]["content"])
         assert actor["recommended_shared_interface"] == {
-            "expression_id": "e-letter", "role": "共同生活", "target_position_ids": ["p-b", "p-c"],
+            "interface_indices": [0, 1], "role": "共同生活",
         }
         assert "PRIVATE_PEER_TEXT" not in json.dumps(actor)
         return httpx.Response(200, json=response(json.dumps(fragment_reply(), ensure_ascii=False)))

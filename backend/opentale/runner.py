@@ -241,7 +241,13 @@ class Runner:
                 feedback = error.feedback
                 repairable = (
                     error.code == "MODEL_OUTPUT_INVALID" and error.retryable and feedback is not None
-                    and feedback.category in {"JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION"}
+                    and (
+                        feedback.category in {"JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION"}
+                        or (method == "propose" and feedback.category == "PROPOSAL_REFERENCE"
+                            and bool(feedback.issues) and set(feedback.issues) <= {
+                                "TARGET_UNKNOWN", "EXPRESSION_UNAVAILABLE", "INTERFACE_UNKNOWN",
+                            })
+                    )
                 )
                 if not repairable or attempt >= MAX_FORMAT_REPAIRS or state.run.id in self.pause_requests:
                     raise
