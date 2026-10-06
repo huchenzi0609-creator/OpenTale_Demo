@@ -57,7 +57,7 @@ Builtins are read-only in the web editor; copy to a new ID to customize. Save ge
 
 Preset writes accept up to 1 MiB of HTTP data; all other writes retain the smaller request bound. No credential-entry field is added; parsed preset values containing the configured credential are rejected before persistence.
 
-`GET /api/health` -> `{ok:true, version:"0.3.2"}`
+`GET /api/health` -> `{ok:true, version:"0.3.3"}`
 
 `GET /api/config`, `POST /api/config/reload` -> safe Settings.public, `budget_bounds:{max_calls:1000,max_tokens:5120000,max_parallel:8,max_windows:1000}`, plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
 
