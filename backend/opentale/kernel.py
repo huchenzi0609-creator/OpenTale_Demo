@@ -13,6 +13,7 @@ from .domain import (
     GenerationFrame,
     Presentation,
     Proposal,
+    ReadingFrame,
     ReadingTrack,
     Snapshot,
     StorySegment,
@@ -57,7 +58,7 @@ def frame_for(state: Snapshot, position_id: str) -> GenerationFrame:
             }
         )
     digest = fingerprint(active)
-    return GenerationFrame(
+    frame = GenerationFrame(
         position_id=position.id,
         name=position.name,
         revision=state.run.revision,
@@ -72,6 +73,11 @@ def frame_for(state: Snapshot, position_id: str) -> GenerationFrame:
             if u.position_id != position_id
         ],
     )
+    if state.reflection is not None:
+        from .reflection import actor_projection
+
+        frame = actor_projection(state, frame)
+    return frame
 
 
 def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int) -> Snapshot:
@@ -86,6 +92,7 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
     writers = [p.position_id for p in proposals]
     if len(writers) != len(set(writers)) or set(writers) != positions:
         raise KernelError("WINDOW_INCOMPLETE", "本窗口必须包含每个参与位置的一份表达。")
+    frames = {p.id: frame_for(state, p.id) for p in state.positions}
     for proposal in proposals:
         validate_proposal(state, proposal)
     result = state.model_copy(deep=True)
@@ -135,6 +142,15 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
         )
     result.uses = sorted(uses.values(), key=lambda u: u.id)
     result.run.revision = revision
+    if result.reflection is not None:
+        from .reflection import capture_choice, install_feedback, position_scope
+
+        install_feedback(result, [
+            (position_scope(p.position_id), p.reflection, frames[p.position_id].reflection)
+            for p in proposals
+        ])
+        for proposal in sorted(proposals, key=lambda p: p.position_id):
+            capture_choice(result, position_scope(proposal.position_id), "propose", frames[proposal.position_id].reflection)
     proposal_map = {p.position_id: p for p in proposals}
     for continuation in result.continuations:
         continuation.seed_text = proposal_map[continuation.position_id].text
@@ -144,7 +160,7 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
         continuation.condition_fingerprint = frame.condition_fingerprint
         continuation.dependencies = [u["id"] for u in frame.active_uses]
     result.audit = audit_for(result)
-    if not any(
+    if result.reflection is None and not any(
         len({b.source_position_id for b in bindings if b.source_position_id != key[0]}) > 1
         for key, bindings in groups.items()
     ):
@@ -164,12 +180,16 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
         peer_targets = {
             o.target_position_id for o in proposal.operations if o.target_position_id != proposal.position_id
         }
-        if not peer_targets & changed_positions:
+        if result.reflection is None and not peer_targets & changed_positions:
             raise KernelError("DEPENDENCY_MISSING", "该表达没有改变任何同伴的实际条件。")
     return result
 
 
 def validate_proposal(state: Snapshot, proposal: Proposal) -> None:
+    from .reflection import validate_reflection
+
+    validate_reflection(proposal.reflection, frame_for(state, proposal.position_id).reflection
+                        if proposal.position_id in {p.id for p in state.positions} else None)
     positions = {p.id for p in state.positions}
     expression_ids = {e.id for e in state.expressions}
     if proposal.position_id not in positions or proposal.based_on_revision != state.run.revision:
@@ -181,7 +201,7 @@ def validate_proposal(state: Snapshot, proposal: Proposal) -> None:
         if operation.anchor not in proposal.text:
             raise KernelError("ANCHOR_INVALID", "关系操作必须锚定本次未完成表达中的原文。")
         peer_effect |= operation.target_position_id != proposal.position_id
-    if not peer_effect:
+    if state.reflection is None and not peer_effect:
         raise KernelError("DEPENDENCY_MISSING", "本次转用须进入另一位置的实际条件。")
 
 
@@ -246,16 +266,47 @@ def reading_track_for(state: Snapshot, reading_id: str = "main") -> ReadingTrack
     return track
 
 
+def reading_frame_for(state: Snapshot, reading_id: str = "main") -> ReadingFrame:
+    track = reading_track_for(state, reading_id)
+    shared_ids = {entry["expression_id"] for entry in audit_for(state)["shared_expressions"]}
+    frame = ReadingFrame(
+        revision=state.run.revision,
+        candidates=[
+            {"position_id": p.id, "name": p.name,
+             "text": next(c.surface for c in state.continuations if c.position_id == p.id),
+             "active_uses": [
+                 use for use in frame_for(state, p.id).active_uses
+                 if use["role"] != "主体背景" and (
+                     state.reflection is not None or use["expression_id"] in shared_ids
+                 )
+             ]}
+            for p in state.positions
+        ],
+        previous_segments=[segment.model_dump() for segment in track.story[-3:]],
+        open_relations=track.reading.open_relations,
+        current_focus=track.reading.focus_position_id,
+        start_position_id=track.start_position_id,
+        required_focus_position_id=track.start_position_id if not track.story else None,
+    )
+    if state.reflection is not None:
+        from .reflection import reading_projection
+
+        frame = reading_projection(state, frame, reading_id)
+    return frame
+
+
 def install_presentation(state: Snapshot, presentation: Presentation, reading_id: str = "main") -> None:
     track = reading_track_for(state, reading_id)
     positions = {p.id for p in state.positions}
     allowed = {u.expression_id for u in state.uses if u.position_id == presentation.focus_position_id}
+    if state.reflection is not None and presentation.focus_position_id in positions:
+        allowed |= {u["expression_id"] for u in frame_for(state, presentation.focus_position_id).active_uses}
     shared = {e["expression_id"] for e in audit_for(state)["shared_expressions"]}
     segments = {s.id for s in track.story}
     if (
         presentation.focus_position_id not in positions
         or not set(presentation.expression_ids) <= allowed
-        or not set(presentation.expression_ids) & shared
+        or (state.reflection is None and not set(presentation.expression_ids) & shared)
     ):
         raise KernelError("PRESENTATION_REFERENCE_INVALID", "呈现须承接当前有效的共同表达。")
     if not set(presentation.reinterprets) <= segments:
@@ -308,4 +359,10 @@ def semantic_projection(state: Snapshot) -> dict:
         track.model_dump(exclude={"last_error"})
         for track in sorted(state.reading_tracks, key=lambda track: track.id)
     ]
+    if state.reflection is not None:
+        projection["reflection"] = state.reflection.model_dump()
+        # Concurrent results preserve order-independent choice semantics.
+        projection["reflection"]["choices"] = sorted(
+            projection["reflection"]["choices"], key=lambda item: item["id"],
+        )
     return projection

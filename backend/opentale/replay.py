@@ -1,19 +1,25 @@
 """Replay semantic operations from recorded evidence without running any provider."""
 
-from .domain import Event, Presentation, Proposal, ReadingTrack, Snapshot
+from .domain import Event, GenerationFrame, Presentation, Proposal, ReadingFrame, ReadingTrack, Snapshot
 from .kernel import (
     fingerprint,
     frame_for,
     install_batch,
     install_presentation,
+    reading_frame_for,
     reading_track_for,
     semantic_projection,
 )
+from .reflection import capture_choice, install_feedback, position_scope, reading_scope
+from .reflection_types import ChoiceRecord, ReflectionFrame
 
 
 def replay(events: list[Event]) -> Snapshot:
     initial = next(event for event in events if event.type == "created")
     state = Snapshot.model_validate(initial.data["initial"])
+    actor_frames: dict[str, GenerationFrame] = {}
+    reader_frames: dict[str, ReadingFrame] = {}
+    accepted_readings: dict[str, dict] = {}
     for event in events:
         if event.type == "reading_created":
             track = ReadingTrack.model_validate(event.data["track"])
@@ -25,9 +31,26 @@ def replay(events: list[Event]) -> Snapshot:
         elif event.type == "batch_installed":
             proposals = [Proposal.model_validate(p) for p in event.data["proposals"]]
             state = install_batch(state, proposals, event.data["base_revision"])
+            actor_frames = {}
+            reader_frames = {}
+            accepted_readings = {}
+            if state.reflection is not None:
+                actor_frames = {key: GenerationFrame.model_validate(value)
+                                for key, value in event.data["realization_frames"].items()}
+                if set(actor_frames) != {p.id for p in state.positions}:
+                    raise ValueError("Missing frozen actor inputs")
+                for key, frame in actor_frames.items():
+                    if frame != frame_for(state, key):
+                        raise ValueError("Frozen actor inputs do not match method execution")
+        elif event.type == "reading_inputs_frozen":
+            for key, value in event.data["frames"].items():
+                frame = ReadingFrame.model_validate(value)
+                if frame != reading_frame_for(state, key):
+                    raise ValueError("Frozen reading inputs do not match method execution")
+                reader_frames[key] = frame
         elif event.type == "continuation_resumed":
             continuation = next(c for c in state.continuations if c.position_id == event.data["position_id"])
-            frame = frame_for(state, continuation.position_id)
+            frame = actor_frames.get(continuation.position_id) or frame_for(state, continuation.position_id)
             if frame.condition_fingerprint != event.data["condition_fingerprint"]:
                 raise ValueError("Continuation evidence does not match active input")
             if frame.revision != event.data["frame_revision"]:
@@ -35,11 +58,38 @@ def replay(events: list[Event]) -> Snapshot:
             continuation.surface = event.data["surface"]
             continuation.status = "ready"
             continuation.resume_count += 1
+            if state.reflection is not None:
+                actual = capture_choice(state, position_scope(continuation.position_id), "realize", frame.reflection)
+                if actual != ChoiceRecord.model_validate(event.data["choice"]):
+                    raise ValueError("Choice evidence does not match actual input")
         elif event.type == "presented":
+            reading_id = event.data.get("reading_id", "main")
+            if state.reflection is not None:
+                frame = reader_frames.get(reading_id) or reading_frame_for(state, reading_id)
+                if frame.reflection != ReflectionFrame.model_validate(event.data["reflection_frame"]):
+                    raise ValueError("Reading choice evidence does not match frozen input")
             install_presentation(
                 state, Presentation.model_validate(event.data["presentation"]),
-                event.data.get("reading_id", "main"),
+                reading_id,
             )
+            if state.reflection is not None:
+                capture_choice(state, reading_scope(reading_id), "present", frame.reflection)
+                accepted_readings[reading_id] = event.data
+        elif event.type == "reflection_feedback":
+            entries = event.data["entries"]
+            for entry in entries:
+                accepted = accepted_readings.get(entry["reading_id"])
+                if accepted is None or any(entry[key] != accepted[key]
+                                           for key in ("presentation", "reflection_frame")):
+                    raise ValueError("Feedback lacks accepted reading evidence")
+            install_feedback(state, [
+                (reading_scope(entry["reading_id"]), Presentation.model_validate(entry["presentation"]).reflection,
+                 ReflectionFrame.model_validate(entry["reflection_frame"])) for entry in entries
+            ])
+        elif event.type == "method_released":
+            if state.reflection is None:
+                raise ValueError("Method release in classic evidence")
+            state.reflection.adoptions[event.data["scope_id"]].remove(event.data["method_id"])
     return state
 
 

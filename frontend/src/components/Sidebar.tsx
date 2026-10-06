@@ -2,7 +2,7 @@ import { useState } from "react";
 import { DEFAULT_LIMITS, LIMIT_FIELDS, budgetRangeText } from "../budgetLimits";
 import type { EditorMode } from "../presetDraft";
 import type { Preset } from "../types";
-import type { Provider } from "../types";
+import type { ExperimentMode, Provider } from "../types";
 import type { Workbench } from "../useWorkbench";
 import PresetEditor from "./PresetEditor";
 const KEY_PATH =
@@ -26,6 +26,8 @@ export default function Sidebar({ model }: { model: Workbench }) {
     setPresetId,
     provider,
     setProvider,
+    mode,
+    setMode,
     limits,
     setLimits,
     snapshot,
@@ -87,7 +89,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
           O<span>↗</span>
         </span>
         <span>
-          OpenTale<small>NARRATIVE LAB / 0.3</small>
+          OpenTale<small>NARRATIVE LAB / 0.4</small>
         </span>
       </a>
       <div className="sidebar-heading">
@@ -125,6 +127,17 @@ export default function Sidebar({ model }: { model: Workbench }) {
           {preset?.storage_path && <details><summary>预设文件与版本</summary><code>{preset.storage_path}</code>
             <p className="helper">当前版本：{preset.version}。私人文件仅保存在本地，不纳入 Git。</p></details>}
         </div>
+        <label htmlFor="experiment-mode">新实验模式</label>
+        <select id="experiment-mode" value={mode}
+          disabled={disabled || booting}
+          onChange={(event) => setMode(event.target.value as ExperimentMode)}>
+          <option value="classic">经典模式 · 共同条件承接</option>
+          <option value="reflexive">反身实验 · 生成并采用方法</option>
+        </select>
+        <p className="helper">{mode === "reflexive"
+          ? "生成者可创建、采用和修改组织材料的方法；实际选择保存在独立技术面板。此模式验证机制，尚不能保证叙事意图的涌现。"
+          : "使用原有共同构想、联合更新与连续阅读流程。旧存档沿用此模式。"}
+          {snapshot && " 模式只影响新建实验，已有存档模式保持原样。"}</p>
         <label htmlFor="provider">生成方式</label>
         <select
           id="provider"

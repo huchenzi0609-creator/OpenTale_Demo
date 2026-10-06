@@ -417,10 +417,16 @@ def read_presets(root: Path) -> list[dict]:
         raise _filesystem_error(error) from None
 
 
-def initialize(preset: dict, provider: str, limits: Limits) -> Snapshot:
+def initialize(preset: dict, provider: str, limits: Limits, mode: str = "classic") -> Snapshot:
+    from .domain import ReadingTrack
+    from .reflection_types import ReflectionState
+
     positions = [Position.model_validate(p) for p in preset["positions"]]
     state = Snapshot(
-        run=Run(id=uuid4().hex, title=preset["name"], provider=provider, limits=limits),
+        run=Run(id=uuid4().hex, title=preset["name"], provider=provider, limits=limits, mode=mode),
+        schema_version=3 if mode == "reflexive" else 2,
+        reflection=ReflectionState() if mode == "reflexive" else None,
+        reading_tracks=[ReadingTrack(id="main", title="阅读 1")],
         positions=positions,
         expressions=[],
         uses=[],

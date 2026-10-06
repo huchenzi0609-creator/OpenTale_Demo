@@ -1,4 +1,5 @@
 export type Provider = "fixture" | "deepseek";
+export type ExperimentMode = "classic" | "reflexive";
 export interface SafeError {
   code: string;
   message: string;
@@ -23,6 +24,7 @@ export interface RunSummary {
   id: string;
   title: string;
   provider: Provider;
+  mode?: ExperimentMode;
   status: "idle" | "running" | "paused" | "error" | "budget_exhausted";
   revision: number;
   created_at: string;
@@ -102,7 +104,7 @@ export interface Event {
   data: Record<string, unknown>;
 }
 export interface Snapshot {
-  schema_version: number;
+  schema_version: 1 | 2 | 3;
   run: Run;
   positions: Position[];
   expressions: Expression[];
@@ -112,6 +114,7 @@ export interface Snapshot {
   story: Segment[];
   reading: ReadingState;
   reading_tracks?: ReadingTrack[];
+  reflection?: ReflectionState | null;
   pending: null | {
     base_revision: number;
     proposals: Record<string, unknown>;
@@ -125,6 +128,49 @@ export interface Snapshot {
     joint_targets: unknown[];
     last_batch: unknown[];
   };
+}
+export interface MethodRecord {
+  id: string;
+  title: string;
+  instruction: string;
+  inputs: string[];
+  order: "listed" | "reverse";
+  limit: number;
+  revises: string | null;
+  created_revision: number;
+  source_scope: string;
+}
+export interface SelectedMaterial {
+  id: string;
+  text: string;
+  position_id: string | null;
+  expression_id: string | null;
+  role: string;
+}
+export interface ChoiceRecord {
+  id: string;
+  revision: number;
+  scope_id: string;
+  stage: "propose" | "realize" | "present";
+  offered: string[];
+  selected: string[];
+  methods: string[];
+  groups: string[][];
+  materials: SelectedMaterial[];
+  input_fingerprint: string;
+}
+export interface ReflectionState {
+  methods: MethodRecord[];
+  adoptions: Record<string, string[]>;
+  choices: ChoiceRecord[];
+}
+export interface ReflectionAblation {
+  before_fingerprint: string;
+  after_fingerprint: string;
+  before_selected: string[];
+  after_selected: string[];
+  structural_effect: boolean;
+  note: string;
 }
 export interface Preset {
   id: string;

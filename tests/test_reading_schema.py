@@ -20,7 +20,7 @@ def test_v2_missing_canonical_tracks_is_rejected_even_with_legacy_aliases(snapsh
 
 def test_unsupported_version_does_not_fall_back_to_empty_main_reading(snapshot):
     future = snapshot.model_dump()
-    future["schema_version"] = 3
+    future["schema_version"] = 4
     with pytest.raises(ValidationError):
         Snapshot.model_validate(future)
 

@@ -5,12 +5,14 @@ import { presetPayload, type PresetDraft } from "./presetDraft";
 import { readingTracks } from "./readings";
 import type {
   Counterfactual,
+  ExperimentMode,
   Limits,
   Preset,
   PresetCatalog,
   Provider,
   PublicConfig,
   ReplayVerification,
+  ReflectionAblation,
   RunSummary,
   Snapshot,
   Verification,
@@ -29,13 +31,14 @@ export function useWorkbench() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [presetId, setPresetId] = useState("");
   const [provider, setProvider] = useState<Provider>("fixture");
+  const [mode, setMode] = useState<ExperimentMode>("classic");
   const [limits, setLimits] = useState<Limits>(DEFAULT_LIMITS);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [selectedRunId, setSelectedRunId] = useState("");
   const [selectedPosition, setSelectedPosition] = useState("");
   const [selectedReadingId, setSelectedReadingId] = useState("main");
   const [presentingReadingId, setPresentingReadingId] = useState("");
-  const [tab, setTab] = useState<"story" | "structure" | "diagnostics">(
+  const [tab, setTab] = useState<"story" | "structure" | "diagnostics" | "reflection">(
     "story",
   );
   const [booting, setBooting] = useState(true);
@@ -52,6 +55,7 @@ export function useWorkbench() {
   const [counterfactual, setCounterfactual] = useState<Counterfactual | null>(
     null,
   );
+  const [reflectionAblation, setReflectionAblation] = useState<ReflectionAblation | null>(null);
   const [counterSource, setCounterSource] = useState("");
   const [deleteArmed, setDeleteArmed] = useState(false);
   const selection = useRef(0);
@@ -67,7 +71,15 @@ export function useWorkbench() {
 
   useEffect(() => {
     setCreateError("");
-  }, [presetId, provider, limits, config?.configured]);
+  }, [presetId, provider, mode, limits, config?.configured]);
+
+  useEffect(() => {
+    setReflectionAblation(null);
+  }, [snapshot?.run.id, snapshot?.run.revision]);
+
+  useEffect(() => {
+    if (snapshot?.run.mode !== "reflexive" && tab === "reflection") setTab("story");
+  }, [snapshot?.run.mode, tab]);
 
   useEffect(() => {
     setBudgetError("");
@@ -337,6 +349,7 @@ export function useWorkbench() {
         await post<Snapshot>("/runs", {
           preset_id: presetId,
           provider,
+          mode,
           limits,
         }),
       );
@@ -405,6 +418,28 @@ export function useWorkbench() {
         await request<ReplayVerification>(`/runs/${snapshot.run.id}/replay`),
       );
     });
+  const ablateReflection = (scopeId: string, methodId: string) => {
+    if (!snapshot || frozen || snapshot.pending || snapshot.run.mode !== "reflexive"
+      || !snapshot.reflection?.adoptions[scopeId]?.includes(methodId)) return;
+    setReflectionAblation(null);
+    return perform("方法离线消融", async () => {
+      setReflectionAblation(await post<ReflectionAblation>(
+        `/runs/${encodeURIComponent(snapshot.run.id)}/reflection/ablate`,
+        { scope_id: scopeId, method_id: methodId },
+      ));
+    });
+  };
+  const releaseReflection = (scopeId: string, methodId: string) => {
+    if (!snapshot || frozen || snapshot.run.mode !== "reflexive"
+      || !snapshot.reflection?.adoptions[scopeId]?.includes(methodId)) return;
+    const id = snapshot.run.id;
+    setReflectionAblation(null);
+    return perform("停止采用方法", async () => {
+      adopt(await post<Snapshot>(`/runs/${encodeURIComponent(id)}/reflection/release`,
+        { scope_id: scopeId, method_id: methodId }));
+      setNotice("已停止在所选作用域采用此方法；只改变后续采用关系，已冻结的调用输入保留。模型可以再次采用此方法；未调用模型。");
+    });
+  };
   const reloadLibrary = () => perform("刷新列表", refreshLibrary);
   const reconnect = () =>
     perform("重新连接", async () => {
@@ -430,6 +465,8 @@ export function useWorkbench() {
     setPresetId,
     provider,
     setProvider,
+    mode,
+    setMode,
     limits,
     setLimits,
     snapshot,
@@ -453,6 +490,8 @@ export function useWorkbench() {
     verification,
     setVerification,
     counterfactual,
+    reflectionAblation,
+    setReflectionAblation,
     replayVerification,
     counterSource,
     setCounterSource,
@@ -480,6 +519,8 @@ export function useWorkbench() {
     verify,
     compare,
     replay,
+    ablateReflection,
+    releaseReflection,
     reloadLibrary,
     reconnect,
     selectRun,

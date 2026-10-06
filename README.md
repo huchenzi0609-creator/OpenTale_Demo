@@ -1,5 +1,9 @@
 # OpenTale Demo
 
+实验分支 `experiment/reflexive-generation` 的 0.4.0 增加“反身实验”：生成器可以创建、采用和修改材料组织方法，方法及实际选择又可成为后续输入。经典模式仍为默认对照。完整能力、运行方式与验证边界见[反身实验说明](docs/REFLEXIVE_EXPERIMENT.md)。
+
+使用独立实验服务：`uv run python scripts/dev.py build --profile reflexive`，随后 `uv run python scripts/dev.py detach --profile reflexive --port 8232`。网页为 `http://127.0.0.1:8232`，实验数据位于 `runtime/reflexive/data/`，与原 `runtime/opentale.sqlite3` 分开。密钥继续只填根目录 `.env.local`，无须在另一份文档复制。网页创建实验时选择“反身实验 · 生成并采用方法”；程序不会自动调用付费模型。
+
 一个可以离线验证的共同生成叙事实验：多个叙述位置共同使用表达，各自保留不同的归属与作用；一处的变化实际改变别处下一次生成的条件，呈现位置再从这些关系中形成一条可读序列。
 
 主仓库仅为本目录。系统用确定性的运行内核管理关系与续延，用可替换的模型生成内容。默认 `fixture` 完全离线，不需要 API key。离线样例验证机制，不能证明真实模型的语义耦合、审美或文学效果。

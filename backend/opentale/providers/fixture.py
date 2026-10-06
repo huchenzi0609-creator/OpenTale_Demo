@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, ReadingFrame
+from opentale.reflection_types import AdoptionDraft, MethodDraft, ReflectionFrame, ReflectionProposal
 
 from .base import ModelResult, ProviderError
 from .feedback import OutputFeedback
@@ -69,12 +70,97 @@ def _glimpse(values: list, fallback: str, budget: int = 180) -> str:
     return "；".join(str(value)[:quota] for value in values)
 
 
+def _fixture_method(
+    frame: ReflectionFrame, scope_id: str, *, reading: bool = False, revision: int = 0,
+) -> ReflectionProposal:
+    """A scripted method evolution, deliberately not evidence of spontaneous intention."""
+    by_kind = {
+        kind: [row for row in frame.objects if row["kind"] == kind]
+        for kind in ("content", "choice", "method")
+    }
+    if reading:
+        # Feedback adopted by an actor cannot smuggle track-local choices,
+        # private biographies or another actor's current surface into that scope.
+        by_kind["content"] = [
+            row for row in by_kind["content"]
+            if row.get("role") != "主体背景" and not row["id"].startswith("surface:")
+        ]
+        by_kind["choice"] = []
+        safe = {row["id"] for row in by_kind["content"]}
+        safe_methods = []
+        remaining = list(by_kind["method"])
+        while remaining:
+            accepted = [row for row in remaining if set(row.get("inputs", [])) <= safe]
+            if not accepted:
+                break
+            safe_methods.extend(accepted)
+            safe.update(row["id"] for row in accepted)
+            remaining = [row for row in remaining if row not in accepted]
+        by_kind["method"] = safe_methods
+    inputs = [row["id"] for row in by_kind["content"][-2:]]
+    if by_kind["choice"]:
+        inputs.insert(0, by_kind["choice"][-1]["id"])
+    # Periodic direct selection demonstrates folding a method back into ordinary
+    # materials and bounds this scripted demonstration's recursive dependency depth.
+    visible_methods = {row["id"] for row in by_kind["method"]}
+    reusable = sorted(set(frame.active_methods) & visible_methods)
+    if reusable and revision % 3:
+        # objects are offered in dependency order, not chronological order;
+        # the last object can be a deep abandoned historical branch.
+        inputs.insert(0, reusable[-1])
+    if not inputs:
+        raise ProviderError("FIXTURE_FRAME_INVALID", "离线反身示例需要至少一项可见材料。")
+    revises = reusable[-1] if reusable else None
+    method = MethodDraft(
+        title="离线脚本·阅读回流" if reading else "离线脚本·材料重组",
+        instruction="把相邻经历并置，沿其中一个动作继续，呈现这些经历怎样改变彼此的含义。",
+        inputs=inputs[:4], order="reverse" if revises else "listed", limit=4, revises=revises,
+    )
+    scopes = [scope_id]
+    if reading:
+        actor = next((row["id"] for row in frame.scopes if row["id"].startswith("position:")), None)
+        if actor:
+            scopes.append(actor)
+    # A scripted demonstration should cease executing the old organizations,
+    # while immutable records remain available for inspection and later reuse.
+    # revises replaces one predecessor; explicit releases clean every other
+    # own-scope method, including a previously returned reading method.
+    all_visible_methods = {row["id"] for row in frame.objects if row["kind"] == "method"}
+    releases = [AdoptionDraft(scope_id=scope_id, method_id=value, action="release")
+                for value in sorted(set(frame.active_methods) & all_visible_methods)
+                if value != revises]
+    adoptions = [AdoptionDraft(scope_id=value, method_id="draft:0") for value in scopes]
+    if len(releases) + len(adoptions) > 16:
+        raise ProviderError("FIXTURE_FRAME_INVALID", "离线示例的采用清理超过单次操作容量。")
+    return ReflectionProposal(methods=[method], adoptions=[*releases, *adoptions])
+
+
+def _selected_life(frame: ReflectionFrame, name: str) -> str:
+    # The exact selected snapshots and adopted instruction affect this deterministic surface.
+    material = "。".join(value.text[:180] for value in frame.materials[:6])
+    if not material:
+        material = "她走到窗边，抬手摸了摸窗框"
+    direction = frame.instruction[:160]
+    return f"{name}接续眼前的经历：{material}。" + (f"这些经历使她想到：{direction}。" if direction else "")
+
+
 class FixtureProvider:
     """Deterministic fixtures intentionally expose the causal dependency in surface text."""
 
     async def propose(
         self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
     ) -> ModelResult[Proposal]:
+        if frame.reflection is not None:
+            own_scope = next(
+                (row["id"] for row in frame.reflection.scopes
+                 if row["id"] in {frame.position_id, f"position:{frame.position_id}"}),
+                frame.reflection.scopes[0]["id"] if frame.reflection.scopes else frame.position_id,
+            )
+            return ModelResult(Proposal(
+                position_id=frame.position_id, based_on_revision=frame.revision,
+                text=_selected_life(frame.reflection, frame.name), operations=[],
+                reflection=_fixture_method(frame.reflection, own_scope, revision=frame.revision),
+            ))
         shared = _shared_use(frame)
         peers = [peer for peer in frame.peers if peer.get("id") != frame.position_id]
         if frame.peer_interfaces:
@@ -124,6 +210,8 @@ class FixtureProvider:
     async def realize(
         self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
     ) -> ModelResult[str]:
+        if frame.reflection is not None:
+            return ModelResult(_selected_life(frame.reflection, frame.name))
         shared = _shared_use(frame)
         values = [str(value) for value in shared.get("values", [])]
         live_content = "。".join(values) if values else str(shared.get("text", ""))[:600]
@@ -136,6 +224,22 @@ class FixtureProvider:
     ) -> ModelResult[Presentation]:
         if not frame.candidates:
             raise ProviderError("FIXTURE_FRAME_INVALID", "还没有可以承接的叙述。")
+        if frame.reflection is not None:
+            candidates = eligible_candidates(frame)
+            candidate = sorted(candidates, key=lambda row: row["position_id"])[frame.revision % len(candidates)]
+            own_scope = next(
+                (row["id"] for row in frame.reflection.scopes if row["id"].startswith("reading:")),
+                frame.reflection.scopes[0]["id"],
+            )
+            value = Presentation(
+                text=_selected_life(frame.reflection, candidate["name"]),
+                focus_position_id=candidate["position_id"],
+                expression_ids=[use["expression_id"] for use in candidate.get("active_uses", [])],
+                reinterprets=[frame.previous_segments[-1]["id"]] if frame.previous_segments else [],
+                reflection=_fixture_method(frame.reflection, own_scope, reading=True, revision=frame.revision),
+            )
+            validate_presentation(frame, value)
+            return ModelResult(value)
         shared_ids = shared_expression_ids(frame, legacy_letter=True)
         try:
             eligible = eligible_candidates(frame, legacy_letter=True)

@@ -32,7 +32,8 @@ def eligible_candidates(frame: ReadingFrame, *, legacy_letter: bool = False) -> 
     shared = shared_expression_ids(frame, legacy_letter=legacy_letter)
     candidates = [
         candidate for candidate in frame.candidates
-        if shared.intersection(use["expression_id"] for use in candidate.get("active_uses", []))
+        if frame.reflection is not None
+        or shared.intersection(use["expression_id"] for use in candidate.get("active_uses", []))
     ]
     required = required_focus(frame)
     if required:
@@ -60,7 +61,7 @@ def validate_presentation(
     if (
         candidate is None
         or not referenced <= scopes
-        or not referenced.intersection(shared)
+        or (frame.reflection is None and not referenced.intersection(shared))
         or not set(presentation.reinterprets) <= previous
     ):
         raise ProviderError(

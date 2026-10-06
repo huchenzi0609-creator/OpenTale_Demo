@@ -198,6 +198,211 @@ const reading = (id: string, title: string, start: string | null,
   last_error: null,
 });
 
+function withReflection() {
+  snapshot.schema_version = 3;
+  snapshot.run.mode = "reflexive";
+  snapshot.run.revision = 2;
+  snapshot.story = [segment("story-only", "她把回信放进了包里。", "b", 2)];
+  snapshot.reflection = {
+    methods: [
+      { id: "method-base", title: "回信的组织", instruction: "从回信中选取经历。", inputs: ["shared"],
+        order: "listed", limit: 8, revises: null, created_revision: 1, source_scope: "actor:a" },
+      { id: "method-revised", title: "倒转回信顺序", instruction: "保留两处经历的区别。", inputs: ["method-base", "choice-prior"],
+        order: "reverse", limit: 4, revises: "method-base", created_revision: 2, source_scope: "actor:b" },
+      { id: "method-unused", title: "尚未采用的方法", instruction: "另一种组合。", inputs: ["shared"],
+        order: "listed", limit: 4, revises: null, created_revision: 2, source_scope: "actor:c" },
+    ],
+    adoptions: { "actor:a": ["method-revised"], "actor:b": ["method-base"], "actor:c": [] },
+    choices: Array.from({ length: 21 }, (_, index) => ({
+      id: `choice-${index + 1}`, revision: 2, scope_id: "actor:a", stage: "propose" as const,
+      offered: ["shared", "choice-prior"], selected: ["shared"], methods: ["method-revised"],
+      groups: [["shared"], ["choice-prior"]],
+      materials: [{ id: "shared", text: "冻结的实际输入。", position_id: "a", expression_id: "shared", role: "经历" }],
+      input_fingerprint: `reflection-input-${index + 1}`,
+    })),
+  };
+}
+
+describe("reflexive experiment interface", () => {
+  it("keeps legacy saves classic and allows selecting the opt-in mode for new runs only", async () => {
+    await createRun();
+    expect(screen.getByLabelText("新实验模式")).toHaveValue("classic");
+    expect(screen.getByLabelText("当前实验模式")).toHaveTextContent("经典模式");
+    expect(screen.queryByRole("button", { name: "生成方法与实际选择" })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("新实验模式"), { target: { value: "reflexive" } });
+    expect(screen.getByLabelText("当前实验模式")).toHaveTextContent("经典模式");
+    expect(screen.getByText(/模式只影响新建实验/)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([url, options]) => url === "/api/runs" && options?.method === "POST")).toHaveLength(1);
+  });
+
+  it("creates a reflexive run without triggering generation and separates its technical panel from prose", async () => {
+    withReflection();
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("新实验模式"), { target: { value: "reflexive" } });
+    fireEvent.click(screen.getByRole("button", { name: "＋ 创建实验" }));
+    await screen.findByRole("heading", { name: "共同表达实验" });
+    const create = fetchMock.mock.calls.find(([url, options]) => url === "/api/runs" && options?.method === "POST");
+    expect(JSON.parse(create![1]!.body as string).mode).toBe("reflexive");
+    expect(screen.getByLabelText("当前实验模式")).toHaveTextContent("反身实验");
+    expect(screen.getByRole("region", { name: "叙事正文" })).toHaveTextContent("她把回信放进了包里。");
+    expect(screen.queryByLabelText("反身生成技术面板")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    expect(screen.getByLabelText("反身生成技术面板")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "叙事正文" })).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+  });
+
+  it("shows method lineage, adoption scopes, grouped choices and frozen actual input fingerprints", async () => {
+    withReflection();
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    const methods = screen.getByRole("region", { name: "已生成方法" });
+    expect(within(methods).getByText(/修改 回信的组织/)).toBeInTheDocument();
+    expect(within(methods).getByText("写信人（actor:a）")).toBeInTheDocument();
+    expect(within(methods).getByText("倒序 · 最多 4 项")).toBeInTheDocument();
+    const choices = screen.getByRole("region", { name: "实际选择历史" });
+    expect(within(choices).getByText("reflection-input-21")).toBeInTheDocument();
+    expect(within(choices).getAllByText(/组 2：/)).toHaveLength(10);
+    expect(within(choices).getAllByText("冻结的实际输入。")).toHaveLength(10);
+    expect(screen.getByLabelText("消融作用域")).toHaveValue("actor:a");
+    expect(screen.getByLabelText("消融方法")).toHaveValue("method-revised");
+    expect(within(screen.getByLabelText("消融方法")).queryByText(/尚未采用/)).not.toBeInTheDocument();
+  });
+
+  it("paginates long choice and method lists instead of rendering all entries", async () => {
+    withReflection();
+    snapshot.reflection!.methods = Array.from({ length: 12 }, (_, index) => ({
+      ...snapshot.reflection!.methods[0], id: `paged-method-${index}`, title: `分页方法${index}`, revises: null,
+    }));
+    snapshot.reflection!.adoptions = {};
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    const choices = screen.getByRole("region", { name: "实际选择历史" });
+    expect(within(choices).queryByText("reflection-input-11")).not.toBeInTheDocument();
+    fireEvent.click(within(choices).getByRole("button", { name: "下一页" }));
+    expect(within(choices).getByText("reflection-input-11")).toBeInTheDocument();
+    expect(within(choices).queryByText("reflection-input-21")).not.toBeInTheDocument();
+    const methods = screen.getByRole("region", { name: "已生成方法" });
+    expect(within(methods).queryByText("分页方法0")).not.toBeInTheDocument();
+    fireEvent.click(within(methods).getByRole("button", { name: "下一页" }));
+    expect(within(methods).getByText("分页方法0")).toBeInTheDocument();
+    expect(within(methods).queryByText("分页方法11")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "执行方法离线消融" })).toBeDisabled();
+  });
+
+  it("compares a currently adopted method offline while preserving the saved world and usage", async () => {
+    withReflection();
+    requestOverrides["POST /api/runs/run-1/reflection/ablate"] = () => response({
+      before_fingerprint: "before-method-input", after_fingerprint: "after-method-input",
+      before_selected: ["selected-original"], after_selected: ["selected-without-method"],
+      structural_effect: true, note: "离线副本比较；没有修改原存档。",
+    });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "执行方法离线消融" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "执行方法离线消融" }));
+    await screen.findByText("✓ 实际输入发生变化");
+    expect(screen.getByText("before-method-input")).toBeInTheDocument();
+    expect(screen.getByText("after-method-input")).toBeInTheDocument();
+    expect(screen.getByText("selected-original")).toBeInTheDocument();
+    expect(screen.getByText("selected-without-method")).toBeInTheDocument();
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/runs/run-1/reflection/ablate");
+    expect(JSON.parse(call![1]!.body as string)).toEqual({ scope_id: "actor:a", method_id: "method-revised" });
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("R2");
+    expect(screen.getByLabelText("调用预算使用量")).toHaveAttribute("value", "0");
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+    fireEvent.change(screen.getByLabelText("消融作用域"), { target: { value: "actor:b" } });
+    expect(screen.getByLabelText("消融方法")).toHaveValue("method-base");
+    expect(screen.queryByText("before-method-input")).not.toBeInTheDocument();
+  });
+
+  it.each(["running", "pending"] as const)("blocks offline ablation on an unstable %s snapshot", async (state) => {
+    withReflection();
+    if (state === "running") snapshot.run.status = "running";
+    else snapshot.pending = { base_revision: 2, proposals: {}, realizations: {}, committed: false };
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    expect(screen.getByRole("button", { name: "执行方法离线消融" })).toBeDisabled();
+    expect(screen.getByLabelText("消融作用域")).toBeDisabled();
+    expect(fetchMock.mock.calls.some(([url]) => url.endsWith("/reflection/ablate"))).toBe(false);
+  });
+
+  it("keeps a schema 3 snapshot with absent reflection readable and reports an empty panel", async () => {
+    withReflection();
+    snapshot.reflection = null;
+    await createRun();
+    expect(screen.getByRole("region", { name: "叙事正文" })).toHaveTextContent("她把回信放进了包里。");
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    expect(screen.getByText(/当前快照没有反身记录/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "执行方法离线消融" })).toBeDisabled();
+  });
+
+  it("releases an adopted method during a recoverable error while preserving frozen inputs", async () => {
+    withReflection();
+    snapshot.run.status = "error";
+    snapshot.run.last_error = { code: "REFLECTION_CAPACITY", message: "方法组合超出容量。", retryable: true };
+    snapshot.pending = { base_revision: 2, proposals: {}, realizations: { a: "已保留阶段" }, committed: true };
+    const released = { ...snapshot, reflection: { ...snapshot.reflection!,
+      adoptions: { ...snapshot.reflection!.adoptions, "actor:a": [] } } };
+    requestOverrides["POST /api/runs/run-1/reflection/release"] = () => response(released);
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    const stop = screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" });
+    expect(stop).toBeEnabled();
+    expect(screen.getByRole("button", { name: "执行方法离线消融" })).toBeDisabled();
+    fireEvent.click(stop);
+    await screen.findByText(/已停止在所选作用域采用此方法/);
+    const call = fetchMock.mock.calls.find(([url]) => url === "/api/runs/run-1/reflection/release");
+    expect(JSON.parse(call![1]!.body as string)).toEqual({ scope_id: "actor:a", method_id: "method-revised" });
+    expect(screen.queryByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "停止采用 回信的组织 · 读信人（actor:b）" })).toBeEnabled();
+    expect(screen.getByText(/续延 1\/3/)).toBeInTheDocument();
+    expect(screen.getByText("reflection-input-21")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "实际选择历史" })).toHaveTextContent("倒转回信顺序（method-revised）");
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("R2");
+    expect(screen.getByLabelText("调用预算使用量")).toHaveAttribute("value", "0");
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+  });
+
+  it("clears a previous ablation result when releasing a method without changing the revision", async () => {
+    withReflection();
+    requestOverrides["POST /api/runs/run-1/reflection/ablate"] = () => response({
+      before_fingerprint: "release-stale-before", after_fingerprint: "release-stale-after",
+      before_selected: ["shared"], after_selected: [], structural_effect: true, note: "离线比较。",
+    });
+    requestOverrides["POST /api/runs/run-1/reflection/release"] = () => response({
+      ...snapshot, reflection: { ...snapshot.reflection!, adoptions: { "actor:b": ["method-base"] } },
+    });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    fireEvent.click(screen.getByRole("button", { name: "执行方法离线消融" }));
+    await screen.findByText("release-stale-before");
+    fireEvent.click(screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" }));
+    await screen.findByText(/已停止在所选作用域采用此方法/);
+    expect(screen.queryByText("release-stale-before")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("消融作用域")).toHaveValue("actor:b");
+    expect(screen.getByLabelText("消融方法")).toHaveValue("method-base");
+  });
+
+  it("disables release during running and retains adoption after a safely reported failure", async () => {
+    withReflection();
+    requestOverrides["POST /api/runs/run-1/reflection/release"] = () => response({ error: {
+      code: "RUN_BUSY", message: "请先暂停当前运行。", retryable: true,
+    } }, 409);
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    fireEvent.click(screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("RUN_BUSY");
+    expect(screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "开始运行" }));
+    await screen.findByRole("button", { name: "暂停" });
+    expect(screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "停止采用 回信的组织 · 读信人（actor:b）" })).toBeDisabled();
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/runs/run-1/reflection/release")).toHaveLength(1);
+  });
+});
+
 describe("parallel readings", () => {
   beforeEach(() => {
     snapshot.continuations = snapshot.positions.map((position) => ({
@@ -469,6 +674,7 @@ describe("OpenTale workbench", () => {
     expect(JSON.parse(call![1]!.body as string)).toEqual({
       preset_id: "letters",
       provider: "fixture",
+      mode: "classic",
       limits: {
         max_calls: 24,
         max_tokens: 128000,

@@ -5,6 +5,7 @@ import StoryReader from "./components/StoryReader";
 import Relations from "./components/Relations";
 import Diagnostics from "./components/Diagnostics";
 import Verification from "./components/Verification";
+import ReflectionPanel from "./components/ReflectionPanel";
 import { readingTracks } from "./readings";
 
 const STATUS: Record<string, string> = {
@@ -171,6 +172,9 @@ export default function App() {
                   {snapshot.run.fork_of ? " / FORK" : ""}
                 </p>
                 <h2>{snapshot.run.title}</h2>
+                <span className="small-tag run-mode" aria-label="当前实验模式">
+                  {snapshot.run.mode === "reflexive" ? "反身实验" : "经典模式"}
+                </span>
                 <span className={`status status-${snapshot.run.status}`}>
                   <i />
                   {STATUS[snapshot.run.status]}
@@ -322,6 +326,12 @@ export default function App() {
               ))}
             </nav>
 
+            {snapshot.run.mode === "reflexive" && <nav className="reflection-tab" aria-label="反身实验技术视图">
+              <button className="button secondary" aria-pressed={tab === "reflection"}
+                onClick={() => setTab("reflection")}>生成方法与实际选择</button>
+              <span className="helper">技术证据与连续阅读分开呈现。</span>
+            </nav>}
+
             {tab === "story" && <StoryReader snapshot={snapshot} model={workbench} />}
             {tab === "structure" && (
               <Relations
@@ -333,6 +343,8 @@ export default function App() {
             {tab === "diagnostics" && (
               <Diagnostics snapshot={snapshot} model={workbench} />
             )}
+            {tab === "reflection" && snapshot.run.mode === "reflexive" &&
+              <ReflectionPanel key={snapshot.run.id} snapshot={snapshot} model={workbench} />}
             <section className="run-footer">
               <button
                 className="text-button"

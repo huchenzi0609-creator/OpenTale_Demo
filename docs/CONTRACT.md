@@ -1,4 +1,6 @@
-# OpenTale Demo v0.3 — module contract
+# OpenTale Demo v0.4 — module contract
+
+The optional reflexive experiment extends this contract as described in [REFLEXIVE_CONTRACT](REFLEXIVE_CONTRACT.md) and [the execution guide](REFLEXIVE_EXPERIMENT.md). Classic remains the default and retains the contract below; reflexive snapshots use schema 3. `POST /api/runs` additionally accepts `mode:classic|reflexive`. `GET /api/runs/{id}/reflection` exposes runtime method/choice evidence; POST `reflection/ablate` compares a detached plan and POST `reflection/release` explicitly releases an adopted scoped method at a stable checkpoint, recording `method_released`. Release preserves any already frozen pending inputs. Neither action invokes a model. Choice/reflection evidence is included in semantic replay. New events `reading_inputs_frozen` and `reflection_feedback` pin concurrent reading inputs and apply accepted method feedback collectively. The development profile isolates experimental storage and assets.
 
 ## Architecture and ownership
 
@@ -57,7 +59,7 @@ Builtins are read-only in the web editor; copy to a new ID to customize. Save ge
 
 Preset writes accept up to 1 MiB of HTTP data; all other writes retain the smaller request bound. No credential-entry field is added; parsed preset values containing the configured credential are rejected before persistence.
 
-`GET /api/health` -> `{ok:true, version:"0.3.3"}`
+`GET /api/health` -> `{ok:true, version:"0.4.0"}`
 
 `GET /api/config`, `POST /api/config/reload` -> safe Settings.public, `budget_bounds:{max_calls:1000,max_tokens:5120000,max_parallel:8,max_windows:1000}`, plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
 

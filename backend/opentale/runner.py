@@ -12,15 +12,17 @@ from .config import Settings
 from .domain import Event, Limits, Pending, Presentation, ReadingFrame, ReadingTrack, Snapshot
 from .kernel import (
     KernelError,
-    audit_for,
     frame_for,
     install_presentation,
+    reading_frame_for,
     reading_track_for,
     validate_proposal,
     without_source,
 )
 from .kernel import install_batch as install
 from .providers import ModelResult, ProviderError, make_provider
+from .reflection import capture_choice, install_feedback, position_scope, reading_scope
+from .reflection_types import ReflectionFrame
 from .storage import Store
 
 T = TypeVar("T")
@@ -77,6 +79,14 @@ class Runner:
         state = self.store.load(run_id)
         if self.busy(run_id) or state.run.status == "running":
             raise KernelError("RUN_BUSY", "请先暂停生成，再配置或单独生成连续阅读。")
+        return state
+
+    def release_method(self, run_id: str, scope_id: str, method_id: str) -> Snapshot:
+        state = self._stable(run_id)
+        if state.reflection is None or method_id not in state.reflection.adoptions.get(scope_id, []):
+            raise KernelError("METHOD_REFERENCE_INVALID", "请选择该作用范围已经采用的方法。")
+        state.reflection.adoptions[scope_id].remove(method_id)
+        self.event(state, "method_released", scope_id=scope_id, method_id=method_id)
         return state
 
     def add_reading(self, run_id: str, title: str, start_position_id: str, enabled: bool = True) -> Snapshot:
@@ -168,17 +178,19 @@ class Runner:
         track = reading_track_for(state, reading_id)
         if self._presented_revision(track, state.run.revision):
             return
-        frame = self.reading_frame(state, reading_id)
+        frame = (state.pending.reading_frames.get(reading_id) if state.pending is not None else None)
+        frame = frame or self.reading_frame(state, reading_id)
         try:
             result = await self._format_call(
                 state, frame, provider, "present", f"present:{reading_id}", reserve_window=reserve_window,
             )
-            self.apply_presentation(state, result.value, reading_id)
+            self.apply_presentation(state, result.value, reading_id, frame=frame)
             if state.pending is not None and state.pending.committed:
                 state.pending.presentations[reading_id] = result.value
             self.event(
                 state, "presented", reading_id=reading_id, segment_id=track.story[-1].id,
                 reinterprets=result.value.reinterprets, presentation=result.value.model_dump(),
+                **({"reflection_frame": frame.reflection.model_dump()} if frame.reflection else {}),
             )
         except (KernelError, ProviderError) as error:
             track.last_error = {"code": error.code, "message": error.message, "retryable": error.retryable}
@@ -202,6 +214,11 @@ class Runner:
             self.store.save(state)
             try:
                 await self._present_track(state, provider, reading_id, reserve_window=False)
+                if state.reflection is not None:
+                    # The accepted event is the executable checkpoint for manual feedback.
+                    accepted = next(event for event in reversed(state.events)
+                                    if event.type == "presented" and event.data.get("reading_id") == reading_id)
+                    self._install_reading_feedback(state, [accepted.data])
                 return state
             except (KernelError, ProviderError):
                 self.event(state, "reading_error", reading_id=reading_id, **track.last_error)
@@ -247,6 +264,9 @@ class Runner:
                             and bool(feedback.issues) and set(feedback.issues) <= {
                                 "TARGET_UNKNOWN", "EXPRESSION_UNAVAILABLE", "INTERFACE_UNKNOWN",
                             })
+                        or (method in {"propose", "present"} and state.reflection is not None
+                            and feedback.category == "PROPOSAL_INVALID"
+                            and feedback.issues == ("REFLECTION_REFERENCE_INVALID",))
                     )
                 )
                 if not repairable or attempt >= MAX_FORMAT_REPAIRS or state.run.id in self.pause_requests:
@@ -366,6 +386,8 @@ class Runner:
                     pending = state.pending
                     assert pending is not None
                     pending.committed = True
+                    if state.reflection is not None:
+                        pending.realization_frames = {p.id: frame_for(state, p.id) for p in state.positions}
                     state.run.phase = "realizing"
                     self.event(
                         state,
@@ -374,6 +396,9 @@ class Runner:
                         joint_targets=state.audit["joint_targets"],
                         base_revision=pending.base_revision,
                         proposals=[p.model_dump() for p in pending.proposals.values()],
+                        **({"realization_frames": {key: value.model_dump()
+                                                  for key, value in pending.realization_frames.items()}}
+                           if state.reflection else {}),
                     )
                 if run_id in self.pause_requests:
                     state.run.status = "paused"
@@ -384,7 +409,7 @@ class Runner:
                     if position_id in pending.realizations:
                         return
                     async with semaphore:
-                        frame = frame_for(state, position_id)
+                        frame = pending.realization_frames.get(position_id) or frame_for(state, position_id)
                         result = await self._format_call(state, frame, provider, "realize", f"realize:{position_id}")
                         if not result.value.strip():
                             raise KernelError("MODEL_OUTPUT_INVALID", "恢复生成没有返回可读内容。")
@@ -393,6 +418,7 @@ class Runner:
                         continuation.surface = result.value
                         continuation.status = "ready"
                         continuation.resume_count += 1
+                        choice = capture_choice(state, position_scope(position_id), "realize", frame.reflection)
                         self.event(
                             state,
                             "continuation_resumed",
@@ -400,6 +426,7 @@ class Runner:
                             frame_revision=frame.revision,
                             condition_fingerprint=frame.condition_fingerprint,
                             surface=result.value,
+                            **({"choice": choice.model_dump()} if choice else {}),
                         )
 
                 results = await asyncio.gather(
@@ -409,6 +436,16 @@ class Runner:
                 if failure:
                     raise failure
                 state.run.phase = "presenting"
+                if state.reflection is not None:
+                    fresh_frames = {
+                        track.id: self.reading_frame(state, track.id)
+                        for track in state.reading_tracks if track.enabled and track.id not in pending.reading_frames
+                    }
+                    if fresh_frames:
+                        pending.reading_frames.update(fresh_frames)
+                        self.event(state, "reading_inputs_frozen", frames={
+                            key: value.model_dump() for key, value in fresh_frames.items()
+                        })
                 self.store.save(state)
                 if run_id in self.pause_requests:
                     state.run.status = "paused"
@@ -425,6 +462,13 @@ class Runner:
                 failure = next((result for result in results if isinstance(result, BaseException)), None)
                 if failure:
                     raise failure
+                if state.reflection is not None:
+                    self._install_reading_feedback(state, [
+                        {"reading_id": reading_id, "presentation": presentation.model_dump(),
+                         "reflection_frame": pending.reading_frames[reading_id].reflection.model_dump()}
+                        for reading_id, presentation in pending.presentations.items()
+                        if pending.reading_frames.get(reading_id) is not None
+                    ])
                 state.pending = None
                 state.run.usage.windows += 1
                 state.run.phase = "idle"
@@ -466,32 +510,31 @@ class Runner:
                 ) from None
 
     def reading_frame(self, state: Snapshot, reading_id: str = "main") -> ReadingFrame:
-        track = reading_track_for(state, reading_id)
-        shared_ids = {entry["expression_id"] for entry in audit_for(state)["shared_expressions"]}
-        return ReadingFrame(
-            revision=state.run.revision,
-            candidates=[
-                {
-                    "position_id": p.id,
-                    "name": p.name,
-                    "text": next(c.surface for c in state.continuations if c.position_id == p.id),
-                    "active_uses": [
-                        use
-                        for use in frame_for(state, p.id).active_uses
-                        if use["expression_id"] in shared_ids
-                    ],
-                }
-                for p in state.positions
-            ],
-            previous_segments=[segment.model_dump() for segment in track.story[-3:]],
-            open_relations=track.reading.open_relations,
-            current_focus=track.reading.focus_position_id,
-            start_position_id=track.start_position_id,
-            required_focus_position_id=track.start_position_id if not track.story else None,
-        )
+        return reading_frame_for(state, reading_id)
 
-    def apply_presentation(self, state: Snapshot, presentation: Presentation, reading_id: str = "main") -> None:
+    def apply_presentation(
+        self, state: Snapshot, presentation: Presentation, reading_id: str = "main",
+        *, frame: ReadingFrame | None = None,
+    ) -> None:
+        from .reflection import validate_reflection
+
+        frame = frame or self.reading_frame(state, reading_id)
+        validate_reflection(presentation.reflection, frame.reflection)
+        if state.reflection is not None:
+            install_feedback(state.model_copy(deep=True), [
+                (reading_scope(reading_id), presentation.reflection, frame.reflection),
+            ])
         install_presentation(state, presentation, reading_id)
+        capture_choice(state, reading_scope(reading_id), "present", frame.reflection)
+
+    def _install_reading_feedback(self, state: Snapshot, entries: list[dict]) -> None:
+        proposals = [
+            (reading_scope(entry["reading_id"]), Presentation.model_validate(entry["presentation"]).reflection,
+             ReflectionFrame.model_validate(entry["reflection_frame"]))
+            for entry in entries
+        ]
+        install_feedback(state, proposals)
+        self.event(state, "reflection_feedback", entries=sorted(entries, key=lambda item: item["reading_id"]))
 
     async def counterfactual(self, run_id: str, target_id: str, source_id: str) -> dict[str, Any]:
         state = self.store.load(run_id)

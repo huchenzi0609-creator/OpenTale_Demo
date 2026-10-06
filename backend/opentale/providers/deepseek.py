@@ -29,6 +29,15 @@ from opentale.security import contains_credential as _contains_credential
 from .base import ModelResult, ProviderError
 from .feedback import OutputFeedback, schema_feedback
 from .reading import eligible_candidates, required_focus, shared_expression_ids, validate_presentation
+from .reflection import (
+    REFLECTION_BOUNDARY,
+    REFLECTION_INSTRUCTIONS,
+    WireReflection,
+    compile_reflection,
+    materials_data,
+    reflection_data,
+    reflection_schema,
+)
 
 T = TypeVar("T", bound=BaseModel)
 # Compatibility aliases for callers inspecting this provider's transport bounds.
@@ -66,6 +75,23 @@ class _FragmentProposal(BaseModel):
     fragments: list[_Fragment] = Field(min_length=1, max_length=MAX_PROPOSAL_FRAGMENTS)
 
 
+class _ReflexiveFragmentProposal(_FragmentProposal):
+    reflection: WireReflection | None = None
+
+
+class _ClassicPresentation(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=MAX_PRESENTATION_TEXT_CHARS)
+    focus_position_id: str
+    expression_ids: list[str] = Field(min_length=1)
+    reinterprets: list[str] = Field(default_factory=list)
+
+
+class _ReflexivePresentation(_ClassicPresentation):
+    expression_ids: list[str]
+    reflection: WireReflection | None = None
+
+
 class _NamedFragment(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     text: str = Field(min_length=1, max_length=MAX_PROPOSAL_TEXT_CHARS)
@@ -87,13 +113,21 @@ class _JSONSyntaxError(ValueError):
         super().__init__(reason)
 
 
+def _local_route_expressions(frame: GenerationFrame) -> set[str]:
+    if frame.reflection is not None:
+        # Methods may select a surface or frozen choice without a writable
+        # Expression carrier. Its material ID is never a new rebind permission.
+        return {material.expression_id for material in frame.reflection.materials if material.expression_id}
+    return {use["expression_id"] for use in frame.active_uses}
+
+
 def _routing_table(frame: GenerationFrame) -> list[dict]:
     """Enumerate the exact old writable pairs; order is local to this request only.
 
     Index selection replaces copying two unrelated identifiers. It grants no new
     scopes and never uses a name to infer an identity or disclose private values.
     """
-    expressions = {use["expression_id"] for use in frame.active_uses}
+    expressions = _local_route_expressions(frame)
     routes = []
     for peer in sorted(frame.peers, key=lambda item: item["id"]):
         if peer["id"] == frame.position_id:
@@ -121,9 +155,9 @@ def _routing_table(frame: GenerationFrame) -> list[dict]:
 def _proposal_schema(frame: GenerationFrame) -> dict:
     """Publish only request-owned route handles and open narrative roles."""
     routes = _routing_table(frame)
-    if not routes:
+    if not routes and frame.reflection is None:
         raise ProviderError("GENERATION_FRAME_INVALID", "当前局部没有可承接的同伴接口。")
-    schema = _FragmentProposal.model_json_schema()
+    schema = (_ReflexiveFragmentProposal if frame.reflection else _FragmentProposal).model_json_schema()
     schema["$defs"]["_FragmentTarget"]["properties"]["interface_index"]["enum"] = [
         route["interface_index"] for route in routes
     ]
@@ -131,7 +165,15 @@ def _proposal_schema(frame: GenerationFrame) -> dict:
         "if": {"properties": {"targets": {"minItems": 1}}},
         "then": {"properties": {"text": {"maxLength": MAX_OPERATION_TEXT_CHARS}}},
     }]
+    if frame.reflection is not None:
+        _with_reflection_schema(schema, frame.reflection)
     return schema
+
+
+def _with_reflection_schema(schema: dict, frame) -> None:
+    reflection = reflection_schema(frame)
+    schema.setdefault("$defs", {}).update(reflection.pop("$defs", {}))
+    schema["$defs"]["WireReflection"] = reflection
 
 
 def _shared_interface(frame: GenerationFrame) -> dict | None:
@@ -251,7 +293,11 @@ def _format_message(feedback: OutputFeedback) -> str:
 
 
 def _presentation_schema(frame: ReadingFrame) -> dict:
-    schema = Presentation.model_json_schema()
+    schema = (_ReflexivePresentation if frame.reflection else _ClassicPresentation).model_json_schema()
+    if frame.reflection is None:
+        schema["properties"].pop("reflection", None)
+    else:
+        _with_reflection_schema(schema, frame.reflection)
     shared = shared_expression_ids(frame)
     schema["required"] = ["text", "focus_position_id", "expression_ids", "reinterprets"]
     schema["oneOf"] = [
@@ -262,10 +308,11 @@ def _presentation_schema(frame: ReadingFrame) -> dict:
                     "items": {"type": "string", "enum": sorted({
                         use["expression_id"] for use in candidate.get("active_uses", [])
                     })},
-                    "contains": {"enum": sorted(shared.intersection(
-                        use["expression_id"] for use in candidate.get("active_uses", [])
-                    ))},
-                    "minContains": 1,
+                    **({} if frame.reflection else {
+                        "contains": {"enum": sorted(shared.intersection(
+                            use["expression_id"] for use in candidate.get("active_uses", [])
+                        ))}, "minContains": 1,
+                    }),
                 },
             },
         }
@@ -353,6 +400,8 @@ class DeepSeekProvider:
                 "不要解释错误、输出推理、复制校验反馈到正文或改用其他阶段的结构。"
                 "严格遵守本阶段 schema；不要猜测不存在的目标或补写输入中没有的权限。"
             )
+        if "reflection" in data or "materials" in data:
+            system += "\n" + REFLECTION_BOUNDARY
         system += "\nJSON schema:\n" + json.dumps(output_schema or schema.model_json_schema(), ensure_ascii=False)
         user = json.dumps(data, ensure_ascii=False)
         if len(system) + len(user) > MAX_REQUEST_CHARS:
@@ -479,7 +528,9 @@ class DeepSeekProvider:
         if re.search(
             r"(?:参考\s*\d+|condition_fingerprint|source_position_id|based_on_revision|CoT|"
             r"JSON_SYNTAX|JSON_TYPE|SCHEMA_VALIDATION|PROPOSAL_INVALID|PROPOSAL_REFERENCE|"
-            r"READING_INVALID|PROSE_INVALID|interface_index|routing_table)", text,
+            r"READING_INVALID|PROSE_INVALID|interface_index|routing_table|object_indices|"
+            r"revises_index|scope_index|method_index|draft_index|input_fingerprint|"
+            r"REFLECTION_REFERENCE_INVALID)", text,
         ):
             raise ProviderError(
                 "MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage,
@@ -514,14 +565,29 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
 {MAX_PROPOSAL_TEXT_CHARS} 字符；按生活的需要决定长度，不必用满上限。
 只构想下一处正在发生的生活，不告诉人物它是模型、被控制或被技术生成。
 """
+        if frame.reflection is not None:
+            instructions = f"""
+根据本次实际材料与组织方式形成以当前人物为主角的短叙述。构想可继续生活、改变材料之间的
+联系，或生出新的组织方法。没有每回合联合写入、转用同伴或修改方法的义务。
+输出 fragments 数组；每个片段写 text 和 targets。targets 可为空；若提出普通承接，
+interface_index 仅选 routing_table 中本次整数，role 给出实际作用。程序逐字采用片段正文。
+有承接片段至多 {MAX_OPERATION_TEXT_CHARS} 字符，拼接正文至多 {MAX_PROPOSAL_TEXT_CHARS} 字符。
+不要输出 operations、持久目标ID、value 或 anchor。正文只呈现生活，技术选择位于结构字段。
+""" + REFLECTION_INSTRUCTIONS
         data = _actor_frame(frame)
+        if frame.reflection is not None:
+            # Classic background fields would bypass the method's actual selection.
+            data.pop("seed_text", None)
+            data.pop("active_uses", None)
+            data.pop("recent_surface", None)
+            data["reflection"] = reflection_data(frame.reflection)
         # All routing pairs are derived from the same immutable local frame used
         # for this evaluation. Never resolve handles against later world state.
         routing_table = _routing_table(frame)
         data["routing_table"] = routing_table
         shared_interface = _shared_interface(frame)
         recommended_indices = []
-        if shared_interface is not None:
+        if shared_interface is not None and frame.reflection is None:
             recommended_indices = [
                 route["interface_index"] for route in routing_table
                 if route["target_position_id"] in shared_interface["target_position_ids"]
@@ -553,8 +619,10 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
             for interface_index in example_indices
         ]
         result = await self._request(
-            instructions, data, _ProposalResponse, output_schema=output_schema,
-            output_example={"fragments": [{"text": _PROSE_PLACEHOLDER, "targets": targets}]},
+            instructions, data, _ReflexiveFragmentProposal if frame.reflection else _ProposalResponse,
+            output_schema=output_schema,
+            output_example={"fragments": [{"text": _PROSE_PLACEHOLDER,
+                                           "targets": [] if frame.reflection else targets}]},
             repair=repair,
         )
         usage = (result.input_tokens, result.output_tokens)
@@ -571,7 +639,7 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
                 ),
             )
 
-        wire = result.value.root
+        wire = result.value if frame.reflection else result.value.root
         if isinstance(wire, Proposal):
             value = wire
         else:
@@ -601,7 +669,7 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
                         value=fragment.text,
                         anchor=fragment.text,
                     ))
-            if not operations:
+            if not operations and frame.reflection is None:
                 invalid("NO_PEER_OPERATION")
             if len(operations) > MAX_PROPOSAL_OPERATIONS:
                 invalid("TOO_MANY_OPERATIONS")
@@ -611,15 +679,19 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
             value = Proposal(
                 position_id=frame.position_id, based_on_revision=frame.revision,
                 text=text, operations=operations,
+                reflection=compile_reflection(wire.reflection, frame.reflection, usage=usage)
+                if frame.reflection else None,
             )
         peers = {peer["id"] for peer in frame.peers} - {frame.position_id}
-        expressions = {use["expression_id"] for use in frame.active_uses}
+        expressions = _local_route_expressions(frame)
         interfaces = {(entry["position_id"], entry["expression_id"]) for entry in frame.peer_interfaces}
         if value.position_id != frame.position_id:
             invalid("POSITION_MISMATCH")
         if value.based_on_revision != frame.revision:
             invalid("REVISION_MISMATCH")
-        if not value.operations:
+        if frame.reflection is None and value.reflection is not None:
+            invalid("REFLECTION_REFERENCE_INVALID")
+        if not value.operations and frame.reflection is None:
             invalid("NO_PEER_OPERATION")
         for operation in value.operations:
             if operation.target_position_id not in peers:
@@ -632,6 +704,9 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
             if not operation.anchor.strip() or operation.anchor not in value.text:
                 invalid("ANCHOR_NOT_IN_TEXT")
         identifiers = peers | expressions | {frame.position_id} | {expression for _, expression in interfaces}
+        if frame.reflection is not None:
+            identifiers |= {row["id"] for row in frame.reflection.objects}
+            identifiers |= {row["id"] for row in frame.reflection.scopes}
         self._check_prose(value.text, identifiers, usage=usage)
         for operation in value.operations:
             self._check_prose(operation.value, identifiers, usage=usage)
@@ -648,13 +723,28 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
 text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅，不必用满上限。
 这次变化应影响人物当前如何继续；条件通过实际经验进入正文。
 """
+        data = _actor_frame(frame)
+        if frame.reflection is not None:
+            instructions = f"""
+从本次 materials 的实际选择和 instruction 的组织方式继续当前人物的生活。
+这些材料共同形成当前处境，选择与组织的后果落实在行动、感知和关系中。
+只输出 {{"text":"自然语言正文"}}，至多 {MAX_REALIZATION_TEXT_CHARS} 字符；不输出方法操作。
+材料没有给出的旧背景不自动补回，材料之间的差异保留局部意义。正文使用人物自然姓名。
+"""
+            data = {
+                "name": frame.name, "materials": materials_data(frame.reflection),
+                "groups": frame.reflection.groups, "instruction": frame.reflection.instruction,
+            }
         result = await self._request(
-            instructions, _actor_frame(frame), _Surface,
+            instructions, data, _Surface,
             output_example={"text": _PROSE_PLACEHOLDER}, repair=repair,
         )
         identifiers = {frame.position_id} | {peer["id"] for peer in frame.peers}
         identifiers |= {use["expression_id"] for use in frame.active_uses}
         identifiers |= {interface["expression_id"] for interface in frame.peer_interfaces}
+        if frame.reflection is not None:
+            identifiers |= {row["id"] for row in frame.reflection.objects}
+            identifiers |= {row["id"] for row in frame.reflection.scopes}
         self._check_prose(result.value.text, identifiers, usage=(result.input_tokens, result.output_tokens))
         return ModelResult(result.value.text, result.input_tokens, result.output_tokens)
 
@@ -679,6 +769,15 @@ reinterprets 可以为空，否则仅引用本条 previous_segments 中的段落
 所有ID只在结构字段输出。text 不含段落编号、节点编号、括号引用、诊断说明或来源标注。
 text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇幅，不必用满上限。
 """
+        if frame.reflection is not None:
+            instructions = f"""
+你是独立连续阅读的位置。依据本次选中 materials 和 instruction 形成下一段生活，
+按相互作用组织呈现，使此前的经历在当前关系中继续。首段仍从 required_focus_position_id 进入。
+focus_position_id 必须来自 candidates。expression_ids 只选所选焦点已有表达，允许为空；
+reinterprets 可为空，否则仅选本条 previous_segments 中的段落ID。
+可以从当前经验提出新的材料组织方式，经 reflection 字段返回世界；无需每次提出。
+text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符；正文没有编号、方法说明或技术引用。
+""" + REFLECTION_INSTRUCTIONS
         data = {
             "revision": frame.revision,
             "start_position_id": frame.start_position_id,
@@ -715,19 +814,41 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇�
             }
             for relation in frame.open_relations
         ]
+        if frame.reflection is not None:
+            data["reflection"] = reflection_data(frame.reflection)
+            data["candidates"] = [
+                {
+                    "position_id": candidate["position_id"], "name": candidate["name"],
+                    "active_uses": [
+                        {key: use[key] for key in ("expression_id", "role") if key in use}
+                        for use in candidate.get("active_uses", [])
+                    ],
+                }
+                for candidate in frame.candidates
+            ]
         example_focus = candidates[0]
-        example_shared = sorted(shared_expression_ids(frame).intersection(
-            use["expression_id"] for use in example_focus.get("active_uses", [])
-        ))[0]
+        example_expressions = sorted(
+            {use["expression_id"] for use in example_focus.get("active_uses", [])}
+            if frame.reflection else shared_expression_ids(frame).intersection(
+                use["expression_id"] for use in example_focus.get("active_uses", [])
+            )
+        )[:1]
         result = await self._request(
-            instructions, data, Presentation, output_schema=_presentation_schema(frame),
+            instructions, data, _ReflexivePresentation if frame.reflection else _ClassicPresentation,
+            output_schema=_presentation_schema(frame),
             output_example={
                 "text": _PROSE_PLACEHOLDER,
                 "focus_position_id": example_focus["position_id"],
-                "expression_ids": [example_shared], "reinterprets": [],
+                "expression_ids": example_expressions, "reinterprets": [],
             }, repair=repair,
         )
         value = result.value
+        value = Presentation(
+            **value.model_dump(exclude={"reflection"}),
+            reflection=compile_reflection(
+                    value.reflection, frame.reflection, usage=(result.input_tokens, result.output_tokens),
+                ) if frame.reflection else None,
+        )
         positions = {candidate["position_id"] for candidate in frame.candidates}
         expressions = {
             use["expression_id"]
@@ -735,8 +856,11 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇�
             for use in candidate.get("active_uses", [])
         }
         segments = {segment["id"] for segment in frame.previous_segments}
+        if frame.reflection is not None:
+            segments |= {row["id"] for row in frame.reflection.objects}
+            segments |= {row["id"] for row in frame.reflection.scopes}
         validate_presentation(frame, value, usage=(result.input_tokens, result.output_tokens))
         self._check_prose(
             value.text, positions | expressions | segments, usage=(result.input_tokens, result.output_tokens)
         )
-        return result
+        return ModelResult(value, result.input_tokens, result.output_tokens)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
@@ -30,6 +31,12 @@ class CreateRun(Record):
     preset_id: str = Field(min_length=1, max_length=80)
     provider: str = "fixture"
     limits: Limits = Field(default_factory=Limits)
+    mode: Literal["classic", "reflexive"] = "classic"
+
+
+class AblateMethod(Record):
+    scope_id: str = Field(min_length=1, max_length=160)
+    method_id: str = Field(min_length=1, max_length=160)
 
 
 class ForkRun(Record):
@@ -76,7 +83,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         yield
         await runner.shutdown()
 
-    app = FastAPI(title="OpenTale", version="0.3.3", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="OpenTale", version="0.4.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.root = store, runner, config_root
     app.state.presets = library
 
@@ -151,7 +158,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.3.3"}
+        return {"ok": True, "version": "0.4.0"}
 
     @app.get("/api/config")
     async def config():
@@ -209,7 +216,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         preset = library.get(body.preset_id)
         if contains_credential(preset, runner.settings.api_key.get_secret_value()):
             raise KernelError("PRIVATE_DATA_REJECTED", "请先在本地移除预设中误填的配置内容。")
-        state = initialize(preset, body.provider, body.limits)
+        state = initialize(preset, body.provider, body.limits, body.mode)
         store.save(state)
         return state
 
@@ -220,6 +227,30 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
     @app.get("/api/runs/{run_id}")
     async def snapshot(run_id: str):
         return store.load(run_id)
+
+    @app.get("/api/runs/{run_id}/reflection")
+    async def reflection(run_id: str):
+        state = store.load(run_id)
+        return {
+            "mode": state.run.mode,
+            **(state.reflection.model_dump() if state.reflection else {
+                "methods": [], "adoptions": {}, "choices": [],
+            }),
+            "note": "程序层面的实际选择与方法版本；不包含CoT，也不证明真实模型已经产生叙事意图。",
+        }
+
+    @app.post("/api/runs/{run_id}/reflection/ablate")
+    async def ablate(run_id: str, body: AblateMethod):
+        from .reflection import ablate_method
+
+        state = runner._stable(run_id)
+        if state.pending is not None:
+            raise KernelError("RUN_BUSY", "请先完成当前恢复点，再对稳定世界做离线消融。")
+        return ablate_method(state, body.scope_id, body.method_id)
+
+    @app.post("/api/runs/{run_id}/reflection/release")
+    async def release_method(run_id: str, body: AblateMethod):
+        return runner.release_method(run_id, body.scope_id, body.method_id)
 
     @app.patch("/api/runs/{run_id}/limits")
     async def update_limits(run_id: str, body: Limits):
@@ -297,7 +328,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
         return await verify_mechanisms(settings)
 
-    distribution = PROJECT_ROOT / "frontend" / "dist"
+    distribution = Path(os.environ.get("OPENTALE_FRONTEND_DIR", PROJECT_ROOT / "frontend" / "dist"))
     if distribution.is_dir():
         assets = distribution / "assets"
         if assets.is_dir():
