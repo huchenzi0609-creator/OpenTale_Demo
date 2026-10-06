@@ -224,7 +224,7 @@ async def test_timeout_is_retryable_without_exposing_exception_request():
 @pytest.mark.parametrize(
     "content",
     ["not json", '{"text":"first","text":"second"}', '{"text":false}', '{"text":""}',
-     '{"text":"ok","extra":"private"}', '```json\n{"text":"ok"}\n```',
+     '{"text":"ok","extra":"private"}',
      '{"text":"CoT 参考233"}', '{"text":"e-letter 技术引用"}',
      json.dumps({"text": TEST_CREDENTIAL}), '{"text":NaN}'],
 )

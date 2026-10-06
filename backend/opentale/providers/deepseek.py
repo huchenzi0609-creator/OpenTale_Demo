@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import TypeVar
 
@@ -26,6 +27,7 @@ from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, 
 from opentale.security import contains_credential as _contains_credential
 
 from .base import ModelResult, ProviderError
+from .feedback import OutputFeedback, schema_feedback
 from .reading import eligible_candidates, required_focus, shared_expression_ids, validate_presentation
 
 T = TypeVar("T", bound=BaseModel)
@@ -60,6 +62,12 @@ class _FragmentProposal(BaseModel):
 
 class _ProposalResponse(RootModel[_FragmentProposal | Proposal]):
     """Accept already-valid legacy replies without asking new calls to duplicate prose."""
+
+
+class _JSONSyntaxError(ValueError):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 def _proposal_schema(frame: GenerationFrame) -> dict:
@@ -147,14 +155,87 @@ def _strict_json(raw: str | bytes) -> object:
         result: dict[str, object] = {}
         for key, value in items:
             if key in result:
-                raise ValueError("Duplicate JSON field")
+                raise _JSONSyntaxError("DUPLICATE_FIELD")
             result[key] = value
         return result
 
     def constant(_: str) -> None:
-        raise ValueError("Non-JSON numeric constant")
+        raise _JSONSyntaxError("NON_JSON_NUMBER")
 
-    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    def floating(raw_number: str) -> float:
+        value = float(raw_number)
+        if not math.isfinite(value):
+            raise _JSONSyntaxError("NON_JSON_NUMBER")
+        return value
+
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant, parse_float=floating)
+
+
+def _output_json(content: str) -> object:
+    """Remove whole syntactic wrappers only; preserve all decoded narrative characters."""
+    raw = content.strip()
+    if raw.startswith("\ufeff"):
+        raw = raw[1:].lstrip()
+    fence = re.fullmatch(r"```(?:json)?[ \t]*\r?\n(.*?)\r?\n```[ \t]*", raw, re.DOTALL | re.IGNORECASE)
+    if fence:
+        raw = fence.group(1)
+    parsed = _strict_json(raw)
+    # An API may return an object encoded inside one or two extra JSON strings.
+    # Never extract an object from surrounding commentary or concatenate responses.
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            return parsed
+        parsed = _strict_json(parsed)
+    if isinstance(parsed, str):
+        raise _JSONSyntaxError("WRAPPING_TOO_DEEP")
+    return parsed
+
+
+def _validate_output(schema: type[T], parsed: object) -> T:
+    if schema is _ProposalResponse:
+        # Diagnose the selected wire shape instead of flattening errors from a union.
+        legacy_fields = {"position_id", "based_on_revision", "text", "operations"}
+        selected = (
+            Proposal if isinstance(parsed, dict) and "fragments" not in parsed and legacy_fields <= parsed.keys()
+            else _FragmentProposal
+        )
+        wire = selected.model_validate(parsed, strict=True)
+        return schema.model_construct(root=wire)
+    return schema.model_validate(parsed, strict=True)
+
+
+def _format_message(feedback: OutputFeedback) -> str:
+    details = "；".join((feedback.category, *feedback.issues[:3]))
+    return f"模型输出不符合当前表达格式（{details}）。"
+
+
+def _presentation_schema(frame: ReadingFrame) -> dict:
+    schema = Presentation.model_json_schema()
+    shared = shared_expression_ids(frame)
+    schema["required"] = ["text", "focus_position_id", "expression_ids", "reinterprets"]
+    schema["oneOf"] = [
+        {
+            "properties": {
+                "focus_position_id": {"const": candidate["position_id"]},
+                "expression_ids": {
+                    "items": {"type": "string", "enum": sorted({
+                        use["expression_id"] for use in candidate.get("active_uses", [])
+                    })},
+                    "contains": {"enum": sorted(shared.intersection(
+                        use["expression_id"] for use in candidate.get("active_uses", [])
+                    ))},
+                    "minContains": 1,
+                },
+            },
+        }
+        for candidate in eligible_candidates(frame)
+    ]
+    history = sorted({segment["id"] for segment in frame.previous_segments})
+    if history:
+        schema["properties"]["reinterprets"]["items"]["enum"] = history
+    else:
+        schema["properties"]["reinterprets"]["maxItems"] = 0
+    return schema
 
 
 def _actor_frame(frame: GenerationFrame) -> dict[str, object]:
@@ -200,18 +281,27 @@ class DeepSeekProvider:
         self._client = client
 
     async def _request(
-        self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None
+        self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None,
+        output_example: dict | None = None, repair: OutputFeedback | None = None,
     ) -> ModelResult[T]:
         key = self.settings.api_key.get_secret_value()
         if not key:
             raise ProviderError("API_KEY_MISSING", "请先在本地配置文件中填写测试密钥。")
-        system = (
-            _NARRATIVE_DISCIPLINE
-            + "\n"
-            + instructions
-            + "\nJSON schema:\n"
-            + json.dumps(output_schema or schema.model_json_schema(), ensure_ascii=False)
-        )
+        system = _NARRATIVE_DISCIPLINE + "\n" + instructions
+        if output_example is not None:
+            system += "\n本阶段完整输出形状示例（正文只是形状示例，请根据当前生活重新生成）：\n"
+            system += json.dumps(output_example, ensure_ascii=False)
+        if repair is not None:
+            if not isinstance(repair, OutputFeedback):
+                raise ValueError("Invalid safe output feedback")
+            system += "\n上次本阶段输出未通过结构校验，有限反馈如下：\n"
+            system += json.dumps(repair.prompt_data(), ensure_ascii=False)
+            system += (
+                "\n使用相同的当前输入重新生成一个完整的本阶段对象，补齐必需字段和正确类型。"
+                "不要解释错误、输出推理、复制校验反馈到正文或改用其他阶段的结构。"
+                "严格遵守本阶段 schema；不要猜测不存在的目标或补写输入中没有的权限。"
+            )
+        system += "\nJSON schema:\n" + json.dumps(output_schema or schema.model_json_schema(), ensure_ascii=False)
         user = json.dumps(data, ensure_ascii=False)
         if len(system) + len(user) > MAX_REQUEST_CHARS:
             raise ProviderError("CONTEXT_TOO_LARGE", "当前局部的输入过长，请缩小活跃内容。")
@@ -263,15 +353,47 @@ class DeepSeekProvider:
             if key in content:
                 raise ProviderError("MODEL_OUTPUT_INVALID", "模型输出包含不允许公开的内容。", True)
             try:
-                value = schema.model_validate(_strict_json(content), strict=True)
-            except (ValueError, ValidationError, RecursionError):
-                raise ProviderError("MODEL_OUTPUT_INVALID", "模型输出不符合当前表达格式。", True) from None
-            if _contains_credential(value.model_dump(mode="json"), key):
+                parsed = _output_json(content)
+            except (ValueError, UnicodeError, RecursionError) as error:
+                reason = error.reason if isinstance(error, _JSONSyntaxError) else "INVALID_JSON"
+                feedback = OutputFeedback("JSON_SYNTAX", (reason,))
+                raise ProviderError(
+                    "MODEL_OUTPUT_INVALID", _format_message(feedback), True, feedback=feedback,
+                ) from None
+            try:
+                sensitive = _contains_credential(parsed, key)
+            except RecursionError:
+                feedback = OutputFeedback("JSON_SYNTAX", ("INVALID_JSON",))
+                raise ProviderError(
+                    "MODEL_OUTPUT_INVALID", _format_message(feedback), True, feedback=feedback,
+                ) from None
+            if sensitive:
                 raise ProviderError("MODEL_OUTPUT_INVALID", "模型输出包含不允许公开的内容。", True)
+            if not isinstance(parsed, dict):
+                feedback = OutputFeedback("JSON_TYPE", ("ROOT_NOT_OBJECT",))
+                raise ProviderError(
+                    "MODEL_OUTPUT_INVALID", _format_message(feedback), True, feedback=feedback,
+                )
+            try:
+                value = _validate_output(schema, parsed)
+            except ValidationError as error:
+                feedback = schema_feedback(error)
+                raise ProviderError(
+                    "MODEL_OUTPUT_INVALID", _format_message(feedback), True, feedback=feedback,
+                ) from None
+            except (ValueError, RecursionError):
+                feedback = OutputFeedback("SCHEMA_VALIDATION", ("SCHEMA_INVALID",))
+                raise ProviderError(
+                    "MODEL_OUTPUT_INVALID", _format_message(feedback), True, feedback=feedback,
+                ) from None
             return ModelResult(value, envelope.usage.prompt_tokens, envelope.usage.completion_tokens)
         except ProviderError as error:
             if usage is not None:
                 error.usage = usage
+            # Validation and JSON decoder exceptions can hold the rejected input.
+            # Do not attach that context to the safe boundary exception.
+            error.__context__ = None
+            error.__cause__ = None
             raise
         except httpx.TimeoutException:
             raise ProviderError("PROVIDER_TIMEOUT", "模型连接超时，可保留当前进度后重试。", True) from None
@@ -298,11 +420,22 @@ class DeepSeekProvider:
     @staticmethod
     def _check_prose(text: str, identifiers: set[str], *, usage: tuple[int, int] | None = None) -> None:
         if not text.strip() or any(identifier and identifier in text for identifier in identifiers):
-            raise ProviderError("MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage)
-        if re.search(r"(?:参考\s*\d+|condition_fingerprint|source_position_id|based_on_revision|CoT)", text):
-            raise ProviderError("MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage)
+            raise ProviderError(
+                "MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage,
+                feedback=OutputFeedback("PROSE_INVALID", ("TECHNICAL_PROSE",)),
+            )
+        if re.search(
+            r"(?:参考\s*\d+|condition_fingerprint|source_position_id|based_on_revision|CoT|"
+            r"JSON_SYNTAX|JSON_TYPE|SCHEMA_VALIDATION|PROPOSAL_INVALID|READING_INVALID|PROSE_INVALID)", text,
+        ):
+            raise ProviderError(
+                "MODEL_OUTPUT_INVALID", "正文包含不允许的技术引用。", True, usage=usage,
+                feedback=OutputFeedback("PROSE_INVALID", ("TECHNICAL_PROSE",)),
+            )
 
-    async def propose(self, frame: GenerationFrame) -> ModelResult[Proposal]:
+    async def propose(
+        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[Proposal]:
         instructions = f"""
 在当前叙述的未完成处生成一份短叙述，并把叙述中的构想直接转用到 peers 的当前条件。
 本窗口要求多来源共同作用于同一个目标用法，不把单输入的顺序接龙称为联合生成。
@@ -328,15 +461,40 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
         shared_interface = _shared_interface(frame)
         if shared_interface is not None:
             data["recommended_shared_interface"] = shared_interface
+        output_schema = _proposal_schema(frame)
+        target_shapes = output_schema["$defs"]["_FragmentTarget"]["oneOf"]
+        if shared_interface is not None:
+            target_shapes = [
+                shape for shape in target_shapes
+                if shape["properties"]["target_position_id"]["const"] in shared_interface["target_position_ids"]
+            ]
+        target_shapes = target_shapes[:2]
+        targets = [
+            {
+                "target_position_id": shape["properties"]["target_position_id"]["const"],
+                "expression_id": (
+                    shared_interface["expression_id"] if shared_interface
+                    and shared_interface["expression_id"] in shape["properties"]["expression_id"]["enum"]
+                    else shape["properties"]["expression_id"]["enum"][0]
+                ),
+                "role": shared_interface["role"] if shared_interface else (
+                    frame.active_uses[0].get("role", "共同生活") if frame.active_uses else "共同生活"
+                ),
+            }
+            for shape in target_shapes
+        ]
         result = await self._request(
-            instructions, data, _ProposalResponse, output_schema=_proposal_schema(frame)
+            instructions, data, _ProposalResponse, output_schema=output_schema,
+            output_example={"fragments": [{"text": "她在尚未完成的生活里停了一下。", "targets": targets}]},
+            repair=repair,
         )
         usage = (result.input_tokens, result.output_tokens)
 
         def invalid(reason: str) -> None:
             # Fixed categories only: never include rejected prose, identifiers or validation details.
             raise ProviderError(
-                "MODEL_OUTPUT_INVALID", f"模型提出了无效的承接操作（{reason}）。", True, usage=usage
+                "MODEL_OUTPUT_INVALID", f"模型提出了无效的承接操作（{reason}）。", True, usage=usage,
+                feedback=OutputFeedback("PROPOSAL_INVALID", (reason,)),
             )
 
         wire = result.value.root
@@ -396,23 +554,30 @@ peer_interfaces 只有可写接口，不提供同伴的私有背景原文。允�
             self._check_prose(operation.value, identifiers, usage=usage)
         return ModelResult(value, result.input_tokens, result.output_tokens)
 
-    async def realize(self, frame: GenerationFrame) -> ModelResult[str]:
+    async def realize(
+        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[str]:
         instructions = f"""
 从已经重构的 active_uses 条件继续当前未完成 seed_text，输出 {{"text":"自然语言正文"}}。
 正文为第三人称叙述，承接正在生效的 values，尤其同一表达上的多个 values。
 text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅，不必用满上限。
 这次变化应影响人物当前如何继续；不要仅把条件列表逐条复述，不要解释技术来源。
 """
-        result = await self._request(instructions, _actor_frame(frame), _Surface)
+        result = await self._request(
+            instructions, _actor_frame(frame), _Surface,
+            output_example={"text": "她在尚未完成的生活里停了一下。"}, repair=repair,
+        )
         identifiers = {frame.position_id} | {peer["id"] for peer in frame.peers}
         identifiers |= {use["expression_id"] for use in frame.active_uses}
         identifiers |= {interface["expression_id"] for interface in frame.peer_interfaces}
         self._check_prose(result.value.text, identifiers, usage=(result.input_tokens, result.output_tokens))
         return ModelResult(result.value.text, result.input_tokens, result.output_tokens)
 
-    async def present(self, frame: ReadingFrame) -> ModelResult[Presentation]:
+    async def present(
+        self, frame: ReadingFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[Presentation]:
         # Check the local entry and common scopes before spending any model call.
-        eligible_candidates(frame)
+        candidates = eligible_candidates(frame)
         instructions = f"""
 你是一个局部阅读位置。选择 candidates 中正在生效的一处叙述，形成下一段可读正文。
 这是同一世界中的一条独立连续阅读。previous_segments 是这条阅读已经呈现的全部可用历史。
@@ -464,7 +629,18 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符，按需要决定段落与篇�
             }
             for relation in frame.open_relations
         ]
-        result = await self._request(instructions, data, Presentation)
+        example_focus = candidates[0]
+        example_shared = sorted(shared_expression_ids(frame).intersection(
+            use["expression_id"] for use in example_focus.get("active_uses", [])
+        ))[0]
+        result = await self._request(
+            instructions, data, Presentation, output_schema=_presentation_schema(frame),
+            output_example={
+                "text": "她在尚未完成的生活里停了一下。",
+                "focus_position_id": example_focus["position_id"],
+                "expression_ids": [example_shared], "reinterprets": [],
+            }, repair=repair,
+        )
         value = result.value
         positions = {candidate["position_id"] for candidate in frame.candidates}
         expressions = {

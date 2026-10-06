@@ -4,6 +4,7 @@ from opentale.config import Settings
 
 from .base import ModelResult, Provider, ProviderError
 from .deepseek import DeepSeekProvider
+from .feedback import OutputFeedback
 from .fixture import FixtureProvider
 
 
@@ -19,6 +20,7 @@ __all__ = [
     "DeepSeekProvider",
     "FixtureProvider",
     "ModelResult",
+    "OutputFeedback",
     "Provider",
     "ProviderError",
     "make_provider",

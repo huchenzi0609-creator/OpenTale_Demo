@@ -76,7 +76,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         yield
         await runner.shutdown()
 
-    app = FastAPI(title="OpenTale", version="0.3.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="OpenTale", version="0.3.1", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.root = store, runner, config_root
     app.state.presets = library
 
@@ -151,7 +151,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.3.0"}
+        return {"ok": True, "version": "0.3.1"}
 
     @app.get("/api/config")
     async def config():
@@ -267,6 +267,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         runner.locks.pop(run_id, None)
         runner.tasks.pop(run_id, None)
         runner.pause_requests.discard(run_id)
+        runner._funded_jobs.pop(run_id, None)
         return {"deleted": True}
 
     @app.get("/api/runs/{run_id}/export")

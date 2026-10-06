@@ -4,6 +4,7 @@ const EVENTS: Record<string, string> = {
   created: "创建",
   window_started: "打开局部窗口",
   proposal_ready: "构想就绪",
+  format_retry: "格式纠错重试",
   batch_installed: "共同安装",
   continuation_resumed: "恢复续延",
   presented: "呈现",

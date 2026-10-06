@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from .capacity import MAX_READING_TRACKS
+from .capacity import MAX_FORMAT_REPAIRS, MAX_READING_TRACKS
 from .config import Settings
 from .domain import Event, Limits, Pending, Presentation, ReadingFrame, ReadingTrack, Snapshot
 from .kernel import (
@@ -32,6 +32,7 @@ class Runner:
         self.locks: dict[str, asyncio.Lock] = {}
         self.tasks: dict[str, asyncio.Task] = {}
         self.pause_requests: set[str] = set()
+        self._funded_jobs: dict[str, set[str]] = {}
 
     def busy(self, run_id: str) -> bool:
         task = self.tasks.get(run_id)
@@ -161,13 +162,17 @@ class Runner:
         )
         return drafts + len(state.positions) - len(pending.realizations) + readers
 
-    async def _present_track(self, state: Snapshot, provider: Any, reading_id: str) -> None:
+    async def _present_track(
+        self, state: Snapshot, provider: Any, reading_id: str, *, reserve_window: bool = True,
+    ) -> None:
         track = reading_track_for(state, reading_id)
         if self._presented_revision(track, state.run.revision):
             return
         frame = self.reading_frame(state, reading_id)
         try:
-            result = await self._call(state, frame, lambda: provider.present(frame))
+            result = await self._format_call(
+                state, frame, provider, "present", f"present:{reading_id}", reserve_window=reserve_window,
+            )
             self.apply_presentation(state, result.value, reading_id)
             if state.pending is not None and state.pending.committed:
                 state.pending.presentations[reading_id] = result.value
@@ -196,7 +201,7 @@ class Runner:
             state.run.status, state.run.phase = "running", "presenting"
             self.store.save(state)
             try:
-                await self._present_track(state, provider, reading_id)
+                await self._present_track(state, provider, reading_id, reserve_window=False)
                 return state
             except (KernelError, ProviderError):
                 self.event(state, "reading_error", reading_id=reading_id, **track.last_error)
@@ -216,19 +221,61 @@ class Runner:
                 state.run.phase = previous_phase
                 self.store.save(state)
 
-    async def _call(
-        self, state: Snapshot, frame: Any, call: Callable[[], Awaitable[ModelResult[T]]]
-    ) -> ModelResult[T]:
-        usage, limits = state.run.usage, state.run.limits
+    def _token_estimate(self, state: Snapshot, frame: Any) -> int:
         estimate = len(frame.model_dump_json().encode("utf-8")) + 4096 + self.settings.max_output_tokens
         if state.run.provider == "fixture":
             estimate = 0  # Deterministic local execution makes no token-billed call.
+        return estimate
+
+    async def _format_call(
+        self, state: Snapshot, frame: Any, provider: Any, method: str, job_key: str,
+        *, reserve_window: bool = True,
+    ) -> ModelResult[Any]:
+        feedback = None
+        for attempt in range(MAX_FORMAT_REPAIRS + 1):
+            try:
+                evaluate = getattr(provider, method)
+                call = (lambda: evaluate(frame)) if feedback is None else (lambda: evaluate(frame, repair=feedback))
+                return await self._call(state, frame, call, job_key=job_key)
+            except ProviderError as error:
+                feedback = error.feedback
+                repairable = (
+                    error.code == "MODEL_OUTPUT_INVALID" and error.retryable and feedback is not None
+                    and feedback.category in {"JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION"}
+                )
+                if not repairable or attempt >= MAX_FORMAT_REPAIRS or state.run.id in self.pause_requests:
+                    raise
+                # In-flight base calls have already consumed call slots but have not
+                # reached their checkpoints. Do not double-count them as future work.
+                required = max(1, self._needed_calls(state) - len(self._funded_jobs.get(state.run.id, set())))
+                if not reserve_window:
+                    required = 1
+                usage = state.run.usage
+                occupied = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
+                if (usage.calls + required > state.run.limits.max_calls
+                        or occupied + self._token_estimate(state, frame) > state.run.limits.max_tokens):
+                    raise
+                self.event(
+                    state, "format_retry", method=method, job=job_key, attempt=attempt + 1,
+                    category=feedback.category, issues=list(feedback.issues),
+                )
+        raise AssertionError("Bounded format repair exhausted without an outcome")
+
+    async def _call(
+        self, state: Snapshot, frame: Any, call: Callable[[], Awaitable[ModelResult[T]]],
+        *, job_key: str | None = None,
+    ) -> ModelResult[T]:
+        usage, limits = state.run.usage, state.run.limits
+        estimate = self._token_estimate(state, frame)
         used = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
         if usage.calls >= limits.max_calls or used + estimate > limits.max_tokens:
             raise KernelError("BUDGET_EXHAUSTED", "预算不足以安全发起下一次调用；已完成的阶段已保存。")
         usage.calls += 1
         usage.reserved_tokens += estimate
         self.store.save(state)
+        funded = self._funded_jobs.setdefault(state.run.id, set())
+        if job_key is not None:
+            funded.add(job_key)
         try:
             result = await call()
         except BaseException as error:
@@ -244,6 +291,9 @@ class Runner:
             usage.failed_calls += 1
             self.store.save(state)
             raise
+        finally:
+            if job_key is not None:
+                funded.discard(job_key)
         usage.reserved_tokens -= estimate
         usage.input_tokens += result.input_tokens
         usage.output_tokens += result.output_tokens
@@ -281,7 +331,7 @@ class Runner:
                         return
                     async with semaphore:
                         frame = frame_for(state, position_id)
-                        result = await self._call(state, frame, lambda: provider.propose(frame))
+                        result = await self._format_call(state, frame, provider, "propose", f"propose:{position_id}")
                         if result.value.position_id != position_id:
                             raise KernelError("MODEL_OUTPUT_INVALID", "模型返回了不匹配的生成位置。")
                         validate_proposal(state, result.value)
@@ -329,7 +379,7 @@ class Runner:
                         return
                     async with semaphore:
                         frame = frame_for(state, position_id)
-                        result = await self._call(state, frame, lambda: provider.realize(frame))
+                        result = await self._format_call(state, frame, provider, "realize", f"realize:{position_id}")
                         if not result.value.strip():
                             raise KernelError("MODEL_OUTPUT_INVALID", "恢复生成没有返回可读内容。")
                         pending.realizations[position_id] = result.value

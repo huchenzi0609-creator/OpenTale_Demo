@@ -7,6 +7,7 @@ from collections import defaultdict
 from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, ReadingFrame
 
 from .base import ModelResult, ProviderError
+from .feedback import OutputFeedback
 from .reading import eligible_candidates, shared_expression_ids, validate_presentation
 
 
@@ -71,7 +72,9 @@ def _glimpse(values: list, fallback: str, budget: int = 180) -> str:
 class FixtureProvider:
     """Deterministic fixtures intentionally expose the causal dependency in surface text."""
 
-    async def propose(self, frame: GenerationFrame) -> ModelResult[Proposal]:
+    async def propose(
+        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[Proposal]:
         shared = _shared_use(frame)
         peers = [peer for peer in frame.peers if peer.get("id") != frame.position_id]
         if frame.peer_interfaces:
@@ -118,7 +121,9 @@ class FixtureProvider:
             )
         )
 
-    async def realize(self, frame: GenerationFrame) -> ModelResult[str]:
+    async def realize(
+        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[str]:
         shared = _shared_use(frame)
         values = [str(value) for value in shared.get("values", [])]
         live_content = "。".join(values) if values else str(shared.get("text", ""))[:600]
@@ -126,7 +131,9 @@ class FixtureProvider:
         surface = f"{frame.name}停在这一段生活里。{live_content}。这次的停顿，使先前的记忆又取得了另一种意味。"
         return ModelResult(surface)
 
-    async def present(self, frame: ReadingFrame) -> ModelResult[Presentation]:
+    async def present(
+        self, frame: ReadingFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[Presentation]:
         if not frame.candidates:
             raise ProviderError("FIXTURE_FRAME_INVALID", "还没有可以承接的叙述。")
         shared_ids = shared_expression_ids(frame, legacy_letter=True)

@@ -7,6 +7,7 @@ from collections import defaultdict
 from opentale.domain import Presentation, ReadingFrame
 
 from .base import ProviderError
+from .feedback import OutputFeedback
 
 
 def shared_expression_ids(frame: ReadingFrame, *, legacy_letter: bool = False) -> set[str]:
@@ -64,4 +65,5 @@ def validate_presentation(
     ):
         raise ProviderError(
             "MODEL_OUTPUT_INVALID", "模型提出了无效的阅读承接。", True, usage=usage,
+            feedback=OutputFeedback("READING_INVALID", ("READING_SCOPE_INVALID",)),
         )
