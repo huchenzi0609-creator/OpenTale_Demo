@@ -12,9 +12,9 @@ class ReflectionRecord(BaseModel):
 class MethodDraft(ReflectionRecord):
     title: str = Field(min_length=1, max_length=100)
     instruction: str = Field(default="", max_length=1200)
-    inputs: list[str] = Field(min_length=1, max_length=32)
+    inputs: list[str] = Field(min_length=1)
     order: Literal["listed", "reverse"] = "listed"
-    limit: int = Field(default=16, ge=1, le=32)
+    limit: int | None = Field(default=16, ge=1)
     revises: str | None = None
 
 
@@ -31,8 +31,8 @@ class AdoptionDraft(ReflectionRecord):
 
 
 class ReflectionProposal(ReflectionRecord):
-    methods: list[MethodDraft] = Field(default_factory=list, max_length=4)
-    adoptions: list[AdoptionDraft] = Field(default_factory=list, max_length=16)
+    methods: list[MethodDraft] = Field(default_factory=list)
+    adoptions: list[AdoptionDraft] = Field(default_factory=list)
 
 
 class Material(ReflectionRecord):

@@ -11,14 +11,18 @@ from opentale.replay import verify_replay
 from pydantic import ValidationError
 
 
-def test_decimal_512m_budget_is_accepted_and_excess_is_rejected():
+def test_budget_defaults_remain_finite_but_unlimited_and_large_values_are_accepted():
     assert Limits().max_tokens == DEFAULT_TOKEN_BUDGET == 128000
-    assert Limits(**budget_bounds()).max_tokens == MAX_TOKEN_BUDGET == 5120000
-    with pytest.raises(ValidationError):
-        Limits(max_tokens=5120001)
+    assert Limits(**budget_bounds()).model_dump() == dict.fromkeys(budget_bounds())
+    assert Limits(max_tokens=MAX_TOKEN_BUDGET + 1).max_tokens == 5120001
+    larger = Limits(max_calls=100000, max_tokens=512000000, max_windows=100000, max_parallel=1000)
+    assert larger.max_parallel == 1000 and larger.max_tokens == 512000000
+    for field in budget_bounds():
+        with pytest.raises(ValidationError):
+            Limits(**{field: 0})
 
 
-def test_api_publishes_bounds_and_accepts_512k_without_generating(tmp_path):
+def test_api_publishes_unbounded_budgets_and_accepts_them_without_generating(tmp_path):
     with TestClient(create_app(tmp_path, tmp_path / "data")) as client:
         assert client.get("/api/config").json()["budget_bounds"] == budget_bounds()
         assert client.post("/api/config/reload").json()["budget_bounds"] == budget_bounds()
@@ -26,10 +30,13 @@ def test_api_publishes_bounds_and_accepts_512k_without_generating(tmp_path):
             "preset_id": "letters", "provider": "fixture", "limits": budget_bounds(),
         })
         assert result.status_code == 200 and result.json()["run"]["usage"]["calls"] == 0
-        rejected = client.post("/api/runs", json={
+        larger = client.post("/api/runs", json={
             "preset_id": "letters", "provider": "fixture", "limits": {"max_tokens": 5120001},
         })
-        assert rejected.status_code == 422
+        assert larger.status_code == 200 and larger.json()["run"]["usage"]["calls"] == 0
+        assert result.json()["run"]["limits"] == budget_bounds()
+        assert result.json()["schema_version"] == 4
+        assert larger.json()["schema_version"] == 4
 
 
 async def test_update_budget_preserves_saved_proposals_usage_and_old_error(tmp_path):

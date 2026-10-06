@@ -1,7 +1,8 @@
-"""Shared application capacity bounds; counts, characters and tokens have distinct units.
+"""Transport and protocol capacities; experiment budgets have no software ceilings.
 
 These are local acceptance ceilings, not claims about a remote model's context or output.
-Raising a ceiling does not increase an experiment's saved budget or trigger generation.
+Legacy budget constants remain import-compatible but no longer constrain validation.
+Removing a ceiling does not increase an experiment's saved budget or trigger generation.
 """
 
 DEFAULT_TOKEN_BUDGET = 128_000
@@ -27,10 +28,10 @@ MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_MODEL_OUTPUT_TOKENS = 32_768
 
 
-def budget_bounds() -> dict[str, int]:
+def budget_bounds() -> dict[str, None]:
     return {
-        "max_calls": MAX_CALL_BUDGET,
-        "max_tokens": MAX_TOKEN_BUDGET,
-        "max_parallel": MAX_PARALLEL_POSITIONS,
-        "max_windows": MAX_WINDOW_BUDGET,
+        "max_calls": None,
+        "max_tokens": None,
+        "max_parallel": None,
+        "max_windows": None,
     }

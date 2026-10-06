@@ -6,10 +6,10 @@ This branch adds an opt-in `mode=reflexive`; default/classic remains unchanged. 
 
 `opentale.reflection_types` defines:
 
-- `MethodDraft`: title (1..100), instruction (0..1200), inputs (1..32 existing object IDs), order (`listed|reverse`), limit (1..32, default16), revises (optional visible method ID).
+- `MethodDraft`: title (1..100), instruction (0..1200), inputs (nonempty existing object IDs), order (`listed|reverse`), limit (positive integer or null=all, default16), revises (optional visible method ID).
 - `MethodRecord`: MethodDraft + id, created_revision, source_scope (diagnostic only).
 - `AdoptionDraft`: scope_id, method_id, action (`adopt|release`). Newly generated methods are addressed in the same response as `draft:0`, `draft:1` etc. Existing methods require visible IDs.
-- `ReflectionProposal`: methods (0..4), adoptions (0..16).
+- `ReflectionProposal`: methods and adoptions are typed lists without a count ceiling.
 - `ReflectionFrame`: objects (request-owned capability table), scopes, active_methods, selected_inputs, groups, materials, instruction, input_fingerprint. `objects` rows contain id, kind (`content|method|choice`), text and kind-specific safe fields. `scopes` rows contain id/name. No creator provenance, hidden reasoning or API data.
 - `ReflectionState`: methods, adoptions (scope -> active method IDs), choices.
 - `ChoiceRecord`: id, revision, scope_id, stage, offered/selected IDs, active method IDs, groups, exact selected Material snapshots, input_fingerprint. Computed by runtime, not model reasoning.
@@ -24,7 +24,7 @@ Inputs may contain existing methods or choices; no fixed meta-level field. New m
 
 Root integrates actor methods into actual GenerationFrame material selection, reading methods into candidate selection/organization, captures choices, and adopts reading feedback only after all presentation frames for a revision have been frozen. Window scheduling remains same-version parallel microbatches in this first experiment; actor count/dynamic spawning remains unchanged. Joint dependency is permitted rather than mandatory in reflexive mode.
 
-Single execution is bounded at 256 traversal/cache-lookup steps, 64 material occurrences and 120,000 full material/instruction characters; at most 16 active methods per scope. Immutable shared subgraphs are memoized per execution without changing ordered material multiplicity. Candidate previews are bounded and explicitly marked; actual selected materials are not silently truncated. Software fingerprints compare resulting materials/groups/instructions, not method IDs alone.
+Execution has no step, material-count, total-character or active-method budget ceiling. Iterative postorder avoids the Python recursion ceiling; cyclic programs and unavailable/private references remain rejected. Immutable shared subgraphs are memoized per execution without changing ordered material multiplicity. Candidate previews are bounded and explicitly marked; actual selected materials are not silently truncated. Software fingerprints compare resulting materials/groups/instructions, not method IDs alone.
 
 ## Provider owner
 

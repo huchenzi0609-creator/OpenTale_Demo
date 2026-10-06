@@ -33,6 +33,7 @@ class Store:
         return db
 
     def save(self, snapshot: Snapshot) -> None:
+        snapshot.mark_extended_schema()
         snapshot.run.updated_at = now()
         with self.connect() as db:
             db.execute(

@@ -7,6 +7,7 @@ import Diagnostics from "./components/Diagnostics";
 import Verification from "./components/Verification";
 import ReflectionPanel from "./components/ReflectionPanel";
 import { readingTracks } from "./readings";
+import { budgetText } from "./budgetLimits";
 
 const STATUS: Record<string, string> = {
   idle: "待命",
@@ -245,26 +246,26 @@ export default function App() {
                 <span>窗口预算</span>
                 <strong>
                   {snapshot.run.usage.windows ?? 0}
-                  <small> / {snapshot.run.limits.max_windows}</small>
+                  <small> / {budgetText(snapshot.run.limits.max_windows)}</small>
                 </strong>
               </div>
               <div>
                 <span>调用预算</span>
                 <strong>
                   {snapshot.run.usage.calls}
-                  <small> / {snapshot.run.limits.max_calls}</small>
+                  <small> / {budgetText(snapshot.run.limits.max_calls)}</small>
                 </strong>
-                <progress
+                {snapshot.run.limits.max_calls !== null && <progress
                   value={snapshot.run.usage.calls}
                   max={snapshot.run.limits.max_calls}
                   aria-label="调用预算使用量"
-                />
+                />}
               </div>
               <div>
                 <span>Token 预算占用</span>
                 <strong>
                   {number(tokenUsage)}
-                  <small> / {number(snapshot.run.limits.max_tokens)}</small>
+                  <small> / {budgetText(snapshot.run.limits.max_tokens)}</small>
                 </strong>
               </div>
             </section>

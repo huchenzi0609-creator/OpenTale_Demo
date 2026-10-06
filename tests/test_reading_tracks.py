@@ -21,7 +21,6 @@ from opentale.providers import FixtureProvider, ModelResult, ProviderError
 from opentale.replay import verify_replay
 from opentale.runner import Runner
 from opentale.storage import Store
-from pydantic import ValidationError
 
 
 def track(state: Snapshot, identifier: str = "main"):
@@ -103,12 +102,13 @@ class StageFailureEvaluator(ReadingEvaluator):
         return await super().realize(frame)
 
 
-def test_total_token_budget_accepts_decimal_5_12m_and_rejects_excess():
-    assert MAX_TOKEN_BUDGET == budget_bounds()["max_tokens"] == 5120000
+def test_total_token_budget_accepts_large_values_and_unlimited():
+    assert MAX_TOKEN_BUDGET == 5120000  # Legacy constant; current budgets are not capped.
+    assert budget_bounds()["max_tokens"] is None
     assert Limits(max_tokens=5120000).max_tokens == 5120000
     assert Limits().max_tokens == 128000
-    with pytest.raises(ValidationError):
-        Limits(max_tokens=5120001)
+    assert Limits(max_tokens=5120001).max_tokens == 5120001
+    assert Limits(max_tokens=None).max_tokens is None
 
 
 async def test_two_starts_share_world_but_keep_separate_reading_continuations(snapshot, settings, tmp_path):

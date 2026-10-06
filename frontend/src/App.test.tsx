@@ -484,12 +484,24 @@ describe("parallel readings", () => {
   it.each(["calls", "tokens"])("prevents manual presentation when actual %s budget is consumed", async (budget) => {
     snapshot.run.revision = 1;
     snapshot.reading_tracks = [reading("main", "主阅读", "a")];
-    if (budget === "calls") snapshot.run.usage.calls = snapshot.run.limits.max_calls;
+    if (budget === "calls") snapshot.run.usage.calls = snapshot.run.limits.max_calls!;
     else snapshot.run.usage = { ...snapshot.run.usage, input_tokens: 1000, reserved_tokens: 1000, unknown_tokens: 38000 };
     await createRun();
     expect(screen.getByRole("button", { name: "从当前世界生成一段" })).toBeDisabled();
     expect(screen.getByText(/调用或 Token 预算已用尽/)).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([url]) => url.endsWith("/present"))).toBe(false);
+  });
+
+  it("allows presentation with unbounded saved budgets and shows no misleading progress ratio", async () => {
+    snapshot.run.revision = 1;
+    snapshot.run.limits = { max_calls: null, max_tokens: null, max_parallel: null, max_windows: null };
+    snapshot.run.usage = { calls: 100001, input_tokens: 51200000, output_tokens: 100, windows: 100001 };
+    snapshot.reading_tracks = [reading("main", "主阅读", "a")];
+    await createRun();
+    expect(screen.getByRole("button", { name: "从当前世界生成一段" })).toBeEnabled();
+    expect(screen.queryByLabelText("调用预算使用量")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("100001 / 不设限");
+    expect(screen.queryByText(/调用或 Token 预算已用尽/)).not.toBeInTheDocument();
   });
 
   it("toggles automatic continuation without generation and retains each reading's prose", async () => {
@@ -656,10 +668,10 @@ describe("OpenTale workbench", () => {
     expect(screen.getByText("650")).toBeInTheDocument();
     expect(screen.getByText(/未知用量保守记账 300/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("调用上限"), {
-      target: { value: "1001" },
+      target: { value: "1.5" },
     });
     expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "＋ 创建实验" })).toHaveAccessibleDescription(/预算须为范围内的正整数/);
+    expect(screen.getByRole("button", { name: "＋ 创建实验" })).toHaveAccessibleDescription(/有限预算须为可精确表示的正整数/);
     fireEvent.change(screen.getByLabelText("调用上限"), {
       target: { value: "12" },
     });
@@ -695,19 +707,20 @@ describe("OpenTale workbench", () => {
     expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeDisabled();
   });
 
-  it("allows the 5.12M fallback budget while rejecting an excess or a fractional limit", async () => {
+  it("allows budgets above former ceilings while rejecting fractions and imprecise numbers", async () => {
     render(<App />);
     const create = await screen.findByRole("button", { name: "＋ 创建实验" });
     await waitFor(() => expect(create).toBeEnabled());
     expect(screen.getByLabelText("Token 上限")).toHaveValue(128000);
-    for (const [label, value] of [["Token 上限", 5120000], ["调用上限", 1000],
-      ["并行位置", 8], ["窗口上限", 1000]] as const) {
+    for (const [label, value] of [["Token 上限", 512000000], ["调用上限", 100001],
+      ["并行位置", 100], ["窗口上限", 100001]] as const) {
       fireEvent.change(screen.getByLabelText(label), { target: { value: String(value) } });
       expect(create).toBeEnabled();
+      expect(screen.getByLabelText(label)).not.toHaveAttribute("max");
     }
-    fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "5120001" } });
+    fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "9007199254740992" } });
     expect(create).toBeDisabled();
-    expect(create).toHaveAccessibleDescription(/5,120,000/);
+    expect(create).toHaveAccessibleDescription(/可精确表示/);
     fireEvent.change(screen.getByLabelText("Token 上限"), { target: { value: "5120000" } });
     fireEvent.change(screen.getByLabelText("调用上限"), { target: { value: "1.5" } });
     expect(create).toBeDisabled();
@@ -729,6 +742,45 @@ describe("OpenTale workbench", () => {
     await waitFor(() => expect(screen.getByLabelText("Token 上限")).toHaveAttribute("max", "512000"));
     expect(create).toBeEnabled();
     expect(screen.getByLabelText("调用上限")).toHaveAttribute("max", "1000");
+  });
+
+  it("creates an experiment with explicit unlimited choices without starting model work", async () => {
+    snapshot.run.limits = { max_calls: null, max_tokens: null, max_parallel: null, max_windows: null };
+    render(<App />);
+    const create = await screen.findByRole("button", { name: "＋ 创建实验" });
+    await waitFor(() => expect(create).toBeEnabled());
+    for (const label of ["调用上限", "Token 上限", "并行位置", "窗口上限"]) {
+      fireEvent.click(screen.getByRole("checkbox", { name: `${label}不设限` }));
+      expect(screen.getByLabelText(label)).toBeDisabled();
+      expect(create).toBeEnabled();
+    }
+    fireEvent.click(create);
+    await screen.findByRole("heading", { name: "共同表达实验" });
+    const creation = fetchMock.mock.calls.find(([url, options]) => url === "/api/runs" && options?.method === "POST");
+    expect(JSON.parse(creation![1]!.body as string).limits).toEqual(snapshot.run.limits);
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+    expect(snapshot.run.usage.calls).toBe(0);
+  });
+
+  it("saves unlimited edits explicitly and preserves the current checkpoint and accounting", async () => {
+    snapshot.pending = { base_revision: 0, proposals: { a: "saved" }, realizations: {}, committed: false };
+    snapshot.run.status = "error";
+    snapshot.run.usage.calls = 20;
+    const unbounded = { max_calls: null, max_tokens: null, max_parallel: null, max_windows: null };
+    requestOverrides["PATCH /api/runs/run-1/limits"] = () => response({ ...snapshot,
+      run: { ...snapshot.run, limits: unbounded } });
+    await createRun();
+    for (const label of ["调用上限", "Token 上限", "并行位置", "窗口上限"]) {
+      fireEvent.click(screen.getByRole("checkbox", { name: `${label}不设限` }));
+    }
+    expect(fetchMock.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "更新本实验预算" }));
+    await screen.findByText(/本实验预算已更新/);
+    const patch = fetchMock.mock.calls.find(([, options]) => options?.method === "PATCH");
+    expect(JSON.parse(patch![1]!.body as string)).toEqual(unbounded);
+    expect(screen.getByRole("region", { name: "运行状态" })).toHaveTextContent("20 / 不设限");
+    expect(screen.getByText(/局部窗口 R0 正在处理中/)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
   });
 
   it("loads the selected save's own limits and cancels budget edits without requests", async () => {
@@ -810,6 +862,7 @@ describe("OpenTale workbench", () => {
     fireEvent.click(screen.getByRole("button", { name: "开始运行" }));
     await screen.findByRole("button", { name: "暂停" });
     expect(screen.getByLabelText("Token 上限")).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: "Token 上限不设限" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "更新本实验预算" })).toBeDisabled();
     expect(screen.getByText("请先暂停运行中的实验，再修改预算。")).toBeInTheDocument();
     expect(fetchMock.mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);

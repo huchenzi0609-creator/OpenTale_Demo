@@ -185,13 +185,21 @@ async def test_presentation_schema_and_example_use_only_required_focus_scopes_an
         await DeepSeekProvider(Settings(api_key=KEY), client).present(frames()[1])
     system = requests[0]["messages"][0]["content"]
     schema = json.loads(system.split("JSON schema:\n", 1)[1])
-    assert schema["required"] == ["text", "focus_position_id", "expression_ids", "reinterprets"]
+    assert schema["required"] == ["text", "focus_index", "expression_indices", "reinterprets_indices"]
     assert len(schema["oneOf"]) == 1
     props = schema["oneOf"][0]["properties"]
-    assert props["focus_position_id"] == {"const": "p-b"}
-    assert props["expression_ids"]["items"]["enum"] == ["door", "private-p-b"]
-    assert props["expression_ids"]["contains"]["enum"] == ["door"]
-    assert schema["properties"]["reinterprets"]["maxItems"] == 0
+    assert props["focus_index"] == {"const": 0}
+    assert props["expression_indices"]["items"]["enum"] == [0, 1]
+    assert props["expression_indices"]["contains"]["enum"] == [0]
+    assert schema["properties"]["reinterprets_indices"]["maxItems"] == 0
+    data = json.loads(requests[0]["messages"][1]["content"])
+    assert data["reading_table"] == [{
+        "focus_index": 0, "position_id": "p-b", "name": "归来的人",
+        "expressions": [
+            {"expression_index": 0, "expression_id": "door", "shared": True},
+            {"expression_index": 1, "expression_id": "private-p-b", "shared": False},
+        ],
+    }]
     assert "本阶段完整输出形状示例" in system
 
 

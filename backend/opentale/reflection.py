@@ -14,11 +14,6 @@ from .reflection_types import (
     ReflectionProposal,
 )
 
-MAX_STEPS = 256
-MAX_MATERIALS = 64
-MAX_ACTIVE_METHODS = 16
-MAX_CONTEXT_CHARS = 120_000
-
 
 def position_scope(position_id: str) -> str:
     return f"position:{position_id}"
@@ -98,47 +93,50 @@ def objects_for(state: Snapshot, scope: str) -> dict[str, dict]:
 
 
 def _execute(objects: dict[str, dict], methods: list[str]) -> tuple[list[Material], list[list[str]], str]:
-    steps = 0
     instructions: list[str] = []
+    seen_instructions: set[str] = set()
     memo: dict[str, list[Material]] = {}
 
-    def expand(ref: str, path: tuple[str, ...]) -> list[Material]:
-        nonlocal steps
-        steps += 1
-        if steps > MAX_STEPS:
-            raise KernelError("METHOD_BUDGET_EXCEEDED", "本次方法组合超过有限求值步数，请释放或简化当前方法。")
-        if ref in path:
-            raise KernelError("METHOD_CYCLE", "方法引用形成了无法有限求值的循环。")
-        if ref in memo:
-            return list(memo[ref])
-        obj = objects.get(ref)
-        if obj is None:
-            raise KernelError("METHOD_INPUT_UNAVAILABLE", "当前方法所需材料在此位置不可见。")
-        if obj["kind"] == "content":
-            memo[ref] = [Material.model_validate({key: obj[key] for key in Material.model_fields if key in obj})]
-            return list(memo[ref])
-        if obj["kind"] == "choice":
-            memo[ref] = [Material.model_validate(material) for material in obj["materials"]][:MAX_MATERIALS]
-            return list(memo[ref])
-        if obj.get("instruction") and obj["instruction"] not in instructions:
-            instructions.append(obj["instruction"])
-        result = []
-        for child in obj["inputs"]:
-            result.extend(expand(child, (*path, ref)))
-        if obj["order"] == "reverse":
-            result.reverse()
-        memo[ref] = result[:obj["limit"]]
-        return list(memo[ref])
+    def expand(root: str) -> list[Material]:
+        # Iterative postorder avoids a Python recursion ceiling for deep method chains.
+        stack = [(root, False)]
+        visiting: set[str] = set()
+        while stack:
+            ref, completed = stack.pop()
+            if ref in memo:
+                continue
+            obj = objects.get(ref)
+            if obj is None:
+                raise KernelError("METHOD_INPUT_UNAVAILABLE", "当前方法所需材料在此位置不可见。")
+            if completed:
+                result = [material for child in obj["inputs"] for material in memo[child]]
+                if obj["order"] == "reverse":
+                    result.reverse()
+                memo[ref] = result[:obj["limit"]] if obj["limit"] is not None else result
+                visiting.remove(ref)
+            elif obj["kind"] == "content":
+                memo[ref] = [Material.model_validate({
+                    key: obj[key] for key in Material.model_fields if key in obj
+                })]
+            elif obj["kind"] == "choice":
+                memo[ref] = [Material.model_validate(material) for material in obj["materials"]]
+            else:
+                if ref in visiting:
+                    raise KernelError("METHOD_CYCLE", "方法引用形成了无法有限求值的循环。")
+                visiting.add(ref)
+                instruction = obj.get("instruction", "")
+                if instruction and instruction not in seen_instructions:
+                    instructions.append(instruction)
+                    seen_instructions.add(instruction)
+                stack.append((ref, True))
+                stack.extend((child, False) for child in reversed(obj["inputs"]))
+        return list(memo[root])
 
     groups, materials = [], []
     for method_id in sorted(methods):
-        group = expand(method_id, ())
+        group = expand(method_id)
         groups.append([material.id for material in group])
         materials.extend(group)
-    if len(materials) > MAX_MATERIALS:
-        raise KernelError("METHOD_BUDGET_EXCEEDED", "本次组合采用的材料过多，请释放或简化当前方法。")
-    if sum(len(material.text) for material in materials) + sum(map(len, instructions)) > MAX_CONTEXT_CHARS:
-        raise KernelError("METHOD_BUDGET_EXCEEDED", "本次方法采用的完整材料超出局部上下文容量。")
     return materials, groups, "\n".join(instructions)
 
 
@@ -152,7 +150,7 @@ def reflection_frame(state: Snapshot, scope: str, default_ids: list[str]) -> Ref
         materials = [
             Material.model_validate({key: objects[ref][key] for key in Material.model_fields if key in objects[ref]})
             for ref in default_ids if ref in objects and objects[ref]["kind"] == "content"
-        ][:MAX_MATERIALS]
+        ]
         groups, instruction = [[material.id for material in materials]], ""
     selected = [material.id for material in materials]
     # Request size is bounded, but adopted dependencies are never silently omitted.
@@ -169,8 +167,6 @@ def reflection_frame(state: Snapshot, scope: str, default_ids: list[str]) -> Ref
     extras = [obj for ref, obj in objects.items() if ref not in required]
     # Offer fresh methods/choices and recent narrative, plus reusable initial carriers.
     rows.extend(extras[-max(0, 96 - len(rows)): ] if len(rows) < 96 else [])
-    if len(rows) > 256:
-        raise KernelError("METHOD_BUDGET_EXCEEDED", "当前方法依赖超出局部接口容量。")
     scopes = [{"id": position_scope(p.id), "name": p.name} for p in state.positions]
     if scope.startswith("reading:"):
         scopes.append({"id": scope, "name": "本条阅读"})
@@ -289,8 +285,6 @@ def install_feedback(
                     removed[adoption.scope_id].add(methods[method_id].revises)
     for scope in incoming.keys() | removed.keys():
         adopted = (set(result.adoptions.get(scope, [])) - removed[scope]) | incoming[scope]
-        if len(adopted) > MAX_ACTIVE_METHODS:
-            raise KernelError("METHOD_LIMIT_REACHED", "本位置采用的方法过多，请在新提案中释放旧方法。")
         result.adoptions[scope] = sorted(adopted)
     result.methods = sorted(methods.values(), key=lambda method: (method.created_revision, method.id))
     detached = state.model_copy(deep=True)

@@ -10,15 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 from .capacity import (
     DEFAULT_TOKEN_BUDGET,
     MAX_BINDING_TEXT_CHARS,
-    MAX_CALL_BUDGET,
     MAX_OPERATION_TEXT_CHARS,
-    MAX_PARALLEL_POSITIONS,
     MAX_PRESENTATION_TEXT_CHARS,
     MAX_PROPOSAL_OPERATIONS,
     MAX_PROPOSAL_TEXT_CHARS,
     MAX_READING_TRACKS,
-    MAX_TOKEN_BUDGET,
-    MAX_WINDOW_BUDGET,
 )
 from .reflection_types import ReflectionFrame, ReflectionProposal, ReflectionState
 
@@ -32,10 +28,10 @@ class Record(BaseModel):
 
 
 class Limits(Record):
-    max_calls: int = Field(default=24, ge=1, le=MAX_CALL_BUDGET)
-    max_tokens: int = Field(default=DEFAULT_TOKEN_BUDGET, ge=1, le=MAX_TOKEN_BUDGET)
-    max_parallel: int = Field(default=3, ge=1, le=MAX_PARALLEL_POSITIONS)
-    max_windows: int = Field(default=8, ge=1, le=MAX_WINDOW_BUDGET)
+    max_calls: int | None = Field(default=24, ge=1)
+    max_tokens: int | None = Field(default=DEFAULT_TOKEN_BUDGET, ge=1)
+    max_parallel: int | None = Field(default=3, ge=1)
+    max_windows: int | None = Field(default=8, ge=1)
 
 
 class Usage(Record):
@@ -199,7 +195,7 @@ class ReadingTrack(Record):
 
 
 class Snapshot(Record):
-    schema_version: Literal[2, 3] = 2
+    schema_version: Literal[2, 3, 4] = 2
     run: Run
     positions: list[Position]
     expressions: list[Expression]
@@ -221,10 +217,10 @@ class Snapshot(Record):
             return value
         data = dict(value)
         version = data.get("schema_version", 1)
-        if type(version) is not int or version not in {1, 2, 3}:
+        if type(version) is not int or version not in {1, 2, 3, 4}:
             return data  # Literal validation rejects unknown future versions.
-        if version in {2, 3} and "reading_tracks" not in data:
-            raise ValueError("Version-2 snapshots require canonical reading histories")
+        if version in {2, 3, 4} and "reading_tracks" not in data:
+            raise ValueError("Versioned snapshots require canonical reading histories")
         legacy_story = data.pop("story", [])
         legacy_reading = data.pop("reading", {})
         if "reading_tracks" not in data:
@@ -242,14 +238,14 @@ class Snapshot(Record):
                     raise ValueError("Primary reading projection does not match its history")
                 if legacy_reading and legacy_reading != main_data.get("reading", {}):
                     raise ValueError("Primary reading projection does not match its state")
-        data["schema_version"] = 3 if version == 3 else 2
+        data["schema_version"] = version if version in {3, 4} else 2
         return data
 
     @model_validator(mode="after")
     def unique_readings(self) -> "Snapshot":
-        if self.run.mode == "reflexive" and (self.schema_version != 3 or self.reflection is None):
-            raise ValueError("Reflexive snapshots require version 3 and reflection state")
-        if self.run.mode == "classic" and (self.schema_version != 2 or self.reflection is not None):
+        if self.run.mode == "reflexive" and (self.schema_version not in {3, 4} or self.reflection is None):
+            raise ValueError("Reflexive snapshots require version 3 or 4 and reflection state")
+        if self.run.mode == "classic" and (self.schema_version not in {2, 4} or self.reflection is not None):
             raise ValueError("Classic snapshots cannot execute reflection state")
         identifiers = [track.id for track in self.reading_tracks]
         if len(identifiers) != len(set(identifiers)) or "main" not in identifiers:
@@ -258,7 +254,26 @@ class Snapshot(Record):
         if any(track.start_position_id is not None and track.start_position_id not in positions
                for track in self.reading_tracks):
             raise ValueError("Reading starts must reference current positions")
+        self.mark_extended_schema()
         return self
+
+    def mark_extended_schema(self) -> None:
+        """Mark data an older reader cannot represent without converting existing finite saves."""
+        legacy = {"max_calls": 1000, "max_tokens": 5120000, "max_parallel": 8, "max_windows": 1000}
+        extended = any(value is None or value > legacy[field]
+                       for field, value in self.run.limits.model_dump().items())
+        methods = list(self.reflection.methods) if self.reflection else []
+        if self.reflection:
+            extended |= any(len(ids) > 16 for ids in self.reflection.adoptions.values())
+        if self.pending:
+            for value in [*self.pending.proposals.values(), *self.pending.presentations.values()]:
+                if value.reflection:
+                    methods.extend(value.reflection.methods)
+                    extended |= len(value.reflection.methods) > 4 or len(value.reflection.adoptions) > 16
+        extended |= any(method.limit is None or method.limit > 32 or len(method.inputs) > 32
+                        for method in methods)
+        if extended:
+            self.schema_version = 4
 
     @computed_field
     @property

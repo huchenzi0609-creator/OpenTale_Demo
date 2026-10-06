@@ -6,6 +6,7 @@ import { readingTracks } from "./readings";
 import type {
   Counterfactual,
   ExperimentMode,
+  FiniteLimits,
   Limits,
   Preset,
   PresetCatalog,
@@ -312,7 +313,7 @@ export function useWorkbench() {
       (snapshot.run.usage.reserved_tokens ?? 0) +
       (snapshot.run.usage.unknown_tokens ?? 0)
     : 0;
-  const minimumRunLimits: Limits = {
+  const minimumRunLimits: FiniteLimits = {
     max_calls: Math.max(1, snapshot?.run.usage.calls ?? 0),
     max_tokens: Math.max(1, tokenUsage),
     max_parallel: 1,

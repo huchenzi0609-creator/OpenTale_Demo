@@ -27,9 +27,9 @@ class WireMethod(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     title: str = Field(min_length=1, max_length=100)
     instruction: str = Field(default="", max_length=1200)
-    object_indices: list[int] = Field(min_length=1, max_length=32)
+    object_indices: list[int] = Field(min_length=1)
     order: Literal["listed", "reverse"] = "listed"
-    limit: int = Field(default=16, ge=1, le=32)
+    limit: int | None = Field(default=16, ge=1)
     revises_index: int | None = None
 
 
@@ -43,8 +43,8 @@ class WireAdoption(BaseModel):
 
 class WireReflection(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    methods: list[WireMethod] = Field(default_factory=list, max_length=4)
-    adoptions: list[WireAdoption] = Field(default_factory=list, max_length=16)
+    methods: list[WireMethod] = Field(default_factory=list)
+    adoptions: list[WireAdoption] = Field(default_factory=list)
 
 
 def materials_data(frame: ReflectionFrame) -> list[dict]:
@@ -137,7 +137,7 @@ def reflection_schema(frame: ReflectionFrame) -> dict:
         "anyOf": [{"type": "integer", "enum": methods}, {"type": "null"}], "default": None,
     }
     props["draft_index"] = {
-        "anyOf": [{"type": "integer", "minimum": 0, "maximum": 3}, {"type": "null"}], "default": None,
+        "anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}], "default": None,
     }
     schema["$defs"]["WireAdoption"]["oneOf"] = [
         {"required": ["method_index"], "properties": {"method_index": {"type": "integer"},
@@ -201,6 +201,7 @@ choice 的 offered_indices/selected_indices/group_indices 呈现此前提供、�
 counts 保留数量，unavailable_*_count 表示当前接口中不可索引的旧引用；不猜测缺失内容或编号。
 可按当前叙述的需要输出 reflection.methods/adoptions，或省略 reflection；无需每次都修改方法。
 methods 中 object_indices 只选本次 objects 已有的整数。方法以 listed/reverse 排序并取 limit 项；
+limit 为 null 时取全部，正整数没有软件最大值。
 instruction 写材料怎样关联、怎样形成经验的方向，它会影响后续真实生成。
 已有方法和选择也可成为方法输入。revises_index 若非空只选 kind=method 的已有对象。
 adoptions 的 scope_index 仅选 scopes；method_index 选已有方法，或 draft_index 选本响应 methods

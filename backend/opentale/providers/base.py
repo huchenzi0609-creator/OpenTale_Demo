@@ -34,7 +34,7 @@ class ProviderError(Exception):
         if usage is not None and (
             not isinstance(usage, tuple)
             or len(usage) != 2
-            or any(type(count) is not int or not 0 <= count <= 5_000_000 for count in usage)
+            or any(type(count) is not int or count < 0 for count in usage)
         ):
             raise ValueError("Invalid provider usage accounting")
         self.code = code

@@ -80,7 +80,7 @@ def test_configuration_diagnostics_follow_reload_without_exposing_values(tmp_pat
         assert credential not in overridden.text
 
 
-def test_recovery_fork_accepts_bounded_budget_without_mutating_parent(tmp_path):
+def test_recovery_fork_accepts_explicit_budget_without_mutating_parent(tmp_path):
     with TestClient(create_app(tmp_path, tmp_path / "data")) as client:
         created = client.post("/api/runs", json={"preset_id": "letters", "provider": "fixture"}).json()
         path = f"/api/runs/{created['run']['id']}"
@@ -89,6 +89,6 @@ def test_recovery_fork_accepts_bounded_budget_without_mutating_parent(tmp_path):
         assert response.status_code == 200 and response.json()["run"]["limits"] == limits
         assert client.get(path).json() == created
         before = len(client.get("/api/runs").json()["runs"])
-        invalid = client.post(path + "/fork", json={"limits": {**limits, "max_parallel": 99}})
+        invalid = client.post(path + "/fork", json={"limits": {**limits, "max_parallel": 0}})
         assert invalid.status_code == 422
         assert len(client.get("/api/runs").json()["runs"]) == before

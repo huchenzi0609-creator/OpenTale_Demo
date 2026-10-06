@@ -151,21 +151,21 @@ export default function Sidebar({ model }: { model: Workbench }) {
         <p className="helper">
           {provider === "fixture"
             ? "确定性文本用于验证结构机制，不代表模型的叙事效果。"
-            : "创建后开始或单步才会调用模型。下方预算是本次实验的硬上限。"}
+            : "创建后开始或单步才会调用模型。下方可保存有限预算，或逐项选择不设限。"}
         </p>
         <div id="experiment-budget" role="group" aria-label="实验预算">
-          <p className="helper">新实验默认 Token 预算为 {DEFAULT_LIMITS.max_tokens.toLocaleString("zh-CN")}，上限 {maximumLimits.max_tokens.toLocaleString("zh-CN")}（按 Token 数计）。加载存档后，下方显示该实验已保存的预算。</p>
+          <p className="helper">新实验默认 Token 预算为 {DEFAULT_LIMITS.max_tokens.toLocaleString("zh-CN")}（按 Token 数计），各项可选择不设限。加载存档后，下方显示该实验已保存的预算，不会自动改变。</p>
           <div className="budget-grid">
           {LIMIT_FIELDS.map(([field, label]) => (
-            <label key={field} htmlFor={field}>
-              {label}
+            <div key={field}>
+              <label htmlFor={field}>{label}</label>
               <input
                 id={field}
                 type="number"
                 min="1"
-                max={maximumLimits[field]}
-                value={limits[field]}
-                disabled={disabled || anyActive}
+                max={maximumLimits[field] ?? undefined}
+                value={limits[field] ?? ""}
+                disabled={disabled || anyActive || limits[field] === null}
                 onChange={(event) =>
                   setLimits((current) => ({
                     ...current,
@@ -173,10 +173,20 @@ export default function Sidebar({ model }: { model: Workbench }) {
                   }))
                 }
               />
-            </label>
+              <label className="budget-unlimited" htmlFor={`${field}-unlimited`}>
+                <input id={`${field}-unlimited`} type="checkbox" checked={limits[field] === null}
+                  aria-label={`${label}不设限`}
+                  disabled={disabled || anyActive || maximumLimits[field] !== null}
+                  onChange={(event) => setLimits((current) => ({
+                    ...current, [field]: event.target.checked ? null
+                      : Math.max(DEFAULT_LIMITS[field], minimumRunLimits[field]),
+                  }))} />
+                不设限
+              </label>
+            </div>
           ))}
           </div>
-          <p className="helper">并行上限同时约束人物生成与阅读呈现。多条阅读共享同一实验预算。</p>
+          <p className="helper">并行不设限时，本阶段任务可全部并行。多条阅读共享同一实验预算。</p>
           {snapshot && <div className="run-budget-actions">
             <p className="helper">当前存档：{snapshot.run.title}。更新只修改本实验上限，保留已有用量、结果与恢复点，不调用模型。</p>
             <button className="button secondary full"
@@ -188,7 +198,7 @@ export default function Sidebar({ model }: { model: Workbench }) {
               onClick={resetRunLimits}>恢复已保存预算</button>
             {!validRunLimits && !anyActive && <p className="helper creation-feedback" role="status">
               {validLimits
-                ? `上限不能低于本档已用量。本档最低上限：调用 ${minimumRunLimits.max_calls}，Token ${minimumRunLimits.max_tokens.toLocaleString("zh-CN")}，窗口 ${minimumRunLimits.max_windows}；各上限须为正整数。`
+                ? `有限上限不能低于本档已用量。本档最低有限上限：调用 ${minimumRunLimits.max_calls}，Token ${minimumRunLimits.max_tokens.toLocaleString("zh-CN")}，窗口 ${minimumRunLimits.max_windows}；也可选择不设限。`
                 : budgetRangeText(maximumLimits)}
             </p>}
             {budgetError && <p className="creation-feedback creation-error" role="alert">

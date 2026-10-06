@@ -15,11 +15,12 @@ export interface Usage {
   windows?: number;
 }
 export interface Limits {
-  max_calls: number;
-  max_tokens: number;
-  max_parallel: number;
-  max_windows: number;
+  max_calls: number | null;
+  max_tokens: number | null;
+  max_parallel: number | null;
+  max_windows: number | null;
 }
+export type FiniteLimits = { [Field in keyof Limits]: number };
 export interface RunSummary {
   id: string;
   title: string;
@@ -104,7 +105,7 @@ export interface Event {
   data: Record<string, unknown>;
 }
 export interface Snapshot {
-  schema_version: 1 | 2 | 3;
+  schema_version: 1 | 2 | 3 | 4;
   run: Run;
   positions: Position[];
   expressions: Expression[];
@@ -135,7 +136,7 @@ export interface MethodRecord {
   instruction: string;
   inputs: string[];
   order: "listed" | "reverse";
-  limit: number;
+  limit: number | null;
   revises: string | null;
   created_revision: number;
   source_scope: string;

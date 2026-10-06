@@ -60,11 +60,10 @@ class Runner:
             raise KernelError("RUN_BUSY", "请先暂停本实验，再更新预算。")
         usage = state.run.usage
         occupied = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
-        if (
-            limits.max_calls < usage.calls
-            or limits.max_tokens < occupied
-            or limits.max_windows < usage.windows
-        ):
+        if any(limit is not None and limit < used for limit, used in (
+            (limits.max_calls, usage.calls), (limits.max_tokens, occupied),
+            (limits.max_windows, usage.windows),
+        )):
             raise KernelError("BUDGET_BELOW_USAGE", "新预算不能小于本实验已用调用、Token 占用或已完成窗口。")
         previous = state.run.limits.model_dump()
         state.run.limits = limits.model_copy(deep=True)
@@ -267,6 +266,11 @@ class Runner:
                         or (method in {"propose", "present"} and state.reflection is not None
                             and feedback.category == "PROPOSAL_INVALID"
                             and feedback.issues == ("REFLECTION_REFERENCE_INVALID",))
+                        or (method == "present" and feedback.category == "READING_INVALID"
+                            and bool(feedback.issues) and set(feedback.issues) <= {
+                                "READING_SCOPE_INVALID", "READING_FOCUS_INVALID", "READING_EXPRESSION_INVALID",
+                                "READING_HISTORY_INVALID", "READING_SHARED_REQUIRED",
+                            })
                     )
                 )
                 if not repairable or attempt >= MAX_FORMAT_REPAIRS or state.run.id in self.pause_requests:
@@ -278,8 +282,10 @@ class Runner:
                     required = 1
                 usage = state.run.usage
                 occupied = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
-                if (usage.calls + required > state.run.limits.max_calls
-                        or occupied + self._token_estimate(state, frame) > state.run.limits.max_tokens):
+                if ((state.run.limits.max_calls is not None
+                     and usage.calls + required > state.run.limits.max_calls)
+                        or (state.run.limits.max_tokens is not None
+                            and occupied + self._token_estimate(state, frame) > state.run.limits.max_tokens)):
                     raise
                 self.event(
                     state, "format_retry", method=method, job=job_key, attempt=attempt + 1,
@@ -294,7 +300,8 @@ class Runner:
         usage, limits = state.run.usage, state.run.limits
         estimate = self._token_estimate(state, frame)
         used = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
-        if usage.calls >= limits.max_calls or used + estimate > limits.max_tokens:
+        if ((limits.max_calls is not None and usage.calls >= limits.max_calls)
+                or (limits.max_tokens is not None and used + estimate > limits.max_tokens)):
             raise KernelError("BUDGET_EXHAUSTED", "预算不足以安全发起下一次调用；已完成的阶段已保存。")
         usage.calls += 1
         usage.reserved_tokens += estimate
@@ -341,16 +348,20 @@ class Runner:
             state.run.last_error = None
             try:
                 provider = make_provider(state.run.provider, self.settings)
-                if state.run.usage.windows >= state.run.limits.max_windows:
+                if (state.run.limits.max_windows is not None
+                        and state.run.usage.windows >= state.run.limits.max_windows):
                     raise KernelError("BUDGET_EXHAUSTED", "本实验的局部窗口额度已用完，可提高窗口预算后继续。")
-                if state.run.usage.calls + self._needed_calls(state) > state.run.limits.max_calls:
+                if (state.run.limits.max_calls is not None
+                        and state.run.usage.calls + self._needed_calls(state) > state.run.limits.max_calls):
                     raise KernelError("BUDGET_EXHAUSTED", "剩余调用额度不足以完成一个窗口；没有发起新调用。")
                 if state.pending is None:
                     state.pending = Pending(base_revision=state.run.revision)
                     state.run.phase = "drafting"
                     self.event(state, "window_started", base_revision=state.run.revision)
                 pending = state.pending
-                semaphore = asyncio.Semaphore(state.run.limits.max_parallel)
+                semaphore = asyncio.Semaphore(state.run.limits.max_parallel or max(
+                    1, len(state.positions) + sum(track.enabled for track in state.reading_tracks),
+                ))
 
                 async def draft(position_id: str) -> None:
                     if position_id in pending.proposals:

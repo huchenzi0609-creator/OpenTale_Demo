@@ -19,7 +19,7 @@ from opentale.reflection import (
     reading_scope,
     reflection_frame,
 )
-from opentale.reflection_types import AdoptionDraft, MethodDraft, ReflectionProposal
+from opentale.reflection_types import AdoptionDraft, MethodDraft, MethodRecord, ReflectionProposal
 from opentale.replay import verify_replay
 from opentale.runner import Runner
 from opentale.storage import Store
@@ -152,18 +152,50 @@ def test_reflexive_allows_quiet_continuation_but_classic_requires_peer_effect(re
         install_batch(snapshot, drafts(snapshot), 0)
 
 
-def test_invalid_reference_and_step_overflow_are_atomic(reflexive, monkeypatch):
+def test_invalid_reference_is_atomic_and_cyclic_execution_is_rejected(reflexive):
     scope = position_scope("writer")
     before = reflexive.model_dump()
     with pytest.raises(KernelError, match="本次可见"):
         install_method(reflexive, scope, inputs=["invented-reference"])
     assert reflexive.model_dump() == before
-    first = install_method(reflexive, scope)
-    before = reflexive.model_dump()
-    monkeypatch.setattr("opentale.reflection.MAX_STEPS", 2)
-    with pytest.raises(KernelError, match="步数"):
-        install_method(reflexive, scope, inputs=[first.id], revises=first.id)
-    assert reflexive.model_dump() == before
+    from opentale.reflection import _execute
+
+    with pytest.raises(KernelError, match="循环"):
+        _execute({"self": {"kind": "method", "inputs": ["self"], "instruction": "", "order": "listed",
+                           "limit": None}}, ["self"])
+
+
+def test_deep_method_chain_has_no_step_or_python_recursion_ceiling(reflexive):
+    scope = position_scope("writer")
+    inputs = public_inputs(reflexive, scope)[:1]
+    ref = inputs[0]
+    for index in range(1100):
+        method = MethodRecord(id=f"deep-{index}", title="继续组合", instruction="", inputs=[ref],
+                              limit=None, created_revision=index, source_scope=scope)
+        reflexive.reflection.methods.append(method)
+        ref = method.id
+    reflexive.reflection.adoptions[scope] = [ref]
+    frame = reflection_frame(reflexive, scope, [])
+    assert frame.selected_inputs == inputs
+    assert len(frame.objects) > 256
+
+
+def test_material_count_and_method_adoption_have_no_budget_ceiling(reflexive):
+    scope = position_scope("writer")
+    public = public_inputs(reflexive, scope)[0]
+    use = next(use for use in reflexive.uses if use.id == public)
+    use.bindings[0].value = "完整经历" * 600
+    frame = reflection_frame(reflexive, scope, [])
+    draft = MethodDraft(title="共同经历", inputs=[public] * 70, limit=None)
+    proposal = ReflectionProposal(
+        methods=[draft] * 20,
+        adoptions=[AdoptionDraft(scope_id=scope, method_id=f"draft:{index}") for index in range(20)],
+    )
+    install_feedback(reflexive, [(scope, proposal, frame)])
+    result = reflection_frame(reflexive, scope, [])
+    assert len(reflexive.reflection.adoptions[scope]) == 20
+    assert len(result.materials) == 1400
+    assert sum(len(material.text) for material in result.materials) > 120000
 
 
 @pytest.mark.parametrize("mode,version", [("classic", 2), ("reflexive", 3)])

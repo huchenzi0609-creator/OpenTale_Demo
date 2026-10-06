@@ -252,6 +252,20 @@ details p {
   padding: 8px 10px;
   font-size: 13px;
 }
+.budget-grid .budget-unlimited {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+}
+.budget-grid .budget-unlimited input {
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--teal);
+}
 .run-budget-actions {
   padding: 10px 0 14px;
   border-top: 1px solid var(--border);

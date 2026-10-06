@@ -14,6 +14,7 @@ _FIELDS = frozenset({
     "text", "fragments", "targets", "target_position_id", "expression_id", "role", "interface_index",
     "position_id", "based_on_revision", "operations", "op", "value", "anchor",
     "focus_position_id", "expression_ids", "reinterprets",
+    "focus_index", "expression_indices", "reinterprets_indices",
     "reflection", "methods", "adoptions", "title", "instruction", "object_indices", "order", "limit",
     "revises_index", "scope_index", "method_index", "draft_index", "action",
 })
@@ -26,6 +27,8 @@ _REASONS = frozenset({
     "EMPTY_FRAGMENT", "FRAGMENT_TOO_LONG", "NO_PEER_OPERATION", "TOO_MANY_OPERATIONS",
     "PROPOSAL_TOO_LARGE", "POSITION_MISMATCH", "REVISION_MISMATCH", "TARGET_UNKNOWN", "INTERFACE_UNKNOWN",
     "EXPRESSION_UNAVAILABLE", "ANCHOR_NOT_IN_TEXT", "READING_SCOPE_INVALID",
+    "READING_FOCUS_INVALID", "READING_EXPRESSION_INVALID", "READING_HISTORY_INVALID",
+    "READING_SHARED_REQUIRED",
     "TECHNICAL_PROSE", "SCHEMA_INVALID", "WRAPPING_TOO_DEEP",
     "REFLECTION_REFERENCE_INVALID",
 })

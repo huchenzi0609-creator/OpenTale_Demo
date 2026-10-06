@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { readingTracks, worldReadyForPresentation } from "../readings";
+import { budgetExhausted } from "../budgetLimits";
 import type { ReadingTrack, Snapshot } from "../types";
 import type { Workbench } from "../useWorkbench";
 
@@ -21,8 +22,8 @@ function ReadingColumn({ track, snapshot, model }: {
   const ready = worldReadyForPresentation(snapshot);
   const usage = snapshot.run.usage;
   const usedTokens = usage.input_tokens + usage.output_tokens + (usage.reserved_tokens ?? 0) + (usage.unknown_tokens ?? 0);
-  const presentationBudgetExhausted = usage.calls >= snapshot.run.limits.max_calls ||
-    usedTokens >= snapshot.run.limits.max_tokens;
+  const presentationBudgetExhausted = budgetExhausted(usage.calls, snapshot.run.limits.max_calls) ||
+    budgetExhausted(usedTokens, snapshot.run.limits.max_tokens);
   const needsConfig = snapshot.run.provider === "deepseek" && !model.config?.configured;
   const reason = model.anyActive ? "请先暂停运行，再调整阅读或单独生成。"
     : !ready ? "请先完成人物续延；当前世界的所有人物续延就绪后即可呈现。"

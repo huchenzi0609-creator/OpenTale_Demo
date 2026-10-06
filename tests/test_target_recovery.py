@@ -275,7 +275,7 @@ async def test_proposal_reference_feedback_cannot_authorize_other_stage_retry(
 
 @pytest.mark.parametrize("feedback,phase,retryable,code", [
     (OutputFeedback("PROPOSAL_INVALID", ("TARGET_UNKNOWN",)), "propose", True, "MODEL_OUTPUT_INVALID"),
-    (OutputFeedback("READING_INVALID", ("READING_SCOPE_INVALID",)), "present", True, "MODEL_OUTPUT_INVALID"),
+    (OutputFeedback("READING_INVALID", ("READING_SCOPE_INVALID",)), "propose", True, "MODEL_OUTPUT_INVALID"),
     (OutputFeedback("PROSE_INVALID", ("TECHNICAL_PROSE",)), "propose", True, "MODEL_OUTPUT_INVALID"),
     (REFERENCE_FEEDBACK, "propose", False, "MODEL_OUTPUT_INVALID"),
     (REFERENCE_FEEDBACK, "propose", True, "PROVIDER_TIMEOUT"),

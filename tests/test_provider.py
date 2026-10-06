@@ -799,7 +799,7 @@ async def test_proposal_prompt_offers_joint_scope_but_excludes_peer_private_cont
         await client.aclose()
 
 
-@pytest.mark.parametrize("usage", [(True, 4), (-1, 4), (1, 5_000_001), (3,), [3, 4], ("3", 4)])
-def test_provider_error_accepts_only_a_pair_of_bounded_integer_usage_counts(usage):
+@pytest.mark.parametrize("usage", [(True, 4), (-1, 4), (1, 1.5), (3,), [3, 4], ("3", 4)])
+def test_provider_error_accepts_only_a_pair_of_nonnegative_integer_usage_counts(usage):
     with pytest.raises(ValueError, match="Invalid provider usage accounting"):
         ProviderError("MODEL_OUTPUT_INVALID", "safe", True, usage=usage)

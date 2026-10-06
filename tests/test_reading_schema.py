@@ -1,7 +1,8 @@
 """Canonical v2 histories cannot silently disappear during snapshot loading."""
 
 import pytest
-from opentale.domain import Snapshot
+from opentale.domain import Limits, Snapshot
+from opentale.storage import Store
 from pydantic import ValidationError
 
 
@@ -20,7 +21,7 @@ def test_v2_missing_canonical_tracks_is_rejected_even_with_legacy_aliases(snapsh
 
 def test_unsupported_version_does_not_fall_back_to_empty_main_reading(snapshot):
     future = snapshot.model_dump()
-    future["schema_version"] = 4
+    future["schema_version"] = 5
     with pytest.raises(ValidationError):
         Snapshot.model_validate(future)
 
@@ -30,3 +31,17 @@ def test_projection_cannot_override_canonical_primary_history(snapshot):
     damaged["reading"]["focus_position_id"] = snapshot.positions[0].id
     with pytest.raises(ValidationError):
         Snapshot.model_validate(damaged)
+
+
+def test_unlimited_data_is_versioned_and_legacy_finite_snapshot_is_preserved(snapshot, tmp_path):
+    before = snapshot.model_dump()
+    assert Snapshot.model_validate(before).schema_version == 2
+    snapshot.run.limits = Limits(max_calls=None, max_tokens=None, max_parallel=None, max_windows=None)
+    store = Store(tmp_path)
+    store.save(snapshot)
+    restored = store.load(snapshot.run.id)
+    assert restored.schema_version == 4 and restored.run.mode == "classic"
+    assert restored.run.limits == snapshot.run.limits
+    for key in ("positions", "expressions", "uses", "continuations", "reading_tracks", "events"):
+        assert restored.model_dump()[key] == before[key]
+    assert Snapshot.model_validate(before).schema_version == 2

@@ -25,10 +25,13 @@ export default function ReflectionPanel({ snapshot, model }: {
   const reflection = snapshot.reflection;
   const [methodPage, setMethodPage] = useState(0);
   const [choicePage, setChoicePage] = useState(0);
-  const [scopeId, setScopeId] = useState("");
-  const [methodId, setMethodId] = useState("");
+  const [requestedScope, setScopeId] = useState("");
+  const [requestedMethod, setMethodId] = useState("");
   const scopes = Object.entries(reflection?.adoptions ?? {}).filter(([, ids]) => ids.length > 0);
+  // A release can invalidate both selections at once; derive a valid pair in one render.
+  const scopeId = scopes.some(([id]) => id === requestedScope) ? requestedScope : scopes[0]?.[0] ?? "";
   const adopted = reflection?.adoptions[scopeId] ?? [];
+  const methodId = adopted.includes(requestedMethod) ? requestedMethod : adopted[0] ?? "";
   const { frozen, busy, reflectionAblation, setReflectionAblation, ablateReflection, releaseReflection } = model;
   const methods = [...(reflection?.methods ?? [])].reverse();
   const choices = [...(reflection?.choices ?? [])].reverse();
@@ -48,10 +51,6 @@ export default function ReflectionPanel({ snapshot, model }: {
     setMethodPage((page) => Math.min(page, Math.max(0, Math.ceil(methods.length / PAGE_SIZE) - 1)));
     setChoicePage((page) => Math.min(page, Math.max(0, Math.ceil(choices.length / PAGE_SIZE) - 1)));
   }, [methods.length, choices.length]);
-  useEffect(() => {
-    if (!scopes.some(([id]) => id === scopeId)) setScopeId(scopes[0]?.[0] ?? "");
-    if (!adopted.includes(methodId)) setMethodId(adopted[0] ?? "");
-  }, [reflection, scopeId, methodId]);
 
   return <div className="reflection-layout" aria-label="反身生成技术面板">
     <section className="panel reflection-intro">
@@ -68,7 +67,7 @@ export default function ReflectionPanel({ snapshot, model }: {
         <dl className="reflection-fields">
           <dt>组织指令</dt><dd>{method.instruction || "仅执行输入选择与排序。"}</dd>
           <dt>输入对象</dt><dd><code>{method.inputs.join(" → ")}</code></dd>
-          <dt>排序与上限</dt><dd>{method.order === "reverse" ? "倒序" : "列出顺序"} · 最多 {method.limit} 项</dd>
+          <dt>排序与选材</dt><dd>{method.order === "reverse" ? "倒序" : "列出顺序"} · {method.limit === null ? "全部材料" : `最多 ${method.limit} 项`}</dd>
           <dt>修改关系</dt><dd>{method.revises ? <>修改 {methodName(method.revises)} <code>{method.revises}</code></> : "初始版本"}</dd>
           <dt>创建作用域</dt><dd>{scopeName(method.source_scope)} <code>{method.source_scope}</code></dd>
           <dt>当前采用处</dt><dd>{Object.entries(reflection?.adoptions ?? {}).filter(([, ids]) => ids.includes(method.id)).length

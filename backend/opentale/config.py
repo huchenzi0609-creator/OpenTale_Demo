@@ -12,8 +12,6 @@ from urllib.parse import urlsplit
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
-from opentale.capacity import MAX_MODEL_OUTPUT_TOKENS
-
 
 class ConfigError(Exception):
     """A configuration failure that never includes user-supplied values."""
@@ -32,7 +30,7 @@ class Settings(BaseModel):
     base_url: str = Field(default="https://api.deepseek.com", repr=False)
     model: str = Field(default="deepseek-flash", repr=False)
     timeout_seconds: float = Field(default=90, ge=5, le=300)
-    max_output_tokens: int = Field(default=1600, ge=128, le=MAX_MODEL_OUTPUT_TOKENS)
+    max_output_tokens: int = Field(default=1600, ge=128)
     port: int = Field(default=8231, ge=1024, le=65535)
 
     @field_validator("api_key", mode="before")
