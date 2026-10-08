@@ -167,6 +167,11 @@ export interface ContextCompaction {
   history_segments: number;
   history_segments_excerpted: number;
   within_target: boolean;
+  structure_excerpted?: boolean;
+  material_occurrences_visible?: number | null;
+  candidate_objects_visible?: number | null;
+  history_segments_visible?: number | null;
+  pages?: { path: string; total: number; visible_indices?: number[]; omitted_count: number; sha256: string }[];
 }
 export interface SchedulePlan {
   epoch_id: string;

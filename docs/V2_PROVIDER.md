@@ -134,7 +134,15 @@ v2 沿用 `propose / realize / present` 三个调用阶段。`propose` 与 `pres
 
 认证 Header、API key、服务端点、客户端实例、超时配置和隐藏推理不在这个投影中。该方法与真实调用共享准备和序列化代码，避免维护两套看似相同的提示。Runner 可以在网络调用之前记录投影及哈希，并为每次修复尝试保留独立证据。
 
-新 v2 请求采用 `provider-json-v2-context` 投影版本，长请求的 user JSON 包含 `context_compaction` 清单。`with_projection_version("provider-json-v1")` 返回共享客户端的独立旧适配器，恢复已有请求时维持原 JSON 字节表达。经典模式与反身 v1 沿用原投影。格式修复只添加系统反馈，文本池和 user JSON 保持一致；清单中的 `output_chars` 是基础请求长度，修复尝试的实际长度另行记录。
+此前的压缩请求采用 `provider-json-v2-context` 投影版本，长请求的 user JSON 包含 `context_compaction` 清单。`with_projection_version("provider-json-v1")` 返回共享客户端的独立旧适配器，恢复已有请求时维持原 JSON 字节表达。经典模式与反身 v1 沿用原投影。格式修复只添加系统反馈，文本池和 user JSON 保持一致；清单中的 `output_chars` 是基础请求长度，修复尝试的实际长度另行记录。
+
+当前新建请求已进一步使用 `provider-json-v3-bounded`，算法为 `source-pages-v1`。上面的 v1 与 v2-context 两个适配器仍保留原字节语义。v3 先把候选人物重复的 `(expression_id, role)` 目录项无损合并，用 `occurrence_count` 保留次数；正文和材料出现位置保持独立。整个请求在池化后能放入物理容量时，优先保留全部选中正文。
+
+仍然过大时，v3 从有限核心逐块装入有来源的页面，每次同时测量 user、当前 schema 和系统提示，并预留格式修复空间。目录、历史、材料与结构都可分页；省略集合只保留一个描述，不为每个省略项制造无限的新元信息。`context_capabilities` 精确列出本页可用的对象、作用域、路由、焦点、表达及历史原索引；输出 schema 和返回编译共同检查这个表，历史原始 ID 也不能绕过页面权限。
+
+材料页使用 `material_index`、历史页使用 `history_index` 保持原出现位置，不重新编号。完整视图若包含本页未展示的材料索引，须依据材料页的省略标记理解；不能把页面当作已经读过整个选择。当前组织 instruction 优先保留并标注原文范围；活跃方法先于普通目录入页，已执行定义也有独立优先预算。`structure_excerpted`、可见数量及 `pages` 共同标记结构省略，正文统计包含没有出现在本页的原始文本。
+
+`verify_bounded_sources(frame, projection)` 从冻结 frame 确定性重建对应版本的 user 投影，核对文本、页承诺、索引映射与组织说明；它不访问网络或密钥配置文件。v2-context 的来源验证器继续用于旧请求。这里的分页缩小的是一次模型调用的可见页面，原始实验、完整 frame、对象与历史保持原值。
 
 `OPENTALE_CONTEXT_TARGET_CHARS` 默认 96000，是单次请求的软目标，独立于实验总 Token 预算且没有配置值上限。强制接口与每项来源的基本覆盖已超过软目标时，系统优先保留仍能放入物理容量的完整正文，并标记 `within_target=false`。它不会为追求软目标而清空材料。原有单次传输边界仍然生效。
 

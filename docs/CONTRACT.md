@@ -1,5 +1,22 @@
 # OpenTale Demo v0.5 — module contract
 
+## Bounded context pages (v0.5.2)
+
+New v2 jobs use `provider-json-v3-bounded` and `source-pages-v1`. Version-1 and
+version-2-context adapters retain their existing byte semantics for frozen requests.
+The new projection first normalizes duplicate reading permission descriptors, then
+fits a finite core and source-backed pages by exact system+user serialization size.
+Text, history and structures can be excerpted; the original frozen frame is unchanged.
+`context_capabilities` declares the original object/routing/focus/expression/history
+indices exposed on this page. Both schema and output compilation enforce that set.
+
+Context evidence adds optional `structure_excerpted`, original/visible material,
+candidate/history counts, and `pages` descriptors (`path`, `total`, `visible_indices`,
+`omitted_count`, `sha256`). Source verification dispatches by algorithm version.
+The workbench distinguishes full compiled selection from the current model page.
+Requests rejected before an envelope remain unbilled and use the new projection on
+resume; accepted stages and old envelopes are not regenerated or relabeled.
+
 ## Context projections (v0.5.1)
 
 New DeepSeek v2 requests use `projection_version:provider-json-v2-context`. The
@@ -124,7 +141,7 @@ Builtins are read-only in the web editor; copy to a new ID to customize. Save ge
 
 Preset writes accept up to 1 MiB of HTTP data; all other writes retain the smaller request bound. No credential-entry field is added; parsed preset values containing the configured credential are rejected before persistence.
 
-`GET /api/health` -> `{ok:true, version:"0.5.1"}`
+`GET /api/health` -> `{ok:true, version:"0.5.2"}`
 
 `GET /api/config`, `POST /api/config/reload` -> safe Settings.public, `budget_bounds:{max_calls:null,max_tokens:null,max_parallel:null,max_windows:null}`, plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
 

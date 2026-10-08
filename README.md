@@ -4,6 +4,8 @@
 
 0.5.1 为 v2 增加[上下文整理](docs/CONTEXT_COMPACTION.md)：共享重复文本和元信息，精简候选目录，必要时使用有原文范围的摘录；完整资料仍在存档中。单次整理软目标与实验累计预算独立，默认 96000 字符，无额外摘要 API 调用。旧恢复点保留已接受阶段，新版从缺失阶段继续。
 
+0.5.2 将新请求升级为按完整请求尺寸装箱的有限页面，覆盖阅读目录和组织结构；输出引用与本页接口一致。旧投影仍用于原冻结请求，分页和省略可在诊断中查看。
+
 使用独立实验服务：`uv run python scripts/dev.py build --profile reflexive`，随后 `uv run python scripts/dev.py detach --profile reflexive --port 8232`。网页为 `http://127.0.0.1:8232`，实验数据位于 `runtime/reflexive/data/`，与原 `runtime/opentale.sqlite3` 分开。密钥继续只填根目录 `.env.local`，无须在另一份文档复制。网页创建实验时选择“反身实验 v2 · 视图、方法与回应”；创建不调用模型，单步和开始才生成。
 
 离线验收新版：`.venv/bin/python scripts/verify_v2.py --windows 3`。脚本使用临时存储和夹具，不加载密钥、不消耗 Token。当前依赖调度为影子观察，仍完整执行人物和读轨阶段；尚未开放程序内自主子模型调用。方法变化的机械证据与真实叙事效果分别评估。

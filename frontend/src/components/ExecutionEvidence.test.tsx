@@ -4,7 +4,11 @@ import type { Snapshot } from "../types";
 import ExecutionEvidence from "./ExecutionEvidence";
 
 describe("context evidence", () => {
-  it.each([false, true])("distinguishes lossless selected text from excerpts: %s", (lossy) => {
+  it.each([
+    { lossy: false, structure: false, expected: "选中材料正文完整保留" },
+    { lossy: true, structure: false, expected: "部分原文未送入模型" },
+    { lossy: false, structure: true, expected: "部分组织结构未展开" },
+  ])("distinguishes text and structure coverage: $expected", ({ lossy, structure, expected }) => {
     const snapshot = { requests: [{
       id: "request", stage: "propose", scope_id: "position:niki", input_world_revision: 4,
       policy_revision: 1, frame_hash: "original-frame", request_hash: "sent-request",
@@ -19,15 +23,22 @@ describe("context evidence", () => {
         original_text_chars: 203829, retained_text_chars: lossy ? 75000 : 203829,
         omitted_text_chars: lossy ? 128829 : 0, history_segments: 4, history_segments_excerpted: lossy ? 2 : 0,
         within_target: true,
+        structure_excerpted: structure,
+        material_occurrences_visible: 434,
+        candidate_objects_visible: structure ? 20 : 360,
+        history_segments_visible: 4,
+        pages: structure ? [{ path: "reflection.objects", total: 360, visible_indices: Array.from({ length: 20 }, (_, index) => index),
+          omitted_count: 340, sha256: "source-page-hash" }] : [],
       },
     }] } as unknown as Snapshot;
     const { container } = render(<ExecutionEvidence snapshot={snapshot} />);
     expect(screen.getByRole("region", { name: "上下文整理记录", hidden: true })).toHaveTextContent(
-      lossy ? "部分原文未送入模型" : "选中材料正文完整保留",
+      expected,
     );
     expect(container).toHaveTextContent("850,930 → 95,000");
     expect(container).toHaveTextContent("434 / 200");
     expect(container).not.toHaveTextContent("PRIVATE-FROZEN-SOURCE");
     expect(container).not.toHaveTextContent("PRIVATE-PROJECTION");
+    if (structure) expect(container).toHaveTextContent("未展开 340");
   });
 });

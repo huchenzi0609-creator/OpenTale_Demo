@@ -1,4 +1,4 @@
-"""Source-backed context projection is deterministic, reversible when lossless and API-free."""
+"""Frozen v2 context projection remains deterministic and API-free."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,8 @@ import httpx
 import pytest
 from opentale.config import Settings
 from opentale.policy_types import View, ViewGroup
-from opentale.providers import DeepSeekProvider, ProviderError
+from opentale.providers import DeepSeekProvider as CurrentDeepSeekProvider
+from opentale.providers import ProviderError
 from opentale.providers.context import (
     LEGACY_PROJECTION_VERSION,
     PROJECTION_VERSION,
@@ -18,6 +19,11 @@ from opentale.providers.feedback import OutputFeedback
 from opentale.reflection_types import Material
 from test_reflexive_provider import envelope
 from test_reflexive_v2_provider import v2_frame
+
+
+def DeepSeekProvider(*args, **kwargs):
+    kwargs.setdefault("projection_version", PROJECTION_VERSION)
+    return CurrentDeepSeekProvider(*args, **kwargs)
 
 
 def repeated_frame():

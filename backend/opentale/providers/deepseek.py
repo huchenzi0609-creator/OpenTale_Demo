@@ -36,12 +36,20 @@ from .context import (
     compact_json,
     compact_schema,
 )
+from .context_bounded import (
+    CONTEXT_INSTRUCTIONS as BOUNDED_CONTEXT_INSTRUCTIONS,
+)
+from .context_bounded import (
+    PROJECTION_VERSION as BOUNDED_PROJECTION_VERSION,
+)
+from .context_bounded import prepare_bounded_context
 from .feedback import OutputFeedback, schema_feedback
 from .policy import V2_REFLECTION_INSTRUCTIONS, WireReflectionV2
 from .prose import NARRATIVE_DISCIPLINE
 from .reading import (
     compile_reading_references,
     history_table,
+    invalid_reading,
     reading_table,
     required_focus,
     shared_expression_ids,
@@ -458,9 +466,9 @@ _PROSE_PLACEHOLDER = "本次生成的正文字符串"
 class DeepSeekProvider:
     def __init__(
         self, settings: Settings, client: httpx.AsyncClient | None = None, *,
-        projection_version: str = PROJECTION_VERSION,
+        projection_version: str = BOUNDED_PROJECTION_VERSION,
     ) -> None:
-        if projection_version not in {PROJECTION_VERSION, LEGACY_PROJECTION_VERSION}:
+        if projection_version not in {PROJECTION_VERSION, LEGACY_PROJECTION_VERSION, BOUNDED_PROJECTION_VERSION}:
             raise ValueError("Unsupported provider projection version")
         self.settings = settings
         self._client = client
@@ -513,6 +521,34 @@ class DeepSeekProvider:
         version_two = (data.get("reflection", {}).get("language_version") == 2
                        or data.get("language_version") == 2)
         target = min(self.settings.context_target_chars, MAX_REQUEST_CHARS - REPAIR_RESERVE_CHARS)
+        if self.projection_version == BOUNDED_PROJECTION_VERSION and version_two and original_chars > target:
+            instructions += "\n" + BOUNDED_CONTEXT_INSTRUCTIONS
+
+            def bounded_system(shaped: dict, feedback=None) -> str:
+                example = output_example
+                if example is not None and "focus_index" in example:
+                    first = shaped["oneOf"][0]["properties"]["focus_index"]["const"]
+                    example = {**example, "focus_index": first, "expression_indices": [], "reinterprets_indices": []}
+                system = self._system_prompt(instructions, data, schema, output_schema=shaped,
+                                             output_example=example, repair=feedback, compact=True)
+                return system.replace(
+                    "instruction 保持完整；materials 的可见正文以 text_pool 的 spans 与 omitted_chars 为准",
+                    "instruction、materials 和视图的可见范围以本页及省略标记为准",
+                )
+
+            data, shaped = prepare_bounded_context(
+                data, output_schema or schema.model_json_schema(), system_builder=bounded_system,
+                input_chars=original_chars, target_chars=target,
+            )
+            user = compact_json(data)
+            system = bounded_system(shaped, repair)
+            assert len(system) + len(user) <= MAX_REQUEST_CHARS
+            return {
+                "model": self.settings.model,
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "thinking": {"type": "disabled"}, "response_format": {"type": "json_object"},
+                "max_tokens": self.settings.max_output_tokens, "stream": False,
+            }
         compact = (self.projection_version == PROJECTION_VERSION and version_two
                    and original_chars > target)
         if compact:
@@ -546,6 +582,12 @@ class DeepSeekProvider:
         prepared = getattr(self, "_prepare_" + method)(frame.model_copy(deep=True))
         instructions, data, schema, options = prepared
         return self._request_payload(instructions, data, schema, **options, repair=repair)
+
+    def _exposed(self, frame, method: str) -> dict | None:
+        if self.projection_version != BOUNDED_PROJECTION_VERSION or not _v2(frame):
+            return None
+        projection = self.request_projection(frame, method)
+        return json.loads(projection["messages"][1]["content"]).get("context_capabilities")
 
     async def _request(
         self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None,
@@ -781,6 +823,7 @@ interface_index 仅选 routing_table 中本次整数，role 给出实际作用�
         routing_table = _routing_table(frame)
         result = await self._request(instructions, data, schema, **options, repair=repair)
         usage = (result.input_tokens, result.output_tokens)
+        exposed = self._exposed(frame, "propose")
 
         def invalid(reason: str) -> None:
             # Fixed categories only: never include rejected prose, identifiers or validation details.
@@ -808,6 +851,8 @@ interface_index 仅选 routing_table 中本次整数，role 给出实际作用�
                     if isinstance(target, _FragmentTarget):
                         if not 0 <= target.interface_index < len(routing_table):
                             invalid("INTERFACE_UNKNOWN")
+                        if exposed is not None and target.interface_index not in exposed["routes"]:
+                            invalid("INTERFACE_UNKNOWN")
                         route = routing_table[target.interface_index]
                         target_position_id = route["target_position_id"]
                         expression_id = route["expression_id"]
@@ -834,7 +879,7 @@ interface_index 仅选 routing_table 中本次整数，role 给出实际作用�
             value = Proposal(
                 position_id=frame.position_id, based_on_revision=frame.revision,
                 text=text, operations=operations,
-                reflection=compile_reflection(wire.reflection, frame.reflection, usage=usage)
+                reflection=compile_reflection(wire.reflection, frame.reflection, usage=usage, exposed=exposed)
                 if frame.reflection else None,
             )
         peers = {peer["id"] for peer in frame.peers} - {frame.position_id}
@@ -893,7 +938,7 @@ text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅
                 "groups": frame.reflection.groups, "instruction": frame.reflection.instruction,
             }
             if _v2(frame):
-                if self.projection_version == PROJECTION_VERSION:
+                if self.projection_version != LEGACY_PROJECTION_VERSION:
                     data["language_version"] = 2
                 data["view"] = view_data(frame.reflection)
                 instructions += ("\nview 的分组和关系是本次组织的一部分，按其具体关系续接经验。"
@@ -1020,6 +1065,7 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符；正文没有编号、方法�
         result = await self._request(instructions, data, schema, **options, repair=repair)
         wire = result.value.root
         usage = (result.input_tokens, result.output_tokens)
+        exposed = self._exposed(frame, "present")
         references = compile_reading_references(
             frame, wire.focus_index, wire.expression_indices, wire.reinterprets_indices, usage=usage,
         ) if isinstance(wire, _IndexedPresentation) else wire.model_dump(
@@ -1028,9 +1074,23 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符；正文没有编号、方法�
         value = Presentation(
             text=wire.text, **references,
             reflection=compile_reflection(
-                    wire.reflection, frame.reflection, usage=usage,
+                    wire.reflection, frame.reflection, usage=usage, exposed=exposed,
                 ) if frame.reflection else None,
         )
+        if exposed is not None:
+            table = reading_table(frame)
+            focus = next((row for row in table if row["position_id"] == value.focus_position_id
+                          and row["focus_index"] in exposed["focuses"]), None)
+            if focus is None:
+                invalid_reading("READING_FOCUS_INVALID", usage=usage)
+            allowed_expressions = {row["expression_id"] for row in focus["expressions"]
+                                   if row["expression_index"] in exposed["expressions"][str(focus["focus_index"]) ]}
+            allowed_history = {row["segment_id"] for row in history_table(frame)
+                               if row["history_index"] in exposed["history"]}
+            if not set(value.expression_ids) <= allowed_expressions:
+                invalid_reading("READING_EXPRESSION_INVALID", usage=usage)
+            if not set(value.reinterprets) <= allowed_history:
+                invalid_reading("READING_HISTORY_INVALID", usage=usage)
         positions = {candidate["position_id"] for candidate in frame.candidates}
         expressions = {
             use["expression_id"]

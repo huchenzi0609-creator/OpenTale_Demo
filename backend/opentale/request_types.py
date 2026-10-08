@@ -5,12 +5,21 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class ContextPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str
+    total: int = Field(ge=0)
+    visible_indices: list[int] = Field(default_factory=list)
+    omitted_count: int = Field(ge=0)
+    sha256: str
+
+
 class ContextCompaction(BaseModel):
     """Source-backed projection statistics, not a claim of semantic equivalence."""
 
     model_config = ConfigDict(extra="forbid")
-    algorithm: Literal["source-excerpts-v1"]
-    projection_version: Literal["provider-json-v2-context"]
+    algorithm: Literal["source-excerpts-v1", "source-pages-v1"]
+    projection_version: Literal["provider-json-v2-context", "provider-json-v3-bounded"]
     target_chars: int = Field(ge=1)
     input_chars: int = Field(ge=0)
     output_chars: int = Field(ge=0)
@@ -24,6 +33,11 @@ class ContextCompaction(BaseModel):
     history_segments: int = Field(ge=0)
     history_segments_excerpted: int = Field(ge=0)
     within_target: bool
+    structure_excerpted: bool = False
+    material_occurrences_visible: int | None = Field(default=None, ge=0)
+    candidate_objects_visible: int | None = Field(default=None, ge=0)
+    history_segments_visible: int | None = Field(default=None, ge=0)
+    pages: list[ContextPage] = Field(default_factory=list)
 
 
 class RequestAttempt(BaseModel):

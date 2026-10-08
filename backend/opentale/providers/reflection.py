@@ -286,6 +286,7 @@ def reflection_schema(frame: ReflectionFrame) -> dict:
 
 def compile_reflection(
     wire: WireReflection | None, frame: ReflectionFrame, *, usage: tuple[int, int] | None = None,
+    exposed: dict | None = None,
 ) -> ReflectionProposal | None:
     if wire is None:
         return None
@@ -298,6 +299,8 @@ def compile_reflection(
 
     def object_id(index: int, kind: str | None = None) -> str:
         if type(index) is not int or not 0 <= index < len(frame.objects):
+            invalid()
+        if exposed is not None and index not in exposed["objects"]:
             invalid()
         row = frame.objects[index]
         if kind is not None and row["kind"] != kind:
@@ -313,7 +316,8 @@ def compile_reflection(
             if frame.language_version != 2:
                 invalid()
             from .policy import compile_program
-            fields.update(language_version=2, program=compile_program(method.program, frame, usage=usage))
+            fields.update(language_version=2, program=compile_program(method.program, frame, usage=usage,
+                                                                     exposed=exposed))
         else:
             fields.update(inputs=[object_id(index) for index in method.object_indices],
                           order=method.order, limit=method.limit)
@@ -330,6 +334,8 @@ def compile_reflection(
     adoptions = []
     for adoption in wire.adoptions:
         if not 0 <= adoption.scope_index < len(frame.scopes):
+            invalid()
+        if exposed is not None and adoption.scope_index not in exposed["scopes"]:
             invalid()
         if (adoption.method_index is None) == (adoption.draft_index is None):
             invalid()

@@ -116,9 +116,15 @@ def verify_request_evidence(state: Snapshot) -> bool:
             if context_compaction_for(attempt.projection) != request.context_compaction:
                 return False
             if request.context_compaction is not None:
-                from .providers.context import verify_compaction_sources
+                if request.context_compaction.algorithm == "source-pages-v1":
+                    from .providers.context_bounded import verify_bounded_sources
 
-                if not verify_compaction_sources(request.frame, attempt.projection):
+                    sources_valid = verify_bounded_sources(request.frame, attempt.projection)
+                else:
+                    from .providers.context import verify_compaction_sources
+
+                    sources_valid = verify_compaction_sources(request.frame, attempt.projection)
+                if not sources_valid:
                     return False
             if attempt.repair_category is None and attempt.request_hash != request.request_hash:
                 return False

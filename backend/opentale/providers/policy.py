@@ -144,10 +144,12 @@ def _invalid(usage: tuple[int, int] | None) -> None:
     )
 
 
-def compile_program(wire: WireProgram, frame: ReflectionFrame, *, usage=None) -> dict:
+def compile_program(wire: WireProgram, frame: ReflectionFrame, *, usage=None, exposed: dict | None = None) -> dict:
     """Produce core program data without assigning meaning to generated labels."""
     def object_id(index: int, kind: str | None = None) -> str:
         if type(index) is not int or not 0 <= index < len(frame.objects):
+            _invalid(usage)
+        if exposed is not None and index not in exposed["objects"]:
             _invalid(usage)
         row = frame.objects[index]
         if kind is not None and row["kind"] != kind:
@@ -184,7 +186,7 @@ def compile_program(wire: WireProgram, frame: ReflectionFrame, *, usage=None) ->
                     _invalid(usage)
                 patch["inputs"] = [object_id(index) for index in indices]
             if step.patch.program is not None:
-                patch["program"] = compile_program(step.patch.program, frame, usage=usage)
+                patch["program"] = compile_program(step.patch.program, frame, usage=usage, exposed=exposed)
             data["patch"] = patch
         steps.append(data)
     return {"steps": steps, "output": wire.output}

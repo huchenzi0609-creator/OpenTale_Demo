@@ -25,14 +25,26 @@ export default function ExecutionEvidence({ snapshot }: { snapshot: Snapshot }) 
             <h3>上下文整理</h3>
             <p className="helper">{record.context_compaction.lossy
               ? "本次含有出处的摘录。部分原文未送入模型，完整材料仍保存在原输入与存档中。"
+              : record.context_compaction.structure_excerpted
+              ? "本次部分组织结构未展开，完整结构保存在原输入与存档中，可按来源继续读取。"
               : "本次合并重复文本并精简候选预览，选中材料正文完整保留。"}</p>
             <dl className="reflection-fields">
               <dt>请求字符数</dt><dd>{record.context_compaction.input_chars.toLocaleString()} → {record.context_compaction.output_chars.toLocaleString()}（基础请求）</dd>
               <dt>材料出现位置 / 文本池条目</dt><dd>{record.context_compaction.material_occurrences.toLocaleString()} / {record.context_compaction.text_entries.toLocaleString()}</dd>
               <dt>正文与历史省略字符</dt><dd>{record.context_compaction.omitted_text_chars.toLocaleString()}</dd>
               <dt>阅读历史摘录段数</dt><dd>{record.context_compaction.history_segments_excerpted.toLocaleString()} / {record.context_compaction.history_segments.toLocaleString()}</dd>
-              <dt>整理目标</dt><dd>{record.context_compaction.target_chars.toLocaleString()} 字符 · {record.context_compaction.within_target ? "已达到" : "保留必要接口后超过软目标"}</dd>
+              <dt>整理目标</dt><dd>{record.context_compaction.target_chars.toLocaleString()} 字符 · {record.context_compaction.within_target ? "已达到" : "超过软目标；已通过单次容量检查"}</dd>
+              {record.context_compaction.material_occurrences_visible != null && <>
+                <dt>本次呈现的材料位置</dt><dd>{record.context_compaction.material_occurrences_visible.toLocaleString()} / {record.context_compaction.material_occurrences.toLocaleString()}</dd>
+                <dt>本次呈现的候选对象</dt><dd>{record.context_compaction.candidate_objects_visible?.toLocaleString()} / {record.context_compaction.candidate_objects.toLocaleString()}</dd>
+                <dt>本次呈现的阅读历史</dt><dd>{record.context_compaction.history_segments_visible?.toLocaleString()} / {record.context_compaction.history_segments.toLocaleString()}</dd>
+              </>}
             </dl>
+            {!!record.context_compaction.pages?.length && <details><summary>结构与历史分页记录</summary>
+              <ul>{record.context_compaction.pages.map((item) => <li key={item.path}>
+                <code>{item.path}</code> · 总数 {item.total.toLocaleString()} · 未展开 {item.omitted_count.toLocaleString()}
+              </li>)}</ul>
+            </details>}
             <p className="helper">原文片段及对应范围随请求证据保存。摘录保留来源，不保证保留全部意义；生成者可再次查询或读取有关原文范围。</p>
           </section>}
           <h3>请求尝试</h3>
