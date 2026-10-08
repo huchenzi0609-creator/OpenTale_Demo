@@ -1,12 +1,29 @@
 """Request identity is frozen before transport; repairs remain separately inspectable attempts."""
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
 from .domain import Snapshot
 from .kernel import KernelError, fingerprint
-from .request_types import RequestEnvelope
+from .request_types import ContextCompaction, RequestEnvelope
+
+
+def context_compaction_for(projection: dict) -> ContextCompaction | None:
+    for message in projection.get("messages", []):
+        if message.get("role") != "user":
+            continue
+        data = json.loads(message["content"])
+        if isinstance(data, dict) and data.get("context_compaction") is not None:
+            return ContextCompaction.model_validate(data["context_compaction"])
+    return None
+
+
+def request_chars(projection: dict | None) -> int | None:
+    if projection is None or "messages" not in projection:
+        return None
+    return sum(len(message.get("content", "")) for message in projection["messages"])
 
 
 def execution_signature(provider: str, settings: Any) -> str:
@@ -15,6 +32,7 @@ def execution_signature(provider: str, settings: Any) -> str:
     sources = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
                for path in sorted(directory.rglob("*.py"))}
     configuration = ({"model": settings.model, "max_output_tokens": settings.max_output_tokens,
+                      "context_target_chars": getattr(settings, "context_target_chars", 96000),
                       "endpoint": settings.base_url} if provider == "deepseek" else {"provider": "fixture"})
     return fingerprint({"sources": sources, "configuration": configuration})
 
@@ -32,11 +50,15 @@ def existing_request(state: Snapshot, stage: str, scope_id: str) -> RequestEnvel
     return next((request for request in state.requests if request.id == identifier), None)
 
 
-def freeze_request(state: Snapshot, frame: Any, provider: Any, stage: str, scope_id: str) -> RequestEnvelope:
+def freeze_request(
+    state: Snapshot, frame: Any, provider: Any, stage: str, scope_id: str,
+    *, projection: dict | None = None,
+) -> RequestEnvelope:
     """Caller persists before any attempt. An edited prompt/config cannot relabel old evidence."""
     identifier, epoch = request_identity(state, stage, scope_id)
     projector = getattr(provider, "request_projection", None)
-    projection = projector(frame, stage) if callable(projector) else frame.model_dump()
+    if projection is None:
+        projection = projector(frame, stage) if callable(projector) else frame.model_dump()
     frame_hash, request_hash = fingerprint(frame.model_dump()), fingerprint(projection)
     existing = existing_request(state, stage, scope_id)
     if existing:
@@ -50,8 +72,10 @@ def freeze_request(state: Snapshot, frame: Any, provider: Any, stage: str, scope
         input_world_revision=frame.revision,
         policy_revision=state.policy_revision,
         frame=frame.model_dump(), frame_hash=frame_hash, request_hash=request_hash,
-        projection_version="provider-json-v1" if callable(projector) else "frame-v1",
+        projection_version=getattr(provider, "projection_version", "provider-json-v1")
+        if callable(projector) else "frame-v1",
         evidence_level="exact_projection" if callable(projector) else "frame_only",
+        context_compaction=context_compaction_for(projection),
     )
     state.requests.append(envelope)
     return envelope
@@ -87,6 +111,15 @@ def verify_request_evidence(state: Snapshot) -> bool:
                 return False
             if fingerprint(attempt.projection) != attempt.request_hash:
                 return False
+            if attempt.request_chars is not None and request_chars(attempt.projection) != attempt.request_chars:
+                return False
+            if context_compaction_for(attempt.projection) != request.context_compaction:
+                return False
+            if request.context_compaction is not None:
+                from .providers.context import verify_compaction_sources
+
+                if not verify_compaction_sources(request.frame, attempt.projection):
+                    return False
             if attempt.repair_category is None and attempt.request_hash != request.request_hash:
                 return False
             if attempt.status == "received" and (attempt.input_tokens is None or attempt.output_tokens is None):

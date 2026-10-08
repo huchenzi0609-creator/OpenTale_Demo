@@ -146,8 +146,27 @@ export interface RequestEvidence {
   attempts: {
     number: number; status: string; repair_category?: string;
     input_tokens?: number; output_tokens?: number;
+    request_chars?: number | null;
   }[];
   accepted_result_hash?: string | null;
+  context_compaction?: ContextCompaction | null;
+}
+export interface ContextCompaction {
+  algorithm: string;
+  projection_version: string;
+  target_chars: number;
+  input_chars: number;
+  output_chars: number;
+  lossy: boolean;
+  text_entries: number;
+  material_occurrences: number;
+  candidate_objects: number;
+  original_text_chars: number;
+  retained_text_chars: number;
+  omitted_text_chars: number;
+  history_segments: number;
+  history_segments_excerpted: number;
+  within_target: boolean;
 }
 export interface SchedulePlan {
   epoch_id: string;
@@ -284,6 +303,7 @@ export interface PublicConfig {
   model: string;
   timeout_seconds: number;
   max_output_tokens: number;
+  context_target_chars?: number;
   budget_bounds?: Limits;
   diagnostics?: {
     config_file_path: string;

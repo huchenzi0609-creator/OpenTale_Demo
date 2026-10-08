@@ -24,7 +24,7 @@ from .kernel import install_batch as install
 from .providers import ModelResult, ProviderError, make_provider
 from .reflection import capture_choice, install_feedback, position_scope, reading_scope
 from .reflection_types import ReflectionFrame
-from .request_evidence import execution_signature, existing_request, freeze_request
+from .request_evidence import execution_signature, existing_request, freeze_request, request_chars
 from .request_types import RequestAttempt, RequestEnvelope
 from .scheduler import begin_plan, observe_job
 from .storage import Store
@@ -279,15 +279,21 @@ class Runner:
         *, reserve_window: bool = True,
     ) -> ModelResult[Any]:
         scope = reading_scope(job_key.split(":", 1)[1]) if method == "present" else position_scope(frame.position_id)
+        existing = existing_request(state, method, scope) if state.run.mode == "reflexive_v2" else None
+        if existing is not None and callable(getattr(provider, "with_projection_version", None)):
+            # Keep previously frozen valid requests byte-for-byte stable after adapter upgrades.
+            provider = provider.with_projection_version(existing.projection_version)
+        projector = getattr(provider, "request_projection", None)
+        base_projection = projector(frame, method) if callable(projector) else None
         envelope = None
         if state.run.mode == "reflexive_v2":
             if state.experiment and state.experiment.get("execution_signature") != execution_signature(
                 state.run.provider, self.settings,
             ):
                 raise KernelError("EXPERIMENT_CONFIGURATION_CHANGED", "对照实验的程序或模型配置已改变，请重新建立配对。")
-            observe_job(state, frame, provider, method, scope)
+            observe_job(state, frame, provider, method, scope, projection=base_projection)
             already_frozen = existing_request(state, method, scope) is not None
-            envelope = freeze_request(state, frame, provider, method, scope)
+            envelope = freeze_request(state, frame, provider, method, scope, projection=base_projection)
             if not already_frozen:
                 self.event(state, "request_frozen", request_id=envelope.id, stage=method,
                            scope_id=scope, frame=frame.model_dump(), frame_hash=envelope.frame_hash)
@@ -298,9 +304,10 @@ class Runner:
             try:
                 evaluate = getattr(provider, method)
                 call = (lambda: evaluate(frame)) if feedback is None else (lambda: evaluate(frame, repair=feedback))
-                projector = getattr(provider, "request_projection", None)
-                projection = (projector(frame, method, repair=feedback) if callable(projector)
-                              else frame.model_dump()) if envelope is not None else None
+                if callable(projector):
+                    projection = base_projection if feedback is None else projector(frame, method, repair=feedback)
+                else:
+                    projection = frame.model_dump() if envelope is not None else None
                 return await self._call(
                     state, frame, call, job_key=job_key, envelope=envelope, projection=projection,
                     repair_category=feedback.category if feedback else None,
@@ -368,6 +375,7 @@ class Runner:
             attempt = RequestAttempt(
                 number=len(envelope.attempts) + 1, request_hash=fingerprint(projection),
                 projection=projection, repair_category=repair_category,
+                request_chars=request_chars(projection),
             )
             envelope.attempts.append(attempt)
         self.store.save(state)

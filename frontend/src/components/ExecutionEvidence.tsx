@@ -21,11 +21,26 @@ export default function ExecutionEvidence({ snapshot }: { snapshot: Snapshot }) 
             <dt>请求摘要</dt><dd><code className="fingerprint">{record.request_hash || "未记录"}</code></dd>
             <dt>采纳结果摘要</dt><dd><code className="fingerprint">{record.accepted_result_hash || "尚无采纳结果"}</code></dd>
           </dl>
+          {record.context_compaction && <section aria-label="上下文整理记录">
+            <h3>上下文整理</h3>
+            <p className="helper">{record.context_compaction.lossy
+              ? "本次含有出处的摘录。部分原文未送入模型，完整材料仍保存在原输入与存档中。"
+              : "本次合并重复文本并精简候选预览，选中材料正文完整保留。"}</p>
+            <dl className="reflection-fields">
+              <dt>请求字符数</dt><dd>{record.context_compaction.input_chars.toLocaleString()} → {record.context_compaction.output_chars.toLocaleString()}（基础请求）</dd>
+              <dt>材料出现位置 / 文本池条目</dt><dd>{record.context_compaction.material_occurrences.toLocaleString()} / {record.context_compaction.text_entries.toLocaleString()}</dd>
+              <dt>正文与历史省略字符</dt><dd>{record.context_compaction.omitted_text_chars.toLocaleString()}</dd>
+              <dt>阅读历史摘录段数</dt><dd>{record.context_compaction.history_segments_excerpted.toLocaleString()} / {record.context_compaction.history_segments.toLocaleString()}</dd>
+              <dt>整理目标</dt><dd>{record.context_compaction.target_chars.toLocaleString()} 字符 · {record.context_compaction.within_target ? "已达到" : "保留必要接口后超过软目标"}</dd>
+            </dl>
+            <p className="helper">原文片段及对应范围随请求证据保存。摘录保留来源，不保证保留全部意义；生成者可再次查询或读取有关原文范围。</p>
+          </section>}
           <h3>请求尝试</h3>
           <ul className="request-attempts">{record.attempts.map((attempt) => <li key={attempt.number}>
             第 {attempt.number} 次 · {attempt.status}
             {attempt.repair_category && <span> · 修复类别 {attempt.repair_category}</span>}
             {(attempt.input_tokens != null || attempt.output_tokens != null) && <span> · 输入 {attempt.input_tokens ?? "未知"} / 输出 {attempt.output_tokens ?? "未知"} Token</span>}
+            {attempt.request_chars != null && <span> · 请求 {attempt.request_chars.toLocaleString()} 字符</span>}
           </li>)}</ul>
         </details>)}
       {!requests.length && <p className="helper">尚无请求证据。旧记录不会自动补造实际请求。</p>}

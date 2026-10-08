@@ -2,6 +2,8 @@
 
 实验分支 `experiment/reflexive-generation` 的 0.5.0 新增“反身实验 v2”：有类型的方法程序保存嵌套视图，可以检查、改写和应用其他方法；局部回应及实际组织变化进入后续生成。完整材料检索、精确请求证据和配对干预可在网页操作。使用入口、执行机制与边界见 [v2 引擎说明](docs/V2_ENGINE.md)和[模型协议](docs/V2_PROVIDER.md)。经典模式仍为默认对照，旧反身模式按[原执行说明](docs/REFLEXIVE_EXPERIMENT.md)继续运行，旧存档不自动转换。
 
+0.5.1 为 v2 增加[上下文整理](docs/CONTEXT_COMPACTION.md)：共享重复文本和元信息，精简候选目录，必要时使用有原文范围的摘录；完整资料仍在存档中。单次整理软目标与实验累计预算独立，默认 96000 字符，无额外摘要 API 调用。旧恢复点保留已接受阶段，新版从缺失阶段继续。
+
 使用独立实验服务：`uv run python scripts/dev.py build --profile reflexive`，随后 `uv run python scripts/dev.py detach --profile reflexive --port 8232`。网页为 `http://127.0.0.1:8232`，实验数据位于 `runtime/reflexive/data/`，与原 `runtime/opentale.sqlite3` 分开。密钥继续只填根目录 `.env.local`，无须在另一份文档复制。网页创建实验时选择“反身实验 v2 · 视图、方法与回应”；创建不调用模型，单步和开始才生成。
 
 离线验收新版：`.venv/bin/python scripts/verify_v2.py --windows 3`。脚本使用临时存储和夹具，不加载密钥、不消耗 Token。当前依赖调度为影子观察，仍完整执行人物和读轨阶段；尚未开放程序内自主子模型调用。方法变化的机械证据与真实叙事效果分别评估。

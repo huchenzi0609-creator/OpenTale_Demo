@@ -27,6 +27,15 @@ from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, 
 from opentale.security import contains_credential as _contains_credential
 
 from .base import ModelResult, ProviderError
+from .context import (
+    CONTEXT_INSTRUCTIONS,
+    LEGACY_PROJECTION_VERSION,
+    PROJECTION_VERSION,
+    REPAIR_RESERVE_CHARS,
+    compact_context,
+    compact_json,
+    compact_schema,
+)
 from .feedback import OutputFeedback, schema_feedback
 from .policy import V2_REFLECTION_INSTRUCTIONS, WireReflectionV2
 from .prose import NARRATIVE_DISCIPLINE
@@ -447,35 +456,74 @@ _PROSE_PLACEHOLDER = "本次生成的正文字符串"
 
 
 class DeepSeekProvider:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self, settings: Settings, client: httpx.AsyncClient | None = None, *,
+        projection_version: str = PROJECTION_VERSION,
+    ) -> None:
+        if projection_version not in {PROJECTION_VERSION, LEGACY_PROJECTION_VERSION}:
+            raise ValueError("Unsupported provider projection version")
         self.settings = settings
         self._client = client
+        self.projection_version = projection_version
 
-    def _request_payload(
+    def with_projection_version(self, version: str) -> DeepSeekProvider:
+        """Independent per-request adapter; concurrent jobs never mutate each other."""
+        return type(self)(self.settings, self._client, projection_version=version)
+
+    def _system_prompt(
         self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None,
-        output_example: dict | None = None, repair: OutputFeedback | None = None,
-    ) -> dict:
+        output_example: dict | None = None, repair: OutputFeedback | None = None, compact: bool = False,
+    ) -> str:
         """Exact model-visible JSON body; transport/authentication stay outside."""
+        dump = compact_json if compact else lambda value: json.dumps(value, ensure_ascii=False)
         system = _NARRATIVE_DISCIPLINE + "\n" + instructions
         if output_example is not None:
             system += "\n本阶段完整输出形状示例（正文占位文字需替换；示例只说明字段、类型和可用编号）：\n"
-            system += json.dumps(output_example, ensure_ascii=False)
+            system += dump(output_example)
         if repair is not None:
             if not isinstance(repair, OutputFeedback):
                 raise ValueError("Invalid safe output feedback")
             system += "\n上次本阶段输出未通过结构校验，有限反馈如下：\n"
-            system += json.dumps(repair.prompt_data(), ensure_ascii=False)
+            system += dump(repair.prompt_data())
             system += (
                 "\n使用相同的当前输入重新生成一个完整的本阶段对象，补齐必需字段和正确类型。"
                 "不要解释错误、输出推理、复制校验反馈到正文或改用其他阶段的结构。"
                 "严格遵守本阶段 schema；不要猜测不存在的目标或补写输入中没有的权限。"
             )
         if "reflection" in data or "materials" in data:
-            system += "\n" + REFLECTION_BOUNDARY
-        system += "\nJSON schema:\n" + json.dumps(output_schema or schema.model_json_schema(), ensure_ascii=False)
+            boundary = REFLECTION_BOUNDARY
+            if compact:
+                boundary = boundary.replace(
+                    "实际采用的 materials 和 instruction 保持完整",
+                    "instruction 保持完整；materials 的可见正文以 text_pool 的 spans 与 omitted_chars 为准",
+                )
+            system += "\n" + boundary
+        shape = output_schema or schema.model_json_schema()
+        system += "\nJSON schema:\n" + dump(compact_schema(shape) if compact else shape)
+        return system
+
+    def _request_payload(
+        self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None,
+        output_example: dict | None = None, repair: OutputFeedback | None = None,
+    ) -> dict:
+        options = {"output_schema": output_schema, "output_example": output_example}
+        base_system = self._system_prompt(instructions, data, schema, **options)
         user = json.dumps(data, ensure_ascii=False)
+        original_chars = len(base_system) + len(user)
+        version_two = (data.get("reflection", {}).get("language_version") == 2
+                       or data.get("language_version") == 2)
+        target = min(self.settings.context_target_chars, MAX_REQUEST_CHARS - REPAIR_RESERVE_CHARS)
+        compact = (self.projection_version == PROJECTION_VERSION and version_two
+                   and original_chars > target)
+        if compact:
+            instructions += "\n" + CONTEXT_INSTRUCTIONS
+            base_system = self._system_prompt(instructions, data, schema, **options, compact=True)
+            data = compact_context(data, system_chars=len(base_system), input_chars=original_chars,
+                                   target_chars=target)
+            user = compact_json(data)
+        system = self._system_prompt(instructions, data, schema, **options, repair=repair, compact=compact)
         if len(system) + len(user) > MAX_REQUEST_CHARS:
-            raise ProviderError("CONTEXT_TOO_LARGE", "当前局部的输入过长，请缩小活跃内容。")
+            raise ProviderError("CONTEXT_TOO_LARGE", "当前完整语句或组织结构仍超出单次输入容量，请收窄方法读取范围。")
         return {
             "model": self.settings.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -630,7 +678,7 @@ class DeepSeekProvider:
             r"revises_index|scope_index|method_index|draft_index|input_fingerprint|"
             r"about_indices|evidence_indices|group_index|material_indices|object_index|choice_index|"
             r"selected_added_indices|selected_removed_indices|method_indices|response_indices|"
-            r"executed_definitions|definition_index|"
+            r"executed_definitions|definition_index|text_ref|text_pool|context_compaction|"
             r"REFLECTION_REFERENCE_INVALID)", text,
         ):
             raise ProviderError(
@@ -845,6 +893,8 @@ text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅
                 "groups": frame.reflection.groups, "instruction": frame.reflection.instruction,
             }
             if _v2(frame):
+                if self.projection_version == PROJECTION_VERSION:
+                    data["language_version"] = 2
                 data["view"] = view_data(frame.reflection)
                 instructions += ("\nview 的分组和关系是本次组织的一部分，按其具体关系续接经验。"
                                  "材料中若含局部回应，理解其所指的经验，再落实为当前生活。")

@@ -125,6 +125,8 @@ export default function ReflectionPanel({ snapshot, model }: {
         </dl>
         {choice.view && <NarrativeView view={choice.view} />}
         <details><summary>查看冻结的输入材料（{choice.materials.length} 项）</summary>
+          {snapshot.requests?.some((request) => request.context_compaction?.lossy) &&
+            <p className="helper">这里保留方法编译时的完整选材。模型实际收到的摘录范围与整理记录，请到“验证与诊断”的请求输入证据查看。</p>}
           {choice.materials.map((material, index) => <div className="reflection-material" key={`${material.id}-${index}`}>
             <code>{material.id} · {material.role}</code><p>{material.text}</p>
           </div>)}

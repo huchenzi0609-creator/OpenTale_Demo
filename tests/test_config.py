@@ -17,7 +17,7 @@ from opentale.config import (
 def clear_config_environment(monkeypatch):
     for name in (
         "OPENTALE_API_KEY", "OPENTALE_BASE_URL", "OPENTALE_MODEL", "OPENTALE_TIMEOUT_SECONDS",
-        "OPENTALE_MAX_OUTPUT_TOKENS", "OPENTALE_PORT",
+        "OPENTALE_MAX_OUTPUT_TOKENS", "OPENTALE_CONTEXT_TARGET_CHARS", "OPENTALE_PORT",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -32,6 +32,14 @@ def test_missing_file_is_unconfigured_and_public_projection_is_secret_free(tmp_p
     assert "base_url" not in public
     assert "unit-test-only-credential" not in repr(settings)
     assert "api_key" not in settings.model_dump()
+
+
+def test_context_target_is_allowlisted_public_and_independent_of_output_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENTALE_CONTEXT_TARGET_CHARS", "250000")
+    settings = load_settings(tmp_path)
+    assert settings.context_target_chars == 250000
+    assert settings.public()["context_target_chars"] == 250000
+    assert settings.max_output_tokens == Settings().max_output_tokens
 
 
 def test_accidentally_pasted_credential_in_model_field_is_not_publicly_echoed():

@@ -14,7 +14,7 @@ v2 沿用 `propose / realize / present` 三个调用阶段。`propose` 与 `pres
 
 | 数据 | propose / present | realize |
 | --- | --- | --- |
-| `materials` | 实际选中的完整文本快照 | 同样保留完整快照 |
+| `materials` | 实际选中的每个材料出现位置；长请求通过文本池呈现全文或有来源的摘录 | 同样保留全部出现位置与来源关系 |
 | `instruction` | 完整的执行组织说明 | 完整的执行组织说明 |
 | `view` | 嵌套分组、关系和材料出现位置 | 同样保留结构 |
 | `objects` | 可操作对象的预览与当次整数接口 | 不提供候选目录 |
@@ -22,7 +22,9 @@ v2 沿用 `propose / realize / present` 三个调用阶段。`propose` 与 `pres
 | `full_objects` | 不进入模型输入 | 不进入模型输入 |
 | 技术来源、私有作用域标记、输入指纹 | 不进入模型输入 | 不进入模型输入 |
 
-`materials` 的完整性独立于候选预览长度。`objects` 中 `preview_truncated=true` 表示文字或其关联材料尚未完整展示；上游已经发生的截断始终保留。`full_length` 给出原文字数。对象可通过 `read` 读取全文或范围，通过 `query` 在权限允许的完整对象集合中寻找较早材料。
+原始 `materials` 快照完整保存，独立于候选预览长度。长请求的文本池优先共享相同正文；需要摘录时，`spans / segments / omitted_chars` 标明确切出处与省略范围，不能把摘录理解成已经读过全文。`objects` 中 `preview_truncated=true` 表示文字或其关联材料尚未完整展示；上游已经发生的截断始终保留。`full_length` 给出原文字数。对象可通过 `read` 读取全文或范围，通过 `query` 在权限允许的完整对象集合中寻找较早材料。具体算法见 [上下文压缩说明](CONTEXT_COMPACTION.md)。
+
+紧凑格式中，`materials[].text_ref` 指向顶层 `text_pool[].text_index`。重复元信息有足够节省时，`materials[].metadata_ref` 指向顶层 `material_metadata[].metadata_index`，还原该次出现的 id、role、position_id、expression_id；材料出现次数和视图索引保持原值。文本池的来源路径对应冻结 frame 的材料或本条阅读历史，源哈希与字符范围可离线验证。
 
 `view.groups` 保留树状子组，各组使用本次 `group_index`；关系使用 `source_group_index / target_group_index`。材料通过 `material_indices` 指向本次 `materials` 的出现位置。同一对象被读取两次时，这两个出现位置分别保留。候选视图只展示部分材料时，缺失的出现位置标记 `unavailable_material_count`，不会假装引用了其他出现位置。
 
@@ -131,6 +133,10 @@ v2 沿用 `propose / realize / present` 三个调用阶段。`propose` 与 `pres
 - 当次修复的有限反馈（如有）。
 
 认证 Header、API key、服务端点、客户端实例、超时配置和隐藏推理不在这个投影中。该方法与真实调用共享准备和序列化代码，避免维护两套看似相同的提示。Runner 可以在网络调用之前记录投影及哈希，并为每次修复尝试保留独立证据。
+
+新 v2 请求采用 `provider-json-v2-context` 投影版本，长请求的 user JSON 包含 `context_compaction` 清单。`with_projection_version("provider-json-v1")` 返回共享客户端的独立旧适配器，恢复已有请求时维持原 JSON 字节表达。经典模式与反身 v1 沿用原投影。格式修复只添加系统反馈，文本池和 user JSON 保持一致；清单中的 `output_chars` 是基础请求长度，修复尝试的实际长度另行记录。
+
+`OPENTALE_CONTEXT_TARGET_CHARS` 默认 96000，是单次请求的软目标，独立于实验总 Token 预算且没有配置值上限。强制接口与每项来源的基本覆盖已超过软目标时，系统优先保留仍能放入物理容量的完整正文，并标记 `within_target=false`。它不会为追求软目标而清空材料。原有单次传输边界仍然生效。
 
 Provider 对 frame 做深复制后编译整数引用，异步返回阶段仍使用原请求的对象表。结构失败可按现有 Runner 策略重试；校验失败的已计费用量会随安全错误返回。技术引用、凭据回显和格式错误不会通过“改写成普通正文”的方式掩盖。
 

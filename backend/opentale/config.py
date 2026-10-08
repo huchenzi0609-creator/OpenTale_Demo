@@ -31,6 +31,7 @@ class Settings(BaseModel):
     model: str = Field(default="deepseek-flash", repr=False)
     timeout_seconds: float = Field(default=90, ge=5, le=300)
     max_output_tokens: int = Field(default=1600, ge=128)
+    context_target_chars: int = Field(default=96_000, ge=1)
     port: int = Field(default=8231, ge=1024, le=65535)
 
     @field_validator("api_key", mode="before")
@@ -96,6 +97,7 @@ class Settings(BaseModel):
             "model": "[已隐藏]" if key and key in self.model else self.model,
             "timeout_seconds": self.timeout_seconds,
             "max_output_tokens": self.max_output_tokens,
+            "context_target_chars": self.context_target_chars,
             "port": self.port,
         }
 
@@ -106,6 +108,7 @@ _ENV_FIELDS = {
     "OPENTALE_MODEL": "model",
     "OPENTALE_TIMEOUT_SECONDS": "timeout_seconds",
     "OPENTALE_MAX_OUTPUT_TOKENS": "max_output_tokens",
+    "OPENTALE_CONTEXT_TARGET_CHARS": "context_target_chars",
     "OPENTALE_PORT": "port",
 }
 

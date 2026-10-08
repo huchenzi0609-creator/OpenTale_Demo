@@ -10,14 +10,14 @@ def begin_plan(state: Snapshot) -> None:
         state.schedule = SchedulePlan(epoch_id=state.pending.epoch_id)
 
 
-def observe_job(state: Snapshot, frame, provider, stage: str, scope_id: str) -> None:
+def observe_job(state: Snapshot, frame, provider, stage: str, scope_id: str, *, projection: dict | None = None) -> None:
     if state.schedule is None:
         return
     key = f"{stage}:{scope_id}"
     if any(job.key == key for job in state.schedule.jobs):
         return
     project = getattr(provider, "request_projection", None)
-    body = project(frame, stage) if callable(project) else frame.model_dump()
+    body = projection if projection is not None else project(frame, stage) if callable(project) else frame.model_dump()
     # Operational revision numbers do not establish a change in narrative conditions.
     if isinstance(body, dict) and "fixture_version" in body:
         body = {key: value for key, value in body.items() if key != "revision"}

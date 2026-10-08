@@ -98,7 +98,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         yield
         await runner.shutdown()
 
-    app = FastAPI(title="OpenTale", version="0.5.0", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="OpenTale", version="0.5.1", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.root = store, runner, config_root
     app.state.presets = library
 
@@ -173,7 +173,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.5.0"}
+        return {"ok": True, "version": "0.5.1"}
 
     @app.get("/api/config")
     async def config():
@@ -307,6 +307,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
             "intervention": "release_method", "compiler_version": "views-v2",
             "model": runner.settings.model if original.run.provider == "deepseek" else "fixture",
             "max_output_tokens": runner.settings.max_output_tokens,
+            "context_target_chars": getattr(runner.settings, "context_target_chars", 96000),
             "execution_signature": execution_signature(original.run.provider, runner.settings),
             "ancestor_usage": original.run.usage.model_dump(),
             "note": "共同恢复点与首次干预已固定；后续轨迹允许分化，单次文本差异不证明语义因果。",
