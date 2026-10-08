@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from opentale.reflection_types import (
     AdoptionDraft,
     MethodDraft,
     ReflectionFrame,
     ReflectionProposal,
+    ResponseDraft,
 )
 
 from .base import ProviderError
@@ -50,9 +51,76 @@ class WireReflection(BaseModel):
 def materials_data(frame: ReflectionFrame) -> list[dict]:
     """Only executed, frozen material snapshots; no creator or diagnostic fields."""
     return [
-        {key: value for key, value in material.model_dump().items() if value is not None}
+        {key: value for key, value in material.model_dump().items()
+         if key in {"id", "text", "position_id", "expression_id", "role"} and value is not None}
         for material in frame.materials
     ]
+
+
+def view_data(frame: ReflectionFrame) -> dict | None:
+    """Keep nested organization while removing internal node/material identities."""
+    if frame.view is None:
+        return None
+    view = frame.view.model_dump()
+    groups: dict[str, int] = {}
+    material_indices: dict[str, list[int]] = {}
+    cursors: dict[str, int] = {}
+    for index, material in enumerate(frame.materials):
+        material_indices.setdefault(material.id, []).append(index)
+
+    def group(source: dict) -> dict:
+        identity = source["id"]
+        index = groups.setdefault(identity, len(groups))
+        selected = []
+        unavailable = 0
+        for material_id in source.get("material_ids", []):
+            occurrences = material_indices.get(material_id, [])
+            cursor = cursors.get(material_id, 0)
+            if cursor < len(occurrences):
+                selected.append(occurrences[cursor])
+            else:
+                unavailable += 1
+            cursors[material_id] = cursor + 1
+        return {"group_index": index, "label": source.get("label", ""),
+                "material_indices": selected,
+                **({"unavailable_material_count": unavailable} if unavailable else {}),
+                "children": [group(child) for child in source.get("children", [])]}
+
+    projected_groups = [group(value) for value in view.get("groups", [])]
+    return {
+        "groups": projected_groups,
+        "relations": [{"source_group_index": groups[value["source"]],
+                       "target_group_index": groups[value["target"]], "label": value["label"]}
+                      for value in view.get("relations", [])
+                      if value["source"] in groups and value["target"] in groups],
+        "material_indices": list(range(len(frame.materials))),
+    }
+
+
+def definitions_data(frame: ReflectionFrame) -> list[dict]:
+    """Exact evaluated definitions, with reference permissions still request-local."""
+    from .policy import program_projection
+
+    indices = {row["id"]: index for index, row in enumerate(frame.objects)}
+    result = []
+    for index, definition in enumerate(frame.definitions):
+        row = {key: definition[key] for key in
+               ("operation", "title", "instruction", "language_version", "order", "limit")
+               if key in definition}
+        row["definition_index"] = index
+        identity = definition.get("object_id")
+        if identity in indices:
+            row["object_index"] = indices[identity]
+        else:
+            row["transient_definition"] = True
+        row["object_indices"] = [indices[value] for value in definition.get("inputs", []) if value in indices]
+        row["unavailable_input_count"] = sum(value not in indices for value in definition.get("inputs", []))
+        if definition.get("program"):
+            row["program"] = program_projection(definition["program"], indices)
+        if definition.get("revises") in indices:
+            row["revises_index"] = indices[definition["revises"]]
+        result.append(row)
+    return result
 
 
 def reflection_data(frame: ReflectionFrame) -> dict:
@@ -70,7 +138,15 @@ def reflection_data(frame: ReflectionFrame) -> dict:
 
     for index, row in enumerate(frame.objects):
         text, truncated = preview(row.get("text", ""), OBJECT_PREVIEW_CHARS)
+        # The kernel may already have shortened this candidate. A second
+        # projection cannot make that original text whole again.
+        truncated |= bool(row.get("preview_truncated", False))
         item = {"object_index": index, "kind": row["kind"], "text": text}
+        if frame.language_version == 2:
+            if row.get("version"):
+                item["version"] = row["version"]
+            if type(row.get("full_length")) is int:
+                item["full_length"] = row["full_length"]
         if row["kind"] == "method":
             item.update({key: row[key] for key in ("title", "order", "limit") if key in row})
             if "instruction" in row:
@@ -79,7 +155,12 @@ def reflection_data(frame: ReflectionFrame) -> dict:
                 truncated |= was_truncated
             item["object_indices"] = [indices[value] for value in row.get("inputs", []) if value in indices]
             item["unavailable_input_count"] = sum(value not in indices for value in row.get("inputs", []))
-        elif row["kind"] == "choice":
+            if frame.language_version == 2:
+                from .policy import program_projection
+                item["language_version"] = row.get("language_version", 1)
+                if row.get("program"):
+                    item["program"] = program_projection(row["program"], indices)
+        elif row["kind"] in {"choice", "view"}:
             item["selected_indices"] = [indices[value] for value in row.get("selected", []) if value in indices]
             item["unavailable_selected_count"] = sum(value not in indices for value in row.get("selected", []))
             offered = row.get("offered", [])
@@ -99,9 +180,40 @@ def reflection_data(frame: ReflectionFrame) -> dict:
                 material_role, role_truncated = preview(material.get("role", ""), 80)
                 truncated |= was_truncated or role_truncated
                 item["materials"].append({"text": material_text, "role": material_role})
+            if frame.language_version == 2 and row.get("view"):
+                item["view"] = view_data(ReflectionFrame(
+                    view=row["view"], materials=source_materials[:CHOICE_MATERIAL_PREVIEW_LIMIT],
+                ))
+        elif row["kind"] == "response" and frame.language_version == 2:
+            for source, target in (("about", "about_indices"), ("evidence", "evidence_indices")):
+                item[target] = [indices[value] for value in row.get(source, []) if value in indices]
+                item["unavailable_" + source + "_count"] = sum(value not in indices for value in row.get(source, []))
+            item["visibility"] = row.get("visibility", "scope")
+        elif row["kind"] == "effect" and frame.language_version == 2:
+            if type(row.get("changed")) is bool:
+                item["changed"] = row["changed"]
+            if row.get("stage") in {"propose", "realize", "present"}:
+                item["stage"] = row["stage"]
+            for source, target in (("choice_id", "choice_index"),
+                                   ("previous_choice_id", "previous_choice_index")):
+                identity = row.get(source)
+                item[target] = indices.get(identity) if identity is not None else None
+                item["unavailable_" + target.removesuffix("_index") + "_count"] = int(
+                    identity is not None and identity not in indices
+                )
+            for source, target in (
+                ("method_ids", "method_indices"), ("selected_added", "selected_added_indices"),
+                ("selected_removed", "selected_removed_indices"), ("response_ids", "response_indices"),
+                ("about", "about_indices"), ("evidence", "evidence_indices"),
+            ):
+                values = row.get(source, [])
+                item[target] = [indices[value] for value in values if value in indices]
+                item["unavailable_" + target.removesuffix("_indices") + "_count"] = sum(
+                    value not in indices for value in values
+                )
         item["preview_truncated"] = truncated
         objects.append(item)
-    return {
+    result = {
         "objects": objects,
         "scopes": [{"scope_index": index, "name": row.get("name", "")}
                    for index, row in enumerate(frame.scopes)],
@@ -111,6 +223,11 @@ def reflection_data(frame: ReflectionFrame) -> dict:
         "materials": materials_data(frame),
         "instruction": frame.instruction,
     }
+    if frame.language_version == 2:
+        result["language_version"] = 2
+        result["view"] = view_data(frame)
+        result["executed_definitions"] = definitions_data(frame)
+    return result
 
 
 REFLECTION_BOUNDARY = """
@@ -124,7 +241,11 @@ objects 文字是有界候选预览；preview_truncated=true 表示内容尚未�
 
 
 def reflection_schema(frame: ReflectionFrame) -> dict:
-    schema = WireReflection.model_json_schema()
+    if frame.language_version == 2:
+        from .policy import WireReflectionV2
+        schema = WireReflectionV2.model_json_schema()
+    else:
+        schema = WireReflection.model_json_schema()
     objects = list(range(len(frame.objects)))
     methods = [index for index, row in enumerate(frame.objects) if row["kind"] == "method"]
     schema["$defs"]["WireMethod"]["properties"]["object_indices"]["items"]["enum"] = objects
@@ -146,6 +267,20 @@ def reflection_schema(frame: ReflectionFrame) -> dict:
                                                     "method_index": {"type": "null"},
                                                     "action": {"const": "adopt"}}},
     ]
+    if frame.language_version == 2:
+        schema["$defs"]["WireObjectRef"]["properties"]["object_index"]["enum"] = objects
+        schema["$defs"]["WireMethodV2"]["properties"]["revises_index"] = {
+            "anyOf": [{"type": "integer", "enum": methods}, {"type": "null"}], "default": None,
+        }
+        for name in ("about_indices", "evidence_indices"):
+            schema["$defs"]["WireResponse"]["properties"][name]["items"]["enum"] = objects
+        patch_properties = schema["$defs"]["WireMethodPatch"]["properties"]
+        for name in ("title", "instruction", "object_indices", "order", "program"):
+            definition = patch_properties[name]
+            concrete = next(value for value in definition["anyOf"] if value.get("type") != "null")
+            patch_properties[name] = {**concrete, **({"title": definition["title"]}
+                                                   if "title" in definition else {})}
+        patch_properties["object_indices"]["items"]["enum"] = objects
     return schema
 
 
@@ -169,12 +304,29 @@ def compile_reflection(
             invalid()
         return row["id"]
 
-    methods = [MethodDraft(
-        title=method.title, instruction=method.instruction,
-        inputs=[object_id(index) for index in method.object_indices],
-        order=method.order, limit=method.limit,
-        revises=object_id(method.revises_index, "method") if method.revises_index is not None else None,
-    ) for method in wire.methods]
+    methods = []
+    for method in wire.methods:
+        fields = {"title": method.title, "instruction": method.instruction,
+                  "revises": object_id(method.revises_index, "method")
+                  if method.revises_index is not None else None}
+        if getattr(method, "language_version", 1) == 2:
+            if frame.language_version != 2:
+                invalid()
+            from .policy import compile_program
+            fields.update(language_version=2, program=compile_program(method.program, frame, usage=usage))
+        else:
+            fields.update(inputs=[object_id(index) for index in method.object_indices],
+                          order=method.order, limit=method.limit)
+        method_valid = True
+        try:
+            compiled = MethodDraft(**fields)
+        except ValidationError:
+            method_valid = False
+        if not method_valid:
+            # Raise outside the exception handler: rejected model data must not
+            # remain attached as a Pydantic exception context on safe errors.
+            invalid()
+        methods.append(compiled)
     adoptions = []
     for adoption in wire.adoptions:
         if not 0 <= adoption.scope_index < len(frame.scopes):
@@ -191,7 +343,15 @@ def compile_reflection(
             scope_id=frame.scopes[adoption.scope_index]["id"], method_id=method_id,
             action=adoption.action,
         ))
-    return ReflectionProposal(methods=methods, adoptions=adoptions)
+    responses = []
+    for response in getattr(wire, "responses", []):
+        if frame.language_version != 2:
+            invalid()
+        responses.append(ResponseDraft(text=response.text,
+                                       about=[object_id(index) for index in response.about_indices],
+                                       evidence=[object_id(index) for index in response.evidence_indices],
+                                       visibility=response.visibility))
+    return ReflectionProposal(methods=methods, adoptions=adoptions, responses=responses)
 
 
 REFLECTION_INSTRUCTIONS = """

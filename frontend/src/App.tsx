@@ -174,7 +174,7 @@ export default function App() {
                 </p>
                 <h2>{snapshot.run.title}</h2>
                 <span className="small-tag run-mode" aria-label="当前实验模式">
-                  {snapshot.run.mode === "reflexive" ? "反身实验" : "经典模式"}
+                  {snapshot.run.mode === "reflexive_v2" ? "反身实验 v2" : snapshot.run.mode === "reflexive" ? "反身实验" : "经典模式"}
                 </span>
                 <span className={`status status-${snapshot.run.status}`}>
                   <i />
@@ -327,7 +327,7 @@ export default function App() {
               ))}
             </nav>
 
-            {snapshot.run.mode === "reflexive" && <nav className="reflection-tab" aria-label="反身实验技术视图">
+            {(snapshot.run.mode === "reflexive" || snapshot.run.mode === "reflexive_v2") && <nav className="reflection-tab" aria-label="反身实验技术视图">
               <button className="button secondary" aria-pressed={tab === "reflection"}
                 onClick={() => setTab("reflection")}>生成方法与实际选择</button>
               <span className="helper">技术证据与连续阅读分开呈现。</span>
@@ -344,7 +344,7 @@ export default function App() {
             {tab === "diagnostics" && (
               <Diagnostics snapshot={snapshot} model={workbench} />
             )}
-            {tab === "reflection" && snapshot.run.mode === "reflexive" &&
+            {tab === "reflection" && (snapshot.run.mode === "reflexive" || snapshot.run.mode === "reflexive_v2") &&
               <ReflectionPanel key={snapshot.run.id} snapshot={snapshot} model={workbench} />}
             <section className="run-footer">
               <button

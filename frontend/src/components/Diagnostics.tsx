@@ -1,5 +1,6 @@
 import type { Snapshot } from "../types";
 import type { Workbench } from "../useWorkbench";
+import ExecutionEvidence from "./ExecutionEvidence";
 const EVENTS: Record<string, string> = {
   created: "创建",
   window_started: "打开局部窗口",
@@ -14,7 +15,23 @@ const EVENTS: Record<string, string> = {
   forked: "独立分支",
   reading_created: "创建阅读路径",
   reading_updated: "更新阅读设置",
+  request_frozen: "冻结请求",
+  proposal_inputs_frozen: "冻结构想输入",
+  reading_inputs_frozen: "冻结阅读输入",
+  method_release_queued: "停止采用已排队",
+  method_released: "停止采用方法",
+  experiment_created: "创建配对分支",
 };
+
+const INPUT_PAYLOAD_FIELDS = new Set([
+  "frame", "frames", "proposal_frames", "realization_frames", "reflection_frame", "projection", "payload",
+]);
+function eventEvidence(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(eventEvidence);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, child]) =>
+    [key, INPUT_PAYLOAD_FIELDS.has(key) ? "输入已保存；可在请求证据与实际选择中查看摘要。" : eventEvidence(child)]));
+  return value;
+}
 
 export default function Diagnostics({
   snapshot,
@@ -38,6 +55,7 @@ export default function Diagnostics({
   } = model;
   return (
     <div className="diagnostic-grid">
+      {(snapshot.run.mode === "reflexive_v2" || !!snapshot.requests?.length) && <ExecutionEvidence key={snapshot.run.id} snapshot={snapshot} />}
       <section className="panel">
         <div className="section-header">
           <div>
@@ -190,7 +208,7 @@ export default function Diagnostics({
                 <strong>{EVENTS[event.type] ?? event.type}</strong>
                 <small>R{event.revision}</small>
               </summary>
-              <pre>{JSON.stringify(event.data, null, 2)}</pre>
+              <pre>{JSON.stringify(eventEvidence(event.data), null, 2)}</pre>
             </details>
           ))}
         </div>

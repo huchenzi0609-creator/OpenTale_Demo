@@ -1,4 +1,48 @@
-# OpenTale Demo v0.4 — module contract
+# OpenTale Demo v0.5 — module contract
+
+## Opt-in reflective programs (schema 5)
+
+`mode:reflexive_v2` selects the versioned View/program/response engine. Classic and
+reflexive v1 retain their original execution semantics. Schema 5 is required for v2;
+schema 1–4 saves remain readable and are never silently promoted into v2.
+
+Root owns domain/runtime integration. The engine owner extends reflection types and
+projection/compiler; provider owns request-local wire compilation; UI consumes these
+contracts. `ReflectionFrame.language_version=2` selects new provider behavior.
+
+`Snapshot` gains `policy_revision`, `requests:RequestEnvelope[]`, optional `schedule`
+and `experiment`. Request envelopes freeze stage/scope/epoch/world/policy revisions,
+full frame, its hash and exact safe provider projection hash before evaluation. Each
+attempt has its own projection/hash/usage/status. Authorization, endpoint configuration
+and hidden reasoning are excluded. Providers without a projection expose `frame_only`
+evidence. `Pending.proposal_frames` freezes proposal inputs even in v1; installation
+and replay use these original frames rather than reconstructing accepted evidence.
+
+v2 source contributions are updated by `(writer,target,expression,role)` slot. An
+unscheduled or unmodified writer's contribution survives. `withdraw` explicitly removes
+the submitting writer's slot; legacy modes reject it. V2 method releases requested
+inside pending epochs are queued until the epoch completes.
+
+`GET /api/runs/{id}/objects?scope_id=...&query=...` returns scoped preview catalog
+`{scope_id,query,objects,total}`. `GET /api/runs/{id}/object?scope_id=...&object_id=...`
+returns `{scope_id,object}` with full visible material. Both are read-only and make no
+model calls. `POST /api/runs/{id}/experiments {scope_id,method_id}` creates control and
+method-release branches at a complete stable checkpoint, returns `{control,intervention,
+manifest}`, and does not generate. The manifest records common origin digest and versions.
+
+SchedulePlan initially runs in `shadow` mode: it records reasons, effective input changes
+and dependencies while honoring all explicit continuation requests. It does not claim
+reduced model calls. Unbounded (`null`) budgets retain their established behavior.
+
+V2 HTTP snapshots return request hashes/status/usage without stored frames or attempt
+projections, and omit large frozen event inputs. Explicit export preserves full evidence;
+internal replay never uses the abbreviated workbench projection. SQLite schema-5 saves
+use content-addressed immutable nodes plus separate append-only events and sealed request
+records. Only new events/unsealed requests are packed on each checkpoint. Completed-window
+and deletion transactions collect unreachable nodes without removing other branches' roots.
+Decoding preserves JSON value semantics: deduplicated physical nodes do not alias mutable
+domain values. Manual presentation retries install any accepted-but-missing feedback without
+another model call. Paired branches verify a code/non-secret-config signature before calls.
 
 Schema 4 identifies nullable/unbounded or larger-than-legacy budget/method data. Existing finite schema 1/2/3 data remains readable without changing its limits or fiction. Saving extended data marks its format version explicitly; canonical reading histories and mode requirements still apply.
 
@@ -61,7 +105,7 @@ Builtins are read-only in the web editor; copy to a new ID to customize. Save ge
 
 Preset writes accept up to 1 MiB of HTTP data; all other writes retain the smaller request bound. No credential-entry field is added; parsed preset values containing the configured credential are rejected before persistence.
 
-`GET /api/health` -> `{ok:true, version:"0.4.1"}`
+`GET /api/health` -> `{ok:true, version:"0.5.0"}`
 
 `GET /api/config`, `POST /api/config/reload` -> safe Settings.public, `budget_bounds:{max_calls:null,max_tokens:null,max_parallel:null,max_windows:null}`, plus `diagnostics`: `{config_file_path,config_file_exists,file_api_key_present,environment_api_key_override,environment_api_key_empty_override,credential_source}`. The source is `environment|file|none`. These fields describe only the actual file path, field presence and override state; never values, lengths, unknown field names, endpoint addresses or credentials. Reload failure preserves the last usable configuration and diagnostic snapshot. `configured` indicates that a nonempty key was loaded; it does not assert authentication or model availability, and loading/reloading never calls a model.
 

@@ -12,6 +12,7 @@ from .config import Settings
 from .domain import Event, Limits, Pending, Presentation, ReadingFrame, ReadingTrack, Snapshot
 from .kernel import (
     KernelError,
+    fingerprint,
     frame_for,
     install_presentation,
     reading_frame_for,
@@ -23,6 +24,9 @@ from .kernel import install_batch as install
 from .providers import ModelResult, ProviderError, make_provider
 from .reflection import capture_choice, install_feedback, position_scope, reading_scope
 from .reflection_types import ReflectionFrame
+from .request_evidence import execution_signature, existing_request, freeze_request
+from .request_types import RequestAttempt, RequestEnvelope
+from .scheduler import begin_plan, observe_job
 from .storage import Store
 
 T = TypeVar("T")
@@ -84,7 +88,15 @@ class Runner:
         state = self._stable(run_id)
         if state.reflection is None or method_id not in state.reflection.adoptions.get(scope_id, []):
             raise KernelError("METHOD_REFERENCE_INVALID", "请选择该作用范围已经采用的方法。")
+        if state.run.mode == "reflexive_v2" and state.pending is not None:
+            release = {"scope_id": scope_id, "method_id": method_id}
+            if release not in state.pending.deferred_releases:
+                state.pending.deferred_releases.append(release)
+                self.event(state, "method_release_queued", **release)
+            return state
         state.reflection.adoptions[scope_id].remove(method_id)
+        if state.run.mode == "reflexive_v2":
+            state.policy_revision += 1
         self.event(state, "method_released", scope_id=scope_id, method_id=method_id)
         return state
 
@@ -179,16 +191,23 @@ class Runner:
             return
         frame = (state.pending.reading_frames.get(reading_id) if state.pending is not None else None)
         frame = frame or self.reading_frame(state, reading_id)
+        if state.run.mode == "reflexive_v2":
+            frozen = existing_request(state, "present", reading_scope(reading_id))
+            if frozen:
+                frame = ReadingFrame.model_validate(frozen.frame)
         try:
             result = await self._format_call(
                 state, frame, provider, "present", f"present:{reading_id}", reserve_window=reserve_window,
             )
             self.apply_presentation(state, result.value, reading_id, frame=frame)
+            self._accept_request(state, "present", reading_scope(reading_id), result.value)
             if state.pending is not None and state.pending.committed:
                 state.pending.presentations[reading_id] = result.value
             self.event(
                 state, "presented", reading_id=reading_id, segment_id=track.story[-1].id,
                 reinterprets=result.value.reinterprets, presentation=result.value.model_dump(),
+                manual=not reserve_window,
+                **self._accepted_evidence(state, "present", reading_scope(reading_id)),
                 **({"reflection_frame": frame.reflection.model_dump()} if frame.reflection else {}),
             )
         except (KernelError, ProviderError) as error:
@@ -204,6 +223,15 @@ class Runner:
             state = self.store.load(run_id)
             track = reading_track_for(state, reading_id)
             if self._presented_revision(track, state.run.revision):
+                accepted = next((event for event in reversed(state.events) if event.type == "presented"
+                                 and event.data.get("reading_id", "main") == reading_id
+                                 and event.revision == state.run.revision), None)
+                if state.reflection is not None and accepted and (
+                    accepted.data.get("manual") or state.pending is None or not state.pending.committed
+                ):
+                    self._install_reading_feedback(state, [accepted.data])
+                    track.last_error = None
+                    self.store.save(state)
                 return state
             if not self._world_ready(state):
                 raise KernelError("READING_NOT_READY", "请先完成本世界的共同构想和各人物续延，再从当前世界生成阅读。")
@@ -237,8 +265,11 @@ class Runner:
                 state.run.phase = previous_phase
                 self.store.save(state)
 
-    def _token_estimate(self, state: Snapshot, frame: Any) -> int:
-        estimate = len(frame.model_dump_json().encode("utf-8")) + 4096 + self.settings.max_output_tokens
+    def _token_estimate(self, state: Snapshot, frame: Any, projection: dict | None = None) -> int:
+        import json
+
+        text = json.dumps(projection, ensure_ascii=False) if projection is not None else frame.model_dump_json()
+        estimate = len(text.encode("utf-8")) + 4096 + self.settings.max_output_tokens
         if state.run.provider == "fixture":
             estimate = 0  # Deterministic local execution makes no token-billed call.
         return estimate
@@ -247,12 +278,33 @@ class Runner:
         self, state: Snapshot, frame: Any, provider: Any, method: str, job_key: str,
         *, reserve_window: bool = True,
     ) -> ModelResult[Any]:
+        scope = reading_scope(job_key.split(":", 1)[1]) if method == "present" else position_scope(frame.position_id)
+        envelope = None
+        if state.run.mode == "reflexive_v2":
+            if state.experiment and state.experiment.get("execution_signature") != execution_signature(
+                state.run.provider, self.settings,
+            ):
+                raise KernelError("EXPERIMENT_CONFIGURATION_CHANGED", "对照实验的程序或模型配置已改变，请重新建立配对。")
+            observe_job(state, frame, provider, method, scope)
+            already_frozen = existing_request(state, method, scope) is not None
+            envelope = freeze_request(state, frame, provider, method, scope)
+            if not already_frozen:
+                self.event(state, "request_frozen", request_id=envelope.id, stage=method,
+                           scope_id=scope, frame=frame.model_dump(), frame_hash=envelope.frame_hash)
+            else:
+                self.store.save(state)
         feedback = None
         for attempt in range(MAX_FORMAT_REPAIRS + 1):
             try:
                 evaluate = getattr(provider, method)
                 call = (lambda: evaluate(frame)) if feedback is None else (lambda: evaluate(frame, repair=feedback))
-                return await self._call(state, frame, call, job_key=job_key)
+                projector = getattr(provider, "request_projection", None)
+                projection = (projector(frame, method, repair=feedback) if callable(projector)
+                              else frame.model_dump()) if envelope is not None else None
+                return await self._call(
+                    state, frame, call, job_key=job_key, envelope=envelope, projection=projection,
+                    repair_category=feedback.category if feedback else None,
+                )
             except ProviderError as error:
                 feedback = error.feedback
                 repairable = (
@@ -282,10 +334,14 @@ class Runner:
                     required = 1
                 usage = state.run.usage
                 occupied = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
+                repair_projection = None
+                if envelope is not None and callable(getattr(provider, "request_projection", None)):
+                    repair_projection = provider.request_projection(frame, method, repair=feedback)
                 if ((state.run.limits.max_calls is not None
                      and usage.calls + required > state.run.limits.max_calls)
                         or (state.run.limits.max_tokens is not None
-                            and occupied + self._token_estimate(state, frame) > state.run.limits.max_tokens)):
+                            and occupied + self._token_estimate(state, frame, repair_projection)
+                            > state.run.limits.max_tokens)):
                     raise
                 self.event(
                     state, "format_retry", method=method, job=job_key, attempt=attempt + 1,
@@ -296,15 +352,24 @@ class Runner:
     async def _call(
         self, state: Snapshot, frame: Any, call: Callable[[], Awaitable[ModelResult[T]]],
         *, job_key: str | None = None,
+        envelope: RequestEnvelope | None = None, projection: dict | None = None,
+        repair_category: str | None = None,
     ) -> ModelResult[T]:
         usage, limits = state.run.usage, state.run.limits
-        estimate = self._token_estimate(state, frame)
+        estimate = self._token_estimate(state, frame, projection)
         used = usage.input_tokens + usage.output_tokens + usage.unknown_tokens + usage.reserved_tokens
         if ((limits.max_calls is not None and usage.calls >= limits.max_calls)
                 or (limits.max_tokens is not None and used + estimate > limits.max_tokens)):
             raise KernelError("BUDGET_EXHAUSTED", "预算不足以安全发起下一次调用；已完成的阶段已保存。")
         usage.calls += 1
         usage.reserved_tokens += estimate
+        attempt = None
+        if envelope is not None:
+            attempt = RequestAttempt(
+                number=len(envelope.attempts) + 1, request_hash=fingerprint(projection),
+                projection=projection, repair_category=repair_category,
+            )
+            envelope.attempts.append(attempt)
         self.store.save(state)
         funded = self._funded_jobs.setdefault(state.run.id, set())
         if job_key is not None:
@@ -322,6 +387,11 @@ class Runner:
                 usage.input_tokens += known_usage[0]
                 usage.output_tokens += known_usage[1]
             usage.failed_calls += 1
+            if attempt is not None:
+                attempt.status = "interrupted" if isinstance(error, asyncio.CancelledError) else "failed"
+                attempt.error_code = error.code if isinstance(error, ProviderError) else "REQUEST_INTERRUPTED"
+                if known_usage is not None:
+                    attempt.input_tokens, attempt.output_tokens = known_usage
             self.store.save(state)
             raise
         finally:
@@ -330,6 +400,9 @@ class Runner:
         usage.reserved_tokens -= estimate
         usage.input_tokens += result.input_tokens
         usage.output_tokens += result.output_tokens
+        if attempt is not None:
+            attempt.status = "received"
+            attempt.input_tokens, attempt.output_tokens = result.input_tokens, result.output_tokens
         # Caller immediately persists accepted result + settled usage in one checkpoint.
         return result
 
@@ -355,10 +428,26 @@ class Runner:
                         and state.run.usage.calls + self._needed_calls(state) > state.run.limits.max_calls):
                     raise KernelError("BUDGET_EXHAUSTED", "剩余调用额度不足以完成一个窗口；没有发起新调用。")
                 if state.pending is None:
-                    state.pending = Pending(base_revision=state.run.revision)
+                    state.pending = Pending(base_revision=state.run.revision, epoch_id=uuid4().hex,
+                                            policy_revision=state.policy_revision)
                     state.run.phase = "drafting"
                     self.event(state, "window_started", base_revision=state.run.revision)
                 pending = state.pending
+                if not pending.epoch_id:
+                    pending.epoch_id = uuid4().hex
+                    pending.policy_revision = state.policy_revision
+                if state.run.mode == "reflexive_v2" and (
+                    state.schedule is None or state.schedule.epoch_id != pending.epoch_id
+                ):
+                    begin_plan(state)
+                if not pending.committed:
+                    missing = {p.id: frame_for(state, p.id) for p in state.positions
+                               if p.id not in pending.proposal_frames}
+                    if missing:
+                        pending.proposal_frames.update(missing)
+                        self.event(state, "proposal_inputs_frozen", frames={
+                            key: value.model_dump() for key, value in missing.items()
+                        }, reconstructed=[key for key in missing if key in pending.proposals])
                 semaphore = asyncio.Semaphore(state.run.limits.max_parallel or max(
                     1, len(state.positions) + sum(track.enabled for track in state.reading_tracks),
                 ))
@@ -367,17 +456,21 @@ class Runner:
                     if position_id in pending.proposals:
                         return
                     async with semaphore:
-                        frame = frame_for(state, position_id)
+                        frame = pending.proposal_frames[position_id]
                         result = await self._format_call(state, frame, provider, "propose", f"propose:{position_id}")
                         if result.value.position_id != position_id:
                             raise KernelError("MODEL_OUTPUT_INVALID", "模型返回了不匹配的生成位置。")
-                        validate_proposal(state, result.value)
+                        validate_proposal(state, result.value, frame=frame)
                         pending.proposals[position_id] = result.value
+                        self._accept_request(state, "propose", position_scope(position_id), result.value)
                         self.event(
                             state,
                             "proposal_ready",
                             position_id=position_id,
                             based_on_revision=result.value.based_on_revision,
+                            **({"proposal": result.value.model_dump(),
+                                **self._accepted_evidence(state, "propose", position_scope(position_id))}
+                               if state.run.mode == "reflexive_v2" else {}),
                         )
 
                 if not pending.committed:
@@ -388,10 +481,13 @@ class Runner:
                     if failure:
                         raise failure
                     try:
-                        state = install(state, list(pending.proposals.values()), pending.base_revision)
+                        state = install(state, list(pending.proposals.values()), pending.base_revision,
+                                        proposal_frames=pending.proposal_frames)
                     except KernelError:
                         # Invalid collective drafts are not cached forever across retry.
-                        state.pending = Pending(base_revision=state.run.revision)
+                        state.pending = Pending(base_revision=state.run.revision, epoch_id=uuid4().hex,
+                                                policy_revision=state.policy_revision,
+                                                deferred_releases=pending.deferred_releases)
                         self.store.save(state)
                         raise
                     pending = state.pending
@@ -407,6 +503,7 @@ class Runner:
                         joint_targets=state.audit["joint_targets"],
                         base_revision=pending.base_revision,
                         proposals=[p.model_dump() for p in pending.proposals.values()],
+                        proposal_frames={key: value.model_dump() for key, value in pending.proposal_frames.items()},
                         **({"realization_frames": {key: value.model_dump()
                                                   for key, value in pending.realization_frames.items()}}
                            if state.reflection else {}),
@@ -425,6 +522,7 @@ class Runner:
                         if not result.value.strip():
                             raise KernelError("MODEL_OUTPUT_INVALID", "恢复生成没有返回可读内容。")
                         pending.realizations[position_id] = result.value
+                        self._accept_request(state, "realize", position_scope(position_id), result.value)
                         continuation = next(c for c in state.continuations if c.position_id == position_id)
                         continuation.surface = result.value
                         continuation.status = "ready"
@@ -437,6 +535,7 @@ class Runner:
                             frame_revision=frame.revision,
                             condition_fingerprint=frame.condition_fingerprint,
                             surface=result.value,
+                            **self._accepted_evidence(state, "realize", position_scope(position_id)),
                             **({"choice": choice.model_dump()} if choice else {}),
                         )
 
@@ -480,6 +579,11 @@ class Runner:
                         for reading_id, presentation in pending.presentations.items()
                         if pending.reading_frames.get(reading_id) is not None
                     ])
+                for release in pending.deferred_releases:
+                    if state.reflection and release["method_id"] in state.reflection.adoptions.get(release["scope_id"], []):
+                        state.reflection.adoptions[release["scope_id"]].remove(release["method_id"])
+                        state.policy_revision += 1
+                        self.event(state, "method_released", **release)
                 state.pending = None
                 state.run.usage.windows += 1
                 state.run.phase = "idle"
@@ -523,6 +627,17 @@ class Runner:
     def reading_frame(self, state: Snapshot, reading_id: str = "main") -> ReadingFrame:
         return reading_frame_for(state, reading_id)
 
+    @staticmethod
+    def _accept_request(state: Snapshot, stage: str, scope: str, value: Any) -> None:
+        request = existing_request(state, stage, scope) if state.run.mode == "reflexive_v2" else None
+        if request is not None:
+            request.accepted_result_hash = fingerprint(value.model_dump() if hasattr(value, "model_dump") else value)
+
+    @staticmethod
+    def _accepted_evidence(state: Snapshot, stage: str, scope: str) -> dict:
+        request = existing_request(state, stage, scope) if state.run.mode == "reflexive_v2" else None
+        return {"request_id": request.id, "result_hash": request.accepted_result_hash} if request else {}
+
     def apply_presentation(
         self, state: Snapshot, presentation: Presentation, reading_id: str = "main",
         *, frame: ReadingFrame | None = None,
@@ -539,6 +654,13 @@ class Runner:
         capture_choice(state, reading_scope(reading_id), "present", frame.reflection)
 
     def _install_reading_feedback(self, state: Snapshot, entries: list[dict]) -> None:
+        keys = ("reading_id", "presentation", "reflection_frame")
+        entries = [{key: entry[key] for key in keys} for entry in entries]
+        installed = [entry for event in state.events if event.type == "reflection_feedback"
+                     for entry in event.data["entries"]]
+        entries = [entry for entry in entries if entry not in installed]
+        if not entries:
+            return
         proposals = [
             (reading_scope(entry["reading_id"]), Presentation.model_validate(entry["presentation"]).reflection,
              ReflectionFrame.model_validate(entry["reflection_frame"]))

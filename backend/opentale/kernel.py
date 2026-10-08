@@ -80,7 +80,11 @@ def frame_for(state: Snapshot, position_id: str) -> GenerationFrame:
     return frame
 
 
-def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int) -> Snapshot:
+def install_batch(
+    state: Snapshot, proposals: list[Proposal], base_revision: int,
+    *, proposal_frames: dict[str, GenerationFrame] | None = None,
+    participants: set[str] | None = None,
+) -> Snapshot:
     """Validate entirely, then replace scoped target groups on a detached snapshot.
 
     Arrival order has no effect. All writers of one role survive the same installation.
@@ -90,14 +94,21 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
         raise KernelError("STALE_PROPOSAL", "该局部的条件已改变，请依据新条件重新生成。")
     positions = {p.id for p in state.positions}
     writers = [p.position_id for p in proposals]
-    if len(writers) != len(set(writers)) or set(writers) != positions:
+    v2 = state.run.mode == "reflexive_v2"
+    expected = participants if v2 and participants is not None else positions
+    if not expected or not expected <= positions or len(writers) != len(set(writers)) or set(writers) != expected:
         raise KernelError("WINDOW_INCOMPLETE", "本窗口必须包含每个参与位置的一份表达。")
-    frames = {p.id: frame_for(state, p.id) for p in state.positions}
+    frames = proposal_frames if proposal_frames is not None else {pid: frame_for(state, pid) for pid in writers}
+    if set(frames) != set(writers) or any(
+        frame.position_id != pid or frame.revision != base_revision for pid, frame in frames.items()
+    ):
+        raise KernelError("STALE_PROPOSAL", "保存的提案输入与本批参与位置或版本不一致。")
     for proposal in proposals:
-        validate_proposal(state, proposal)
+        validate_proposal(state, proposal, frame=frames[proposal.position_id])
     result = state.model_copy(deep=True)
     revision = base_revision + 1
     groups: dict[tuple[str, str, str], list[Binding]] = defaultdict(list)
+    withdrawn: dict[tuple[str, str, str], set[str]] = defaultdict(set)
     batch_trace = []
     before = {p.id: frame_for(state, p.id).condition_fingerprint for p in state.positions}
     for proposal in sorted(proposals, key=lambda p: p.position_id):
@@ -112,6 +123,11 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
         )
         for operation in proposal.operations:
             key = (operation.target_position_id, operation.expression_id, operation.role)
+            if operation.op == "withdraw":
+                withdrawn[key].add(proposal.position_id)
+                batch_trace.append({"source_position_id": proposal.position_id, **operation.model_dump(),
+                                    "source_expression_id": source_expression_id})
+                continue
             groups[key].append(
                 Binding(
                     source_position_id=proposal.position_id,
@@ -129,7 +145,19 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
                 }
             )
     uses = {(u.position_id, u.expression_id, u.role): u for u in result.uses}
-    for key, bindings in sorted(groups.items()):
+    for key in sorted(groups.keys() | withdrawn.keys()):
+        bindings = groups[key]
+        writers_for_key = {binding.source_position_id for binding in bindings}
+        if writers_for_key & withdrawn[key]:
+            raise KernelError("BINDING_SLOT_CONFLICT", "同一来源不能在同批同时更新和撤回同一用法。")
+        if v2 and key in uses:
+            bindings = [
+                binding for binding in uses[key].bindings
+                if binding.source_position_id not in writers_for_key | withdrawn[key]
+            ] + bindings
+        if not bindings:
+            uses.pop(key, None)
+            continue
         # Correlated bindings remain separately attributed, including incompatible values.
         bindings = sorted(bindings, key=lambda b: (b.source_position_id, b.value, b.anchor))
         uses[key] = Use(
@@ -153,7 +181,8 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
             capture_choice(result, position_scope(proposal.position_id), "propose", frames[proposal.position_id].reflection)
     proposal_map = {p.position_id: p for p in proposals}
     for continuation in result.continuations:
-        continuation.seed_text = proposal_map[continuation.position_id].text
+        if continuation.position_id in proposal_map:
+            continuation.seed_text = proposal_map[continuation.position_id].text
         continuation.frame_revision = revision
         continuation.status = "pending"
         frame = frame_for(result, continuation.position_id)
@@ -185,17 +214,20 @@ def install_batch(state: Snapshot, proposals: list[Proposal], base_revision: int
     return result
 
 
-def validate_proposal(state: Snapshot, proposal: Proposal) -> None:
+def validate_proposal(state: Snapshot, proposal: Proposal, *, frame: GenerationFrame | None = None) -> None:
     from .reflection import validate_reflection
 
-    validate_reflection(proposal.reflection, frame_for(state, proposal.position_id).reflection
-                        if proposal.position_id in {p.id for p in state.positions} else None)
+    if frame is None and proposal.position_id in {p.id for p in state.positions}:
+        frame = frame_for(state, proposal.position_id)
+    validate_reflection(proposal.reflection, frame.reflection if frame is not None else None)
     positions = {p.id for p in state.positions}
     expression_ids = {e.id for e in state.expressions}
     if proposal.position_id not in positions or proposal.based_on_revision != state.run.revision:
         raise KernelError("STALE_PROPOSAL", "表达依据的位置或条件版本已过时。")
     peer_effect = False
     for operation in proposal.operations:
+        if operation.op == "withdraw" and state.run.mode != "reflexive_v2":
+            raise KernelError("OPERATION_MODE_INVALID", "当前实验版本不支持来源槽位撤回。")
         if operation.target_position_id not in positions or operation.expression_id not in expression_ids:
             raise KernelError("REFERENCE_INVALID", "表达引用了不存在的位置或片段。")
         if operation.anchor not in proposal.text:
@@ -282,7 +314,9 @@ def reading_frame_for(state: Snapshot, reading_id: str = "main") -> ReadingFrame
              ]}
             for p in state.positions
         ],
-        previous_segments=[segment.model_dump() for segment in track.story[-3:]],
+        previous_segments=[segment.model_dump() for segment in (
+            track.story if state.run.mode == "reflexive_v2" else track.story[-3:]
+        )],
         open_relations=track.reading.open_relations,
         current_focus=track.reading.focus_position_id,
         start_position_id=track.start_position_id,
@@ -360,9 +394,25 @@ def semantic_projection(state: Snapshot) -> dict:
         for track in sorted(state.reading_tracks, key=lambda track: track.id)
     ]
     if state.reflection is not None:
-        projection["reflection"] = state.reflection.model_dump()
+        if state.run.mode == "reflexive":
+            from .reflection import legacy_reflection_data
+
+            projection["reflection"] = legacy_reflection_data(state.reflection)
+        else:
+            projection["reflection"] = state.reflection.model_dump()
         # Concurrent results preserve order-independent choice semantics.
         projection["reflection"]["choices"] = sorted(
             projection["reflection"]["choices"], key=lambda item: item["id"],
         )
+        if state.run.mode == "reflexive_v2":
+            for collection in ("views", "effects", "responses"):
+                projection["reflection"][collection] = sorted(
+                    projection["reflection"].get(collection, []), key=lambda item: item["id"],
+                )
+            projection["reflection"]["object_versions"] = sorted(
+                projection["reflection"].get("object_versions", []),
+                key=lambda item: (item["object_id"], item["version"]),
+            )
+    if state.run.mode == "reflexive_v2":
+        projection["policy_revision"] = state.policy_revision
     return projection

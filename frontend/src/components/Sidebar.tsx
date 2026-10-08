@@ -133,8 +133,11 @@ export default function Sidebar({ model }: { model: Workbench }) {
           onChange={(event) => setMode(event.target.value as ExperimentMode)}>
           <option value="classic">经典模式 · 共同条件承接</option>
           <option value="reflexive">反身实验 · 生成并采用方法</option>
+          <option value="reflexive_v2">反身实验 v2 · 视图、方法与回应</option>
         </select>
-        <p className="helper">{mode === "reflexive"
+        <p className="helper">{mode === "reflexive_v2"
+          ? "将材料组织成视图，检查与修改方法，并把局部回应带入后续生成。可检索完整材料、比较执行计划与实际输入，保留独立阅读路径。"
+          : mode === "reflexive"
           ? "生成者可创建、采用和修改组织材料的方法；实际选择保存在独立技术面板。此模式验证机制，尚不能保证叙事意图的涌现。"
           : "使用原有共同构想、联合更新与连续阅读流程。旧存档沿用此模式。"}
           {snapshot && " 模式只影响新建实验，已有存档模式保持原样。"}</p>

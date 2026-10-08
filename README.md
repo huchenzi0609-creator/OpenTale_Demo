@@ -1,8 +1,10 @@
 # OpenTale Demo
 
-实验分支 `experiment/reflexive-generation` 的 0.4.1 支持“反身实验”：生成器可以创建、采用和修改材料组织方法，方法及实际选择又可成为后续输入。经典模式仍为默认对照。完整能力、运行方式与验证边界见[反身实验说明](docs/REFLEXIVE_EXPERIMENT.md)。
+实验分支 `experiment/reflexive-generation` 的 0.5.0 新增“反身实验 v2”：有类型的方法程序保存嵌套视图，可以检查、改写和应用其他方法；局部回应及实际组织变化进入后续生成。完整材料检索、精确请求证据和配对干预可在网页操作。使用入口、执行机制与边界见 [v2 引擎说明](docs/V2_ENGINE.md)和[模型协议](docs/V2_PROVIDER.md)。经典模式仍为默认对照，旧反身模式按[原执行说明](docs/REFLEXIVE_EXPERIMENT.md)继续运行，旧存档不自动转换。
 
-使用独立实验服务：`uv run python scripts/dev.py build --profile reflexive`，随后 `uv run python scripts/dev.py detach --profile reflexive --port 8232`。网页为 `http://127.0.0.1:8232`，实验数据位于 `runtime/reflexive/data/`，与原 `runtime/opentale.sqlite3` 分开。密钥继续只填根目录 `.env.local`，无须在另一份文档复制。网页创建实验时选择“反身实验 · 生成并采用方法”；程序不会自动调用付费模型。
+使用独立实验服务：`uv run python scripts/dev.py build --profile reflexive`，随后 `uv run python scripts/dev.py detach --profile reflexive --port 8232`。网页为 `http://127.0.0.1:8232`，实验数据位于 `runtime/reflexive/data/`，与原 `runtime/opentale.sqlite3` 分开。密钥继续只填根目录 `.env.local`，无须在另一份文档复制。网页创建实验时选择“反身实验 v2 · 视图、方法与回应”；创建不调用模型，单步和开始才生成。
+
+离线验收新版：`.venv/bin/python scripts/verify_v2.py --windows 3`。脚本使用临时存储和夹具，不加载密钥、不消耗 Token。当前依赖调度为影子观察，仍完整执行人物和读轨阶段；尚未开放程序内自主子模型调用。方法变化的机械证据与真实叙事效果分别评估。
 
 一个可以离线验证的共同生成叙事实验：多个叙述位置共同使用表达，各自保留不同的归属与作用；一处的变化实际改变别处下一次生成的条件，呈现位置再从这些关系中形成一条可读序列。
 

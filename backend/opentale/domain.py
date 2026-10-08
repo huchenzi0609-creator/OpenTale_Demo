@@ -17,6 +17,7 @@ from .capacity import (
     MAX_READING_TRACKS,
 )
 from .reflection_types import ReflectionFrame, ReflectionProposal, ReflectionState
+from .request_types import RequestEnvelope, SchedulePlan
 
 
 def now() -> str:
@@ -86,7 +87,7 @@ class Continuation(Record):
 
 
 class Operation(Record):
-    op: Literal["rebind"]
+    op: Literal["rebind", "withdraw"]
     target_position_id: str
     expression_id: str
     role: str = Field(min_length=1, max_length=80)
@@ -165,13 +166,17 @@ class Pending(Record):
     presentations: dict[str, Presentation] = Field(default_factory=dict)
     reading_frames: dict[str, ReadingFrame] = Field(default_factory=dict)
     realization_frames: dict[str, GenerationFrame] = Field(default_factory=dict)
+    proposal_frames: dict[str, GenerationFrame] = Field(default_factory=dict)
+    epoch_id: str = ""
+    policy_revision: int = 0
+    deferred_releases: list[dict[str, str]] = Field(default_factory=list)
 
 
 class Run(Record):
     id: str
     title: str
     provider: Literal["fixture", "deepseek"]
-    mode: Literal["classic", "reflexive"] = "classic"
+    mode: Literal["classic", "reflexive", "reflexive_v2"] = "classic"
     status: str = "idle"
     revision: int = 0
     created_at: str = Field(default_factory=now)
@@ -195,7 +200,7 @@ class ReadingTrack(Record):
 
 
 class Snapshot(Record):
-    schema_version: Literal[2, 3, 4] = 2
+    schema_version: Literal[2, 3, 4, 5] = 2
     run: Run
     positions: list[Position]
     expressions: list[Expression]
@@ -209,6 +214,10 @@ class Snapshot(Record):
     pending: Pending | None = None
     audit: dict[str, Any] = Field(default_factory=dict)
     reflection: ReflectionState | None = None
+    policy_revision: int = 0
+    requests: list[RequestEnvelope] = Field(default_factory=list)
+    schedule: SchedulePlan | None = None
+    experiment: dict[str, Any] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -217,9 +226,9 @@ class Snapshot(Record):
             return value
         data = dict(value)
         version = data.get("schema_version", 1)
-        if type(version) is not int or version not in {1, 2, 3, 4}:
+        if type(version) is not int or version not in {1, 2, 3, 4, 5}:
             return data  # Literal validation rejects unknown future versions.
-        if version in {2, 3, 4} and "reading_tracks" not in data:
+        if version in {2, 3, 4, 5} and "reading_tracks" not in data:
             raise ValueError("Versioned snapshots require canonical reading histories")
         legacy_story = data.pop("story", [])
         legacy_reading = data.pop("reading", {})
@@ -238,11 +247,13 @@ class Snapshot(Record):
                     raise ValueError("Primary reading projection does not match its history")
                 if legacy_reading and legacy_reading != main_data.get("reading", {}):
                     raise ValueError("Primary reading projection does not match its state")
-        data["schema_version"] = version if version in {3, 4} else 2
+        data["schema_version"] = version if version in {3, 4, 5} else 2
         return data
 
     @model_validator(mode="after")
     def unique_readings(self) -> "Snapshot":
+        if self.run.mode == "reflexive_v2" and (self.schema_version != 5 or self.reflection is None):
+            raise ValueError("Reflexive v2 snapshots require version 5 and reflection state")
         if self.run.mode == "reflexive" and (self.schema_version not in {3, 4} or self.reflection is None):
             raise ValueError("Reflexive snapshots require version 3 or 4 and reflection state")
         if self.run.mode == "classic" and (self.schema_version not in {2, 4} or self.reflection is not None):
@@ -259,6 +270,9 @@ class Snapshot(Record):
 
     def mark_extended_schema(self) -> None:
         """Mark data an older reader cannot represent without converting existing finite saves."""
+        if self.run.mode == "reflexive_v2":
+            self.schema_version = 5
+            return
         legacy = {"max_calls": 1000, "max_tokens": 5120000, "max_parallel": 8, "max_windows": 1000}
         extended = any(value is None or value > legacy[field]
                        for field, value in self.run.limits.model_dump().items())

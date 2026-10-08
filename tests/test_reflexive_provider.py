@@ -187,6 +187,17 @@ def test_method_preview_marks_missing_dependencies_without_inventing_indices():
     assert "unavailable-method" not in json.dumps(projection)
 
 
+def test_projection_retains_upstream_truncation_even_at_exact_preview_length():
+    frame = reflection_frame()
+    frame.objects[0].update(text="字" * OBJECT_PREVIEW_CHARS, preview_truncated=True)
+    projection = reflection_data(frame)
+    assert len(projection["objects"][0]["text"]) == OBJECT_PREVIEW_CHARS
+    assert projection["objects"][0]["preview_truncated"] is True
+    # Short previews can also be incomplete after a range or upstream budget.
+    frame.objects[0]["text"] = "节选"
+    assert reflection_data(frame)["objects"][0]["preview_truncated"] is True
+
+
 async def test_choice_projection_exposes_selection_and_grouping_without_old_raw_references():
     frame = actor_frame()
     frame.reflection.objects[2].update(
@@ -249,6 +260,32 @@ async def test_method_instruction_remains_data_beneath_system_discipline(stage):
     assert executed["materials"][0]["text"] == "完整材料" * 3000
     actual_text = result.value if stage == "realize" else result.value.text
     assert actual_text == "她收好雨衣，推开厨房的门。"
+
+
+@pytest.mark.parametrize("stage", ["propose", "realize", "present"])
+async def test_request_projection_is_exact_sent_json_and_excludes_transport_secrets(stage):
+    frame = reading_frame() if stage == "present" else actor_frame()
+    wire = {"text": "她收好雨衣，推开厨房的门。"}
+    if stage == "propose":
+        wire = {"fragments": [{"text": wire["text"], "targets": []}]}
+    elif stage == "present":
+        wire.update(focus_index=0, expression_indices=[], reinterprets_indices=[])
+    captured = []
+
+    def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=envelope(wire))
+
+    from opentale.providers.feedback import OutputFeedback
+    repair = OutputFeedback("PROSE_INVALID", ("TECHNICAL_PROSE",))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = DeepSeekProvider(Settings(api_key="mock-only-secret", base_url="https://private.invalid"), client)
+        projected = provider.request_projection(frame, stage, repair=repair)
+        assert "mock-only-secret" not in json.dumps(projected)
+        assert "private.invalid" not in json.dumps(projected)
+        assert provider.request_projection(frame, stage) != projected
+        await getattr(provider, stage)(frame, repair=repair)
+    assert projected == captured[0]
 
 
 @pytest.mark.parametrize("change", [

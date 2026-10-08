@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError
@@ -28,6 +28,7 @@ from opentale.security import contains_credential as _contains_credential
 
 from .base import ModelResult, ProviderError
 from .feedback import OutputFeedback, schema_feedback
+from .policy import V2_REFLECTION_INSTRUCTIONS, WireReflectionV2
 from .prose import NARRATIVE_DISCIPLINE
 from .reading import (
     compile_reading_references,
@@ -45,6 +46,7 @@ from .reflection import (
     materials_data,
     reflection_data,
     reflection_schema,
+    view_data,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -87,6 +89,19 @@ class _ReflexiveFragmentProposal(_FragmentProposal):
     reflection: WireReflection | None = None
 
 
+class _FragmentTargetV2(_FragmentTarget):
+    action: Literal["rebind", "withdraw"] = "rebind"
+
+
+class _FragmentV2(_Fragment):
+    targets: list[_FragmentTargetV2] = Field(max_length=MAX_FRAGMENT_TARGETS)
+
+
+class _ReflexiveFragmentProposalV2(_FragmentProposal):
+    fragments: list[_FragmentV2] = Field(min_length=1, max_length=MAX_PROPOSAL_FRAGMENTS)
+    reflection: WireReflectionV2 | None = None
+
+
 class _ClassicPresentation(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     text: str = Field(min_length=1, max_length=MAX_PRESENTATION_TEXT_CHARS)
@@ -113,12 +128,38 @@ class _IndexedReflexivePresentation(_IndexedPresentation):
     reflection: WireReflection | None = None
 
 
+class _ReflexivePresentationV2(_ReflexivePresentation):
+    reflection: WireReflectionV2 | None = None
+
+
+class _IndexedReflexivePresentationV2(_IndexedReflexivePresentation):
+    reflection: WireReflectionV2 | None = None
+
+
 class _PresentationResponse(RootModel[_IndexedPresentation | _ClassicPresentation]):
     """Accept exact historical references; new requests use local handles."""
 
 
 class _ReflexivePresentationResponse(RootModel[_IndexedReflexivePresentation | _ReflexivePresentation]):
     """Reflexive permissions stay independent of the reading-reference format."""
+
+
+class _ReflexivePresentationResponseV2(RootModel[_IndexedReflexivePresentationV2 | _ReflexivePresentationV2]):
+    """Explicit opt-in for typed programs and locally grounded responses."""
+
+
+def _v2(frame: GenerationFrame | ReadingFrame) -> bool:
+    return frame.reflection is not None and frame.reflection.language_version == 2
+
+
+def _reflection_instructions(frame: GenerationFrame | ReadingFrame) -> str:
+    return V2_REFLECTION_INSTRUCTIONS if _v2(frame) else REFLECTION_INSTRUCTIONS
+
+
+def _proposal_response(frame: GenerationFrame):
+    if _v2(frame):
+        return _ReflexiveFragmentProposalV2
+    return _ReflexiveFragmentProposal if frame.reflection else _ProposalResponse
 
 
 class _NamedFragment(BaseModel):
@@ -186,11 +227,13 @@ def _proposal_schema(frame: GenerationFrame) -> dict:
     routes = _routing_table(frame)
     if not routes and frame.reflection is None:
         raise ProviderError("GENERATION_FRAME_INVALID", "当前局部没有可承接的同伴接口。")
-    schema = (_ReflexiveFragmentProposal if frame.reflection else _FragmentProposal).model_json_schema()
-    schema["$defs"]["_FragmentTarget"]["properties"]["interface_index"]["enum"] = [
+    schema = (_proposal_response(frame) if frame.reflection else _FragmentProposal).model_json_schema()
+    target_name = "_FragmentTargetV2" if _v2(frame) else "_FragmentTarget"
+    fragment_name = "_FragmentV2" if _v2(frame) else "_Fragment"
+    schema["$defs"][target_name]["properties"]["interface_index"]["enum"] = [
         route["interface_index"] for route in routes
     ]
-    schema["$defs"]["_Fragment"]["allOf"] = [{
+    schema["$defs"][fragment_name]["allOf"] = [{
         "if": {"properties": {"targets": {"minItems": 1}}},
         "then": {"properties": {"text": {"maxLength": MAX_OPERATION_TEXT_CHARS}}},
     }]
@@ -202,7 +245,7 @@ def _proposal_schema(frame: GenerationFrame) -> dict:
 def _with_reflection_schema(schema: dict, frame) -> None:
     reflection = reflection_schema(frame)
     schema.setdefault("$defs", {}).update(reflection.pop("$defs", {}))
-    schema["$defs"]["WireReflection"] = reflection
+    schema["$defs"]["WireReflectionV2" if frame.language_version == 2 else "WireReflection"] = reflection
 
 
 def _shared_interface(frame: GenerationFrame) -> dict | None:
@@ -336,6 +379,7 @@ def _format_message(feedback: OutputFeedback) -> str:
 
 def _presentation_schema(frame: ReadingFrame) -> dict:
     schema = (
+        _IndexedReflexivePresentationV2 if _v2(frame) else
         _IndexedReflexivePresentation if frame.reflection else _IndexedPresentation
     ).model_json_schema()
     if frame.reflection is None:
@@ -407,13 +451,11 @@ class DeepSeekProvider:
         self.settings = settings
         self._client = client
 
-    async def _request(
+    def _request_payload(
         self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None,
         output_example: dict | None = None, repair: OutputFeedback | None = None,
-    ) -> ModelResult[T]:
-        key = self.settings.api_key.get_secret_value()
-        if not key:
-            raise ProviderError("API_KEY_MISSING", "请先在本地配置文件中填写测试密钥。")
+    ) -> dict:
+        """Exact model-visible JSON body; transport/authentication stay outside."""
         system = _NARRATIVE_DISCIPLINE + "\n" + instructions
         if output_example is not None:
             system += "\n本阶段完整输出形状示例（正文占位文字需替换；示例只说明字段、类型和可用编号）：\n"
@@ -434,7 +476,7 @@ class DeepSeekProvider:
         user = json.dumps(data, ensure_ascii=False)
         if len(system) + len(user) > MAX_REQUEST_CHARS:
             raise ProviderError("CONTEXT_TOO_LARGE", "当前局部的输入过长，请缩小活跃内容。")
-        payload = {
+        return {
             "model": self.settings.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "thinking": {"type": "disabled"},
@@ -442,6 +484,32 @@ class DeepSeekProvider:
             "max_tokens": self.settings.max_output_tokens,
             "stream": False,
         }
+
+    def request_projection(
+        self, frame: GenerationFrame | ReadingFrame, method: str, *, repair: OutputFeedback | None = None,
+    ) -> dict:
+        """Return the exact outgoing body without credentials, endpoint or network I/O.
+
+        Callers may freeze/hash this document before evaluation. Repair feedback
+        is part of the body and therefore part of each attempt's request identity.
+        """
+        if method not in {"propose", "realize", "present"}:
+            raise ValueError("Unknown generation method")
+        prepared = getattr(self, "_prepare_" + method)(frame.model_copy(deep=True))
+        instructions, data, schema, options = prepared
+        return self._request_payload(instructions, data, schema, **options, repair=repair)
+
+    async def _request(
+        self, instructions: str, data: dict, schema: type[T], *, output_schema: dict | None = None,
+        output_example: dict | None = None, repair: OutputFeedback | None = None,
+    ) -> ModelResult[T]:
+        key = self.settings.api_key.get_secret_value()
+        if not key:
+            raise ProviderError("API_KEY_MISSING", "请先在本地配置文件中填写测试密钥。")
+        payload = self._request_payload(
+            instructions, data, schema, output_schema=output_schema,
+            output_example=output_example, repair=repair,
+        )
         url = self.settings.base_url + "/chat/completions"
         owned = self._client is None
         client = self._client or httpx.AsyncClient(
@@ -560,6 +628,9 @@ class DeepSeekProvider:
             r"focus_index|expression_indices|reinterprets_indices|reading_table|history_table|"
             r"READING_FOCUS_INVALID|READING_EXPRESSION_INVALID|READING_HISTORY_INVALID|READING_SHARED_REQUIRED|"
             r"revises_index|scope_index|method_index|draft_index|input_fingerprint|"
+            r"about_indices|evidence_indices|group_index|material_indices|object_index|choice_index|"
+            r"selected_added_indices|selected_removed_indices|method_indices|response_indices|"
+            r"executed_definitions|definition_index|"
             r"REFLECTION_REFERENCE_INVALID)", text,
         ):
             raise ProviderError(
@@ -567,9 +638,7 @@ class DeepSeekProvider:
                 feedback=OutputFeedback("PROSE_INVALID", ("TECHNICAL_PROSE",)),
             )
 
-    async def propose(
-        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
-    ) -> ModelResult[Proposal]:
+    def _prepare_propose(self, frame: GenerationFrame) -> tuple:
         instructions = f"""
 在当前叙述的未完成处生成一份短叙述，并把叙述中的构想直接转用到 peers 的当前条件。
 从人物的当前经验生出构想，写出它在同伴生活中的具体作用；牵连体现在各人物的处境和反应中。
@@ -603,7 +672,10 @@ routing_table 只有可写接口及现有作用，不提供同伴的私有背景
 interface_index 仅选 routing_table 中本次整数，role 给出实际作用。程序逐字采用片段正文。
 有承接片段至多 {MAX_OPERATION_TEXT_CHARS} 字符，拼接正文至多 {MAX_PROPOSAL_TEXT_CHARS} 字符。
 不要输出 operations、持久目标ID、value 或 anchor。正文只呈现生活，技术选择位于结构字段。
-""" + REFLECTION_INSTRUCTIONS
+""" + _reflection_instructions(frame)
+            if _v2(frame):
+                instructions += ("\n普通承接的 targets 每项可写 action:rebind 或 withdraw，默认 rebind。"
+                                 "withdraw 撤回自己对该目标表达与 role 的既有贡献；同槽位本次择一操作。")
         data = _actor_frame(frame)
         if frame.reflection is not None:
             # Classic background fields would bypass the method's actual selection.
@@ -648,13 +720,18 @@ interface_index 仅选 routing_table 中本次整数，role 给出实际作用�
             }
             for interface_index in example_indices
         ]
-        result = await self._request(
-            instructions, data, _ReflexiveFragmentProposal if frame.reflection else _ProposalResponse,
-            output_schema=output_schema,
-            output_example={"fragments": [{"text": _PROSE_PLACEHOLDER,
-                                           "targets": [] if frame.reflection else targets}]},
-            repair=repair,
-        )
+        return (instructions, data, _proposal_response(frame),
+                {"output_schema": output_schema,
+                 "output_example": {"fragments": [{"text": _PROSE_PLACEHOLDER,
+                                                   "targets": [] if frame.reflection else targets}]}})
+
+    async def propose(
+        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[Proposal]:
+        frame = frame.model_copy(deep=True)
+        instructions, data, schema, options = self._prepare_propose(frame)
+        routing_table = _routing_table(frame)
+        result = await self._request(instructions, data, schema, **options, repair=repair)
         usage = (result.input_tokens, result.output_tokens)
 
         def invalid(reason: str) -> None:
@@ -692,7 +769,7 @@ interface_index 仅选 routing_table 中本次整数，role 给出实际作用�
                     # Mechanical compilation uses the model's prose verbatim. There is no
                     # inferred replacement, anchor repair, omitted target or extra evaluation.
                     operations.append(Operation(
-                        op="rebind",
+                        op=getattr(target, "action", "rebind"),
                         target_position_id=target_position_id,
                         expression_id=expression_id,
                         role=target.role,
@@ -737,14 +814,16 @@ interface_index 仅选 routing_table 中本次整数，role 给出实际作用�
         if frame.reflection is not None:
             identifiers |= {row["id"] for row in frame.reflection.objects}
             identifiers |= {row["id"] for row in frame.reflection.scopes}
+            identifiers |= {material.id for material in frame.reflection.materials}
         self._check_prose(value.text, identifiers, usage=usage)
         for operation in value.operations:
             self._check_prose(operation.value, identifiers, usage=usage)
+        if value.reflection is not None:
+            for response in value.reflection.responses:
+                self._check_prose(response.text, identifiers, usage=usage)
         return ModelResult(value, result.input_tokens, result.output_tokens)
 
-    async def realize(
-        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
-    ) -> ModelResult[str]:
+    def _prepare_realize(self, frame: GenerationFrame) -> tuple:
         instructions = f"""
 从已经重构的 active_uses 条件继续当前未完成 seed_text，输出 {{"text":"自然语言正文"}}。
 正文为第三人称叙述，承接正在生效的 values，尤其同一表达上的多个 values。
@@ -765,25 +844,29 @@ text 至多 {MAX_REALIZATION_TEXT_CHARS} 字符，按需要决定段落与篇幅
                 "name": frame.name, "materials": materials_data(frame.reflection),
                 "groups": frame.reflection.groups, "instruction": frame.reflection.instruction,
             }
-        result = await self._request(
-            instructions, data, _Surface,
-            output_example={"text": _PROSE_PLACEHOLDER}, repair=repair,
-        )
+            if _v2(frame):
+                data["view"] = view_data(frame.reflection)
+                instructions += ("\nview 的分组和关系是本次组织的一部分，按其具体关系续接经验。"
+                                 "材料中若含局部回应，理解其所指的经验，再落实为当前生活。")
+        return instructions, data, _Surface, {"output_example": {"text": _PROSE_PLACEHOLDER}}
+
+    async def realize(
+        self, frame: GenerationFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[str]:
+        frame = frame.model_copy(deep=True)
+        instructions, data, schema, options = self._prepare_realize(frame)
+        result = await self._request(instructions, data, schema, **options, repair=repair)
         identifiers = {frame.position_id} | {peer["id"] for peer in frame.peers}
         identifiers |= {use["expression_id"] for use in frame.active_uses}
         identifiers |= {interface["expression_id"] for interface in frame.peer_interfaces}
         if frame.reflection is not None:
             identifiers |= {row["id"] for row in frame.reflection.objects}
             identifiers |= {row["id"] for row in frame.reflection.scopes}
+            identifiers |= {material.id for material in frame.reflection.materials}
         self._check_prose(result.value.text, identifiers, usage=(result.input_tokens, result.output_tokens))
         return ModelResult(result.value.text, result.input_tokens, result.output_tokens)
 
-    async def present(
-        self, frame: ReadingFrame, *, repair: OutputFeedback | None = None,
-    ) -> ModelResult[Presentation]:
-        # Preserve exactly the request's scopes, entry, history and selected methods
-        # while the asynchronous transport runs. Resolve all handles in this copy.
-        frame = frame.model_copy(deep=True)
+    def _prepare_present(self, frame: ReadingFrame) -> tuple:
         table = reading_table(frame)
         instructions = f"""
 你是一个局部阅读位置。选择 candidates 中正在生效的一处叙述，形成下一段可读正文。
@@ -814,7 +897,7 @@ reinterprets_indices 可为空，否则仅选 history_table 的 history_index。
 或自行拼写人物、表达、历史段落ID。正文使用自然姓名，技术选择位于结构字段。
 可以从当前经验提出新的材料组织方式，经 reflection 字段返回世界；无需每次提出。
 text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符；正文没有编号、方法说明或技术引用。
-""" + REFLECTION_INSTRUCTIONS
+""" + _reflection_instructions(frame)
         data = {
             "revision": frame.revision,
             "start_position_id": frame.start_position_id,
@@ -869,16 +952,22 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符；正文没有编号、方法�
         example_expressions = [expression["expression_index"]
                                for expression in example_focus["expressions"]
                                if frame.reflection is not None or expression["shared"]][:1]
-        result = await self._request(
-            instructions, data,
-            _ReflexivePresentationResponse if frame.reflection else _PresentationResponse,
-            output_schema=_presentation_schema(frame),
-            output_example={
-                "text": _PROSE_PLACEHOLDER,
-                "focus_index": example_focus["focus_index"],
-                "expression_indices": example_expressions, "reinterprets_indices": [],
-            }, repair=repair,
-        )
+        return (instructions, data,
+                _ReflexivePresentationResponseV2 if _v2(frame) else
+                _ReflexivePresentationResponse if frame.reflection else _PresentationResponse,
+                {"output_schema": _presentation_schema(frame), "output_example": {
+                    "text": _PROSE_PLACEHOLDER, "focus_index": example_focus["focus_index"],
+                    "expression_indices": example_expressions, "reinterprets_indices": [],
+                }})
+
+    async def present(
+        self, frame: ReadingFrame, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[Presentation]:
+        # Preserve exactly the request's scopes, entry, history and selected methods
+        # while the asynchronous transport runs. Resolve all handles in this copy.
+        frame = frame.model_copy(deep=True)
+        instructions, data, schema, options = self._prepare_present(frame)
+        result = await self._request(instructions, data, schema, **options, repair=repair)
         wire = result.value.root
         usage = (result.input_tokens, result.output_tokens)
         references = compile_reading_references(
@@ -902,8 +991,13 @@ text 至多 {MAX_PRESENTATION_TEXT_CHARS} 字符；正文没有编号、方法�
         if frame.reflection is not None:
             segments |= {row["id"] for row in frame.reflection.objects}
             segments |= {row["id"] for row in frame.reflection.scopes}
+            segments |= {material.id for material in frame.reflection.materials}
         validate_presentation(frame, value, usage=(result.input_tokens, result.output_tokens))
         self._check_prose(
             value.text, positions | expressions | segments, usage=(result.input_tokens, result.output_tokens)
         )
+        if value.reflection is not None:
+            for response in value.reflection.responses:
+                self._check_prose(response.text, positions | expressions | segments,
+                                  usage=(result.input_tokens, result.output_tokens))
         return ModelResult(value, result.input_tokens, result.output_tokens)

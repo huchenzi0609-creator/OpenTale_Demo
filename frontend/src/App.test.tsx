@@ -1160,3 +1160,157 @@ describe("OpenTale workbench", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("view programs and local feedback", () => {
+  const catalogPath = "/api/runs/run-1/objects?scope_id=position%3Aa&query=";
+  beforeEach(() => {
+    withReflection();
+    snapshot.schema_version = 5;
+    snapshot.run.mode = "reflexive_v2";
+    const reflection = snapshot.reflection!;
+    reflection.methods[1].language_version = 2;
+    reflection.methods[1].program = { steps: [
+      { id: "source", op: "inspect", ref: { object_id: "method-base", mode: "live" } },
+      { id: "applied", op: "apply", method: "source" },
+    ], output: "applied" };
+    reflection.choices = reflection.choices.slice(-2).map((choice, index) => ({ ...choice,
+      input_fingerprint: "same-effective-input", plan_fingerprint: `plan-${index}`,
+      view: { material_ids: ["shared"], groups: [
+        { id: "outer", label: "回信中的经历", material_ids: [], children: [
+          { id: "inside", label: "未寄出的部分", material_ids: ["shared"], children: [] },
+        ] },
+      ], relations: [{ source: "outer", target: "inside", label: "重新理解" }] },
+    }));
+    reflection.responses = [{ id: "response-local", created_revision: 2, source_scope: "actor:b",
+      text: "这次组织让她重新看待那封回信。", about: ["method-revised"], evidence: ["choice-21"], visibility: "scope" }];
+    reflection.effects = [{ id: "effect-1", revision: 2, scope_id: "actor:b", stage: "propose", choice_id: "choice-21",
+      method_ids: ["method-revised"], before_fingerprint: "old-input", after_fingerprint: "same-effective-input",
+      changed: true, selected_added: ["new-material"], selected_removed: [], response_ids: ["response-local"] }];
+    requestOverrides[`GET ${catalogPath}`] = () => response({ scope_id: "position:a", query: "", total: 1,
+      objects: [{ id: "shared", kind: "expression", text: "一封信的预览…", preview_truncated: true }] });
+  });
+
+  it("creates the opt-in v2 mode while preserving classic and v1 options", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "＋ 创建实验" })).toBeEnabled());
+    const mode = screen.getByLabelText("新实验模式");
+    expect(within(mode).getAllByRole("option")).toHaveLength(3);
+    fireEvent.change(mode, { target: { value: "reflexive_v2" } });
+    fireEvent.click(screen.getByRole("button", { name: "＋ 创建实验" }));
+    expect(await screen.findByLabelText("当前实验模式")).toHaveTextContent("反身实验 v2");
+    const call = fetchMock.mock.calls.find(([url, options]) => url === "/api/runs" && options?.method === "POST");
+    expect(JSON.parse(call![1]!.body as string).mode).toBe("reflexive_v2");
+    expect(screen.getByRole("region", { name: "叙事正文" })).toHaveTextContent("她把回信放进了包里。");
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+  });
+
+  it("preserves nested view structure and distinguishes changed plans from unchanged model input", async () => {
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    await screen.findByText("一封信的预览…");
+    expect(screen.getByText("计划变化 · 实际输入未变")).toBeInTheDocument();
+    expect(screen.getAllByText("回信中的经历")).toHaveLength(4);
+    expect(screen.getAllByText("未寄出的部分")).toHaveLength(4);
+    expect(screen.getAllByText(/重新理解/)).toHaveLength(2);
+    expect(screen.getByText("查看方法定义 · 2 个操作")).toBeInTheDocument();
+    expect(screen.getByText("这次组织让她重新看待那封回信。")).toBeInTheDocument();
+    expect(screen.getByText("仅此叙事位置")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "执行后果" }));
+    expect(screen.getByText("new-material")).toBeInTheDocument();
+    expect(screen.queryByText("这次组织让她重新看待那封回信。")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /连续阅读/ }));
+    expect(screen.queryByText("same-effective-input")).not.toBeInTheDocument();
+  });
+
+  it("reads original full materials through the scoped endpoint without generating", async () => {
+    requestOverrides["GET /api/runs/run-1/object?scope_id=position%3Aa&object_id=shared"] = () => response({
+      scope_id: "position:a", object: { id: "shared", kind: "expression", text: "完整的信。\n第二段保留此前的关系。" },
+    });
+    requestOverrides["GET /api/runs/run-1/objects?scope_id=position%3Aa&query=%E6%97%A7%E4%BF%A1"] = () => response({
+      scope_id: "position:a", query: "旧信", total: 0, objects: [],
+    });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    await screen.findByText("一封信的预览…");
+    expect(screen.getByText(/预览已截断/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "读取完整对象 shared" }));
+    expect(await screen.findByText(/完整的信。/)).toHaveTextContent("第二段保留此前的关系。");
+    fireEvent.change(screen.getByLabelText("材料关键词"), { target: { value: "旧信" } });
+    fireEvent.click(screen.getByRole("button", { name: "检索材料" }));
+    expect(await screen.findByText(/未找到匹配的材料/)).toBeInTheDocument();
+    expect(screen.queryByText(/完整的信。/)).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+  });
+
+  it("discards an old scope's late full-object response after switching readers", async () => {
+    let resolveFull!: (value: Response) => void;
+    requestOverrides["GET /api/runs/run-1/object?scope_id=position%3Aa&object_id=shared"] = () => new Promise((resolve) => { resolveFull = resolve; });
+    requestOverrides["GET /api/runs/run-1/objects?scope_id=position%3Ab&query="] = () => response({
+      scope_id: "position:b", query: "", total: 0, objects: [],
+    });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    await screen.findByText("一封信的预览…");
+    fireEvent.click(screen.getByRole("button", { name: "读取完整对象 shared" }));
+    fireEvent.change(screen.getByLabelText("材料读取位置"), { target: { value: "position:b" } });
+    await screen.findByText(/未找到匹配的材料/);
+    await act(async () => { resolveFull(await response({ scope_id: "position:a", object: { id: "private", kind: "seed", text: "另一位置的旧请求全文" } })); });
+    expect(screen.queryByText("另一位置的旧请求全文")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("材料读取位置")).toHaveValue("position:b");
+  });
+
+  it("creates a pair of independent saved runs without running them or replacing the original", async () => {
+    requestOverrides["POST /api/runs/run-1/experiments"] = () => response({
+      control: { ...snapshot, run: { ...snapshot.run, id: "control-1", title: "对照实验" } },
+      intervention: { ...snapshot, run: { ...snapshot.run, id: "intervention-1", title: "干预实验" } },
+      manifest: { id: "pair-1", origin_run_id: "run-1", origin_revision: 2, origin_digest: "shared-checkpoint-digest",
+        scope_id: "actor:a", method_id: "method-revised", intervention: "release_method" },
+    });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    await screen.findByText("一封信的预览…");
+    fireEvent.click(screen.getByRole("button", { name: "创建配对实验（不调用模型）" }));
+    expect(await screen.findByText("两个分支已保存")).toBeInTheDocument();
+    expect(screen.getByLabelText("选择存档")).toHaveValue("run-1");
+    expect(screen.getByText("shared-checkpoint-digest")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "打开对照分支" })).toBeEnabled();
+    const call = fetchMock.mock.calls.find(([url]) => url.endsWith("/experiments"));
+    expect(JSON.parse(call![1]!.body as string)).toEqual({ scope_id: "actor:a", method_id: "method-revised" });
+    expect(fetchMock.mock.calls.some(([url]) => /\/(step|start|present)$/.test(url))).toBe(false);
+  });
+
+  it("shows request evidence and shadow decisions without rendering stored payloads", async () => {
+    snapshot.requests = [{ id: "request-1", stage: "propose", scope_id: "actor:a", input_world_revision: 2, policy_revision: 3,
+      frame_hash: "frame-hash", request_hash: "sent-request-hash", projection_version: "view-program-v2",
+      evidence_level: "exact_projection", attempts: [{ number: 1, status: "accepted", input_tokens: 80, output_tokens: 20 }],
+      accepted_result_hash: "accepted-result-hash" }];
+    Object.assign(snapshot.requests[0], { frame: { private_text: "raw-saved-frame-text" }, payload: "raw-request-body" });
+    snapshot.events.push({ id: "frozen-event", type: "request_frozen", revision: 2, at: "",
+      data: { frame_hash: "frozen-event-hash", frame: { private_text: "raw-saved-frame-text" }, projection: "raw-request-body" } });
+    snapshot.schedule = { epoch_id: "epoch-1", mode: "shadow", jobs: [{ key: "a-propose", stage: "propose", scope_id: "actor:a",
+      reason: "沿已有组织继续", changed: false, dependencies: ["shared"] }] };
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "验证与诊断" }));
+    expect(screen.getByRole("region", { name: "请求输入证据" })).toHaveTextContent("sent-request-hash");
+    expect(screen.getByText("精确投影")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "影子调度计划" })).toHaveTextContent("沿已有组织继续");
+    expect(screen.queryByText("raw-saved-frame-text")).not.toBeInTheDocument();
+    expect(screen.queryByText("raw-request-body")).not.toBeInTheDocument();
+    expect(screen.getByText(/frozen-event-hash/)).toBeInTheDocument();
+  });
+
+  it("shows a queued release during recovery without claiming the method was already removed", async () => {
+    snapshot.run.status = "error";
+    snapshot.pending = { base_revision: 2, proposals: {}, realizations: {}, committed: false };
+    requestOverrides["POST /api/runs/run-1/reflection/release"] = () => response({ ...snapshot,
+      pending: { ...snapshot.pending, deferred_releases: [{ scope_id: "actor:a", method_id: "method-revised" }] } });
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "生成方法与实际选择" }));
+    await screen.findByText("一封信的预览…");
+    fireEvent.click(screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" }));
+    expect(await screen.findByText(/停止采用已排队，将在当前恢复窗口完成后生效/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "停止采用 倒转回信顺序 · 写信人（actor:a）" })).toBeDisabled();
+    expect(screen.getByText("已排队停止采用")).toBeInTheDocument();
+    expect(screen.queryByText(/已停止在所选作用域采用此方法/)).not.toBeInTheDocument();
+  });
+});

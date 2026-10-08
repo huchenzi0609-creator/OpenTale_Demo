@@ -16,7 +16,7 @@ from pydantic import Field
 
 from .capacity import budget_bounds
 from .config import ConfigError, load_settings_with_diagnostics
-from .domain import Limits, Record
+from .domain import Limits, Record, Snapshot
 from .kernel import KernelError
 from .presets import PresetDefinition, PresetError, PresetLibrary, initialize
 from .providers import ProviderError
@@ -31,7 +31,7 @@ class CreateRun(Record):
     preset_id: str = Field(min_length=1, max_length=80)
     provider: str = "fixture"
     limits: Limits = Field(default_factory=Limits)
-    mode: Literal["classic", "reflexive"] = "classic"
+    mode: Literal["classic", "reflexive", "reflexive_v2"] = "classic"
 
 
 class AblateMethod(Record):
@@ -69,6 +69,21 @@ def safe_error(code: str, message: str, status: int, retryable: bool = False) ->
     )
 
 
+def snapshot_response(state: Snapshot):
+    """The workbench receives evidence summaries; full request material remains in explicit export."""
+    if state.run.mode != "reflexive_v2":
+        return state
+    data = state.model_dump(exclude={
+        "requests": {"__all__": {"frame": True, "attempts": {"__all__": {"projection"}}}},
+        "reflection": {"object_versions"},
+        "pending": {"proposal_frames", "realization_frames", "reading_frames"},
+        "events": True,
+    })
+    hidden = {"frame", "frames", "proposal_frames", "realization_frames", "reading_frames", "reflection_frame", "initial"}
+    data["events"] = [event.model_dump(exclude={"data": hidden}) for event in state.events]
+    return data
+
+
 def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAPI:
     config_root = root or Path(os.environ.get("OPENTALE_ROOT", PROJECT_ROOT))
     directory = data_dir or Path(os.environ.get("OPENTALE_DATA_DIR", PROJECT_ROOT / "runtime"))
@@ -83,7 +98,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
         yield
         await runner.shutdown()
 
-    app = FastAPI(title="OpenTale", version="0.4.1", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="OpenTale", version="0.5.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.root = store, runner, config_root
     app.state.presets = library
 
@@ -158,7 +173,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.4.1"}
+        return {"ok": True, "version": "0.5.0"}
 
     @app.get("/api/config")
     async def config():
@@ -218,7 +233,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
             raise KernelError("PRIVATE_DATA_REJECTED", "请先在本地移除预设中误填的配置内容。")
         state = initialize(preset, body.provider, body.limits, body.mode)
         store.save(state)
-        return state
+        return snapshot_response(state)
 
     @app.get("/api/runs")
     async def runs():
@@ -226,7 +241,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/runs/{run_id}")
     async def snapshot(run_id: str):
-        return store.load(run_id)
+        return snapshot_response(store.load(run_id))
 
     @app.get("/api/runs/{run_id}/reflection")
     async def reflection(run_id: str):
@@ -239,6 +254,72 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
             "note": "程序层面的实际选择与方法版本；不包含CoT，也不证明真实模型已经产生叙事意图。",
         }
 
+    def visible_objects(run_id: str, scope_id: str):
+        from .reflection import objects_for, position_scope, reading_scope
+
+        state = store.load(run_id)
+        allowed = {position_scope(position.id) for position in state.positions}
+        allowed |= {reading_scope(track.id) for track in state.reading_tracks}
+        if state.reflection is None or scope_id not in allowed:
+            raise KernelError("METHOD_SCOPE_INVALID", "请选择当前反身实验中的有效位置或阅读。")
+        return objects_for(state, scope_id)
+
+    @app.get("/api/runs/{run_id}/objects")
+    async def objects(run_id: str, scope_id: str, query: str = ""):
+        catalog = visible_objects(run_id, scope_id)
+        from .retrieval import retrieve
+
+        if query.strip():
+            # Query uses the same deterministic, permission-filtered full-material index as methods.
+            found = retrieve(catalog, query)
+            rows = [catalog[ref] for ref in found]
+        else:
+            rows = list(catalog.values())
+        previews = [{**{key: row[key] for key in ("id", "kind", "title", "role", "version", "language_version")
+                       if key in row}, "text": row.get("text", "")[:800],
+                     "preview_truncated": len(row.get("text", "")) > 800} for row in rows]
+        return {"scope_id": scope_id, "query": query, "objects": previews, "total": len(rows)}
+
+    @app.get("/api/runs/{run_id}/object")
+    async def full_object(run_id: str, scope_id: str, object_id: str):
+        catalog = visible_objects(run_id, scope_id)
+        if object_id not in catalog:
+            raise KernelError("METHOD_INPUT_UNAVAILABLE", "该对象在此位置不可读取。")
+        return {"scope_id": scope_id, "object": catalog[object_id]}
+
+    @app.post("/api/runs/{run_id}/experiments")
+    async def paired_experiment(run_id: str, body: AblateMethod):
+        from uuid import uuid4
+
+        from .kernel import fingerprint, semantic_projection
+        from .request_evidence import execution_signature
+
+        original = runner._stable(run_id)
+        if original.run.mode != "reflexive_v2" or original.pending is not None:
+            raise KernelError("EXPERIMENT_NOT_READY", "请从新版反身实验已完成的窗口建立对照。")
+        if original.reflection is None or body.method_id not in original.reflection.adoptions.get(body.scope_id, []):
+            raise KernelError("METHOD_REFERENCE_INVALID", "请选择当前已采用的方法建立对照。")
+        manifest = {
+            "id": uuid4().hex, "origin_run_id": run_id, "origin_revision": original.run.revision,
+            "origin_digest": fingerprint(semantic_projection(original)),
+            "policy_revision": original.policy_revision,
+            "scope_id": body.scope_id, "method_id": body.method_id,
+            "intervention": "release_method", "compiler_version": "views-v2",
+            "model": runner.settings.model if original.run.provider == "deepseek" else "fixture",
+            "max_output_tokens": runner.settings.max_output_tokens,
+            "execution_signature": execution_signature(original.run.provider, runner.settings),
+            "ancestor_usage": original.run.usage.model_dump(),
+            "note": "共同恢复点与首次干预已固定；后续轨迹允许分化，单次文本差异不证明语义因果。",
+        }
+        control = store.fork(run_id, f"{original.run.title} · 对照")
+        intervention = store.fork(run_id, f"{original.run.title} · 方法撤去")
+        control.experiment = {**manifest, "arm": "control"}
+        intervention.experiment = {**manifest, "arm": "intervention"}
+        runner.event(control, "experiment_created", manifest=control.experiment)
+        runner.event(intervention, "experiment_created", manifest=intervention.experiment)
+        intervention = runner.release_method(intervention.run.id, body.scope_id, body.method_id)
+        return {"control": snapshot_response(control), "intervention": snapshot_response(intervention), "manifest": manifest}
+
     @app.post("/api/runs/{run_id}/reflection/ablate")
     async def ablate(run_id: str, body: AblateMethod):
         from .reflection import ablate_method
@@ -250,37 +331,37 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.post("/api/runs/{run_id}/reflection/release")
     async def release_method(run_id: str, body: AblateMethod):
-        return runner.release_method(run_id, body.scope_id, body.method_id)
+        return snapshot_response(runner.release_method(run_id, body.scope_id, body.method_id))
 
     @app.patch("/api/runs/{run_id}/limits")
     async def update_limits(run_id: str, body: Limits):
-        return runner.update_limits(run_id, body)
+        return snapshot_response(runner.update_limits(run_id, body))
 
     @app.post("/api/runs/{run_id}/readings")
     async def create_reading(run_id: str, body: CreateReading):
         if contains_credential(body.model_dump(), runner.settings.api_key.get_secret_value()):
             raise KernelError("PRIVATE_DATA_REJECTED", "密钥只能填写到本机配置文件，不能用于阅读配置。")
-        return runner.add_reading(run_id, body.title, body.start_position_id, body.enabled)
+        return snapshot_response(runner.add_reading(run_id, body.title, body.start_position_id, body.enabled))
 
     @app.patch("/api/runs/{run_id}/readings/{reading_id}")
     async def configure_reading(run_id: str, reading_id: str, body: ConfigureReading):
-        return runner.set_reading_enabled(run_id, reading_id, body.enabled)
+        return snapshot_response(runner.set_reading_enabled(run_id, reading_id, body.enabled))
 
     @app.post("/api/runs/{run_id}/readings/{reading_id}/present")
     async def present_reading(run_id: str, reading_id: str):
-        return await runner.present_reading(run_id, reading_id)
+        return snapshot_response(await runner.present_reading(run_id, reading_id))
 
     @app.post("/api/runs/{run_id}/step")
     async def step(run_id: str):
-        return await runner.step(run_id)
+        return snapshot_response(await runner.step(run_id))
 
     @app.post("/api/runs/{run_id}/start")
     async def start(run_id: str):
-        return await runner.start(run_id)
+        return snapshot_response(await runner.start(run_id))
 
     @app.post("/api/runs/{run_id}/pause")
     async def pause(run_id: str):
-        return runner.pause(run_id)
+        return snapshot_response(runner.pause(run_id))
 
     @app.post("/api/runs/{run_id}/fork")
     async def fork(run_id: str, body: ForkRun):
@@ -288,7 +369,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
             raise KernelError("RUN_BUSY", "请先暂停，再从稳定阶段建立分支。")
         state = store.fork(run_id, body.title, limits=body.limits)
         runner.event(state, "forked", from_run_id=run_id)
-        return state
+        return snapshot_response(state)
 
     @app.delete("/api/runs/{run_id}")
     async def delete(run_id: str):

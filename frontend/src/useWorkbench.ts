@@ -7,6 +7,7 @@ import type {
   Counterfactual,
   ExperimentMode,
   FiniteLimits,
+  InterventionPair,
   Limits,
   Preset,
   PresetCatalog,
@@ -57,6 +58,7 @@ export function useWorkbench() {
     null,
   );
   const [reflectionAblation, setReflectionAblation] = useState<ReflectionAblation | null>(null);
+  const [interventionPair, setInterventionPair] = useState<InterventionPair | null>(null);
   const [counterSource, setCounterSource] = useState("");
   const [deleteArmed, setDeleteArmed] = useState(false);
   const selection = useRef(0);
@@ -76,10 +78,11 @@ export function useWorkbench() {
 
   useEffect(() => {
     setReflectionAblation(null);
+    setInterventionPair(null);
   }, [snapshot?.run.id, snapshot?.run.revision]);
 
   useEffect(() => {
-    if (snapshot?.run.mode !== "reflexive" && tab === "reflection") setTab("story");
+    if (snapshot?.run.mode !== "reflexive" && snapshot?.run.mode !== "reflexive_v2" && tab === "reflection") setTab("story");
   }, [snapshot?.run.mode, tab]);
 
   useEffect(() => {
@@ -420,7 +423,7 @@ export function useWorkbench() {
       );
     });
   const ablateReflection = (scopeId: string, methodId: string) => {
-    if (!snapshot || frozen || snapshot.pending || snapshot.run.mode !== "reflexive"
+    if (!snapshot || frozen || snapshot.pending || (snapshot.run.mode !== "reflexive" && snapshot.run.mode !== "reflexive_v2")
       || !snapshot.reflection?.adoptions[scopeId]?.includes(methodId)) return;
     setReflectionAblation(null);
     return perform("方法离线消融", async () => {
@@ -431,14 +434,30 @@ export function useWorkbench() {
     });
   };
   const releaseReflection = (scopeId: string, methodId: string) => {
-    if (!snapshot || frozen || snapshot.run.mode !== "reflexive"
+    if (!snapshot || frozen || (snapshot.run.mode !== "reflexive" && snapshot.run.mode !== "reflexive_v2")
       || !snapshot.reflection?.adoptions[scopeId]?.includes(methodId)) return;
     const id = snapshot.run.id;
     setReflectionAblation(null);
     return perform("停止采用方法", async () => {
-      adopt(await post<Snapshot>(`/runs/${encodeURIComponent(id)}/reflection/release`,
-        { scope_id: scopeId, method_id: methodId }));
-      setNotice("已停止在所选作用域采用此方法；只改变后续采用关系，已冻结的调用输入保留。模型可以再次采用此方法；未调用模型。");
+      const next = await post<Snapshot>(`/runs/${encodeURIComponent(id)}/reflection/release`,
+        { scope_id: scopeId, method_id: methodId });
+      adopt(next);
+      const queued = next.pending?.deferred_releases?.some((release) => release.scope_id === scopeId && release.method_id === methodId);
+      setNotice(queued
+        ? "停止采用已排队，将在当前恢复窗口完成后生效。当前采用关系和已冻结输入保留；未调用模型。"
+        : "已停止在所选作用域采用此方法；只改变后续采用关系，已冻结的调用输入保留。模型可以再次采用此方法；未调用模型。");
+    });
+  };
+  const createInterventionPair = (scopeId: string, methodId: string) => {
+    if (!snapshot || frozen || snapshot.pending || snapshot.run.mode !== "reflexive_v2"
+      || !snapshot.reflection?.adoptions[scopeId]?.includes(methodId)) return;
+    setInterventionPair(null);
+    return perform("创建配对实验", async () => {
+      const pair = await post<InterventionPair>(`/runs/${encodeURIComponent(snapshot.run.id)}/experiments`,
+        { scope_id: scopeId, method_id: methodId });
+      setInterventionPair(pair);
+      await refreshLibrary();
+      setNotice("已从同一恢复点创建对照与干预存档。原实验保留，两个分支尚未运行，未调用模型。");
     });
   };
   const reloadLibrary = () => perform("刷新列表", refreshLibrary);
@@ -493,6 +512,7 @@ export function useWorkbench() {
     counterfactual,
     reflectionAblation,
     setReflectionAblation,
+    interventionPair,
     replayVerification,
     counterSource,
     setCounterSource,
@@ -522,6 +542,7 @@ export function useWorkbench() {
     replay,
     ablateReflection,
     releaseReflection,
+    createInterventionPair,
     reloadLibrary,
     reconnect,
     selectRun,

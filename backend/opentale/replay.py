@@ -18,6 +18,7 @@ def replay(events: list[Event]) -> Snapshot:
     initial = next(event for event in events if event.type == "created")
     state = Snapshot.model_validate(initial.data["initial"])
     actor_frames: dict[str, GenerationFrame] = {}
+    proposal_frames: dict[str, GenerationFrame] = {}
     reader_frames: dict[str, ReadingFrame] = {}
     accepted_readings: dict[str, dict] = {}
     for event in events:
@@ -28,9 +29,32 @@ def replay(events: list[Event]) -> Snapshot:
             state.reading_tracks.append(track)
         elif event.type == "reading_enabled":
             reading_track_for(state, event.data["reading_id"]).enabled = event.data["enabled"]
+        elif event.type == "proposal_inputs_frozen":
+            for key, value in event.data["frames"].items():
+                frame = GenerationFrame.model_validate(value)
+                if frame != frame_for(state, key):
+                    raise ValueError("Proposal inputs do not match freeze-time state")
+                proposal_frames[key] = frame
+        elif event.type == "request_frozen":
+            if fingerprint(event.data["frame"]) != event.data["frame_hash"]:
+                raise ValueError("Request evidence hash mismatch")
+            if event.data["stage"] == "present":
+                reading_id = event.data["scope_id"].removeprefix("reading:")
+                frame = ReadingFrame.model_validate(event.data["frame"])
+                expected = reader_frames.get(reading_id) or reading_frame_for(state, reading_id)
+                if frame != expected:
+                    raise ValueError("Request input differs from frozen reader input")
+                reader_frames[reading_id] = frame
         elif event.type == "batch_installed":
             proposals = [Proposal.model_validate(p) for p in event.data["proposals"]]
-            state = install_batch(state, proposals, event.data["base_revision"])
+            frozen = None
+            if "proposal_frames" in event.data:
+                frozen = {key: GenerationFrame.model_validate(value)
+                          for key, value in event.data["proposal_frames"].items()}
+                if frozen != proposal_frames:
+                    raise ValueError("Installed proposals differ from original frozen inputs")
+            state = install_batch(state, proposals, event.data["base_revision"], proposal_frames=frozen)
+            proposal_frames = {}
             actor_frames = {}
             reader_frames = {}
             accepted_readings = {}
@@ -90,6 +114,8 @@ def replay(events: list[Event]) -> Snapshot:
             if state.reflection is None:
                 raise ValueError("Method release in classic evidence")
             state.reflection.adoptions[event.data["scope_id"]].remove(event.data["method_id"])
+            if state.run.mode == "reflexive_v2":
+                state.policy_revision += 1
     return state
 
 
@@ -98,6 +124,10 @@ def verify_replay(snapshot: Snapshot, events: list[Event]) -> dict:
         reconstructed = replay(events)
         expected, actual = semantic_projection(snapshot), semantic_projection(reconstructed)
         checks = [{"name": key, "passed": expected[key] == actual[key]} for key in expected]
+        if snapshot.run.mode == "reflexive_v2":
+            from .request_evidence import verify_request_evidence
+
+            checks.append({"name": "冻结请求与逐次尝试", "passed": verify_request_evidence(snapshot)})
         return {
             "ok": all(c["passed"] for c in checks),
             "digest": fingerprint(actual),

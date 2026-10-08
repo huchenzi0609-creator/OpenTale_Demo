@@ -1,5 +1,5 @@
 export type Provider = "fixture" | "deepseek";
-export type ExperimentMode = "classic" | "reflexive";
+export type ExperimentMode = "classic" | "reflexive" | "reflexive_v2";
 export interface SafeError {
   code: string;
   message: string;
@@ -105,7 +105,7 @@ export interface Event {
   data: Record<string, unknown>;
 }
 export interface Snapshot {
-  schema_version: 1 | 2 | 3 | 4;
+  schema_version: 1 | 2 | 3 | 4 | 5;
   run: Run;
   positions: Position[];
   expressions: Expression[];
@@ -116,18 +116,69 @@ export interface Snapshot {
   reading: ReadingState;
   reading_tracks?: ReadingTrack[];
   reflection?: ReflectionState | null;
+  requests?: RequestEvidence[];
+  schedule?: SchedulePlan | null;
   pending: null | {
     base_revision: number;
     proposals: Record<string, unknown>;
     realizations: Record<string, unknown>;
     committed: boolean;
     presentations?: Record<string, unknown>;
+    deferred_releases?: { scope_id: string; method_id: string }[];
   };
   audit: {
     shared_expressions: unknown[];
     effective_edges: unknown[];
     joint_targets: unknown[];
     last_batch: unknown[];
+  };
+}
+export interface RequestEvidence {
+  id: string;
+  stage: string;
+  scope_id: string;
+  input_world_revision: number;
+  policy_revision: number;
+  frame_hash: string;
+  request_hash: string | null;
+  projection_version: string;
+  evidence_level: "exact_projection" | "frame_only";
+  attempts: {
+    number: number; status: string; repair_category?: string;
+    input_tokens?: number; output_tokens?: number;
+  }[];
+  accepted_result_hash?: string | null;
+}
+export interface SchedulePlan {
+  epoch_id: string;
+  mode: "shadow";
+  jobs: {
+    key: string; stage: string; scope_id: string;
+    reason: string; changed: boolean; dependencies: string[];
+  }[];
+}
+export interface NarrativeObject {
+  id: string;
+  kind: string;
+  text?: string;
+  title?: string;
+  preview_truncated?: boolean;
+  view?: NarrativeView;
+  [field: string]: unknown;
+}
+export interface ObjectCatalog {
+  scope_id: string;
+  query: string;
+  objects: NarrativeObject[];
+  total: number;
+}
+export interface InterventionPair {
+  control: Snapshot;
+  intervention: Snapshot;
+  manifest: {
+    id: string; origin_run_id: string; origin_revision: number;
+    origin_digest: string; scope_id: string; method_id: string;
+    intervention: "release_method";
   };
 }
 export interface MethodRecord {
@@ -140,6 +191,39 @@ export interface MethodRecord {
   revises: string | null;
   created_revision: number;
   source_scope: string;
+  language_version?: 1 | 2;
+  program?: { steps: Record<string, unknown>[]; output: string } | null;
+}
+export interface ObjectRef {
+  object_id: string;
+  mode: "live" | "version";
+  version?: string | null;
+  start?: number | null;
+  end?: number | null;
+}
+export interface ViewGroup {
+  id: string;
+  label: string;
+  material_ids: string[];
+  children: ViewGroup[];
+}
+export interface NarrativeView {
+  groups: ViewGroup[];
+  relations: { source: string; target: string; label: string }[];
+  material_ids: string[];
+}
+export interface ViewRecord {
+  id: string; created_revision: number; scope_id: string; view: NarrativeView;
+}
+export interface ResponseRecord {
+  id: string; created_revision: number; source_scope: string; text: string;
+  about: string[]; evidence: string[]; visibility: "scope" | "shared";
+}
+export interface EffectRecord {
+  id: string; revision: number; scope_id: string; stage: string;
+  choice_id: string; method_ids: string[];
+  before_fingerprint: string | null; after_fingerprint: string; changed: boolean;
+  selected_added: string[]; selected_removed: string[]; response_ids: string[];
 }
 export interface SelectedMaterial {
   id: string;
@@ -159,11 +243,17 @@ export interface ChoiceRecord {
   groups: string[][];
   materials: SelectedMaterial[];
   input_fingerprint: string;
+  plan_fingerprint?: string;
+  view?: NarrativeView | null;
+  dependencies?: ObjectRef[];
 }
 export interface ReflectionState {
   methods: MethodRecord[];
   adoptions: Record<string, string[]>;
   choices: ChoiceRecord[];
+  views?: ViewRecord[];
+  responses?: ResponseRecord[];
+  effects?: EffectRecord[];
 }
 export interface ReflectionAblation {
   before_fingerprint: string;

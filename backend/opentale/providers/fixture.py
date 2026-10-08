@@ -5,11 +5,19 @@ from __future__ import annotations
 from collections import defaultdict
 
 from opentale.domain import GenerationFrame, Operation, Presentation, Proposal, ReadingFrame
-from opentale.reflection_types import AdoptionDraft, MethodDraft, ReflectionFrame, ReflectionProposal
+from opentale.policy_types import PolicyProgram
+from opentale.reflection_types import (
+    AdoptionDraft,
+    MethodDraft,
+    ReflectionFrame,
+    ReflectionProposal,
+    ResponseDraft,
+)
 
 from .base import ModelResult, ProviderError
 from .feedback import OutputFeedback
 from .reading import eligible_candidates, shared_expression_ids, validate_presentation
+from .reflection import materials_data, reflection_data, view_data
 
 
 def _shared_use(frame: GenerationFrame) -> dict:
@@ -74,6 +82,8 @@ def _fixture_method(
     frame: ReflectionFrame, scope_id: str, *, reading: bool = False, revision: int = 0,
 ) -> ReflectionProposal:
     """A scripted method evolution, deliberately not evidence of spontaneous intention."""
+    if frame.language_version == 2:
+        return _fixture_program(frame, scope_id, reading=reading)
     by_kind = {
         kind: [row for row in frame.objects if row["kind"] == kind]
         for kind in ("content", "choice", "method")
@@ -135,16 +145,136 @@ def _fixture_method(
     return ReflectionProposal(methods=[method], adoptions=[*releases, *adoptions])
 
 
+def _fixture_program(frame: ReflectionFrame, scope_id: str, *, reading: bool) -> ReflectionProposal:
+    """Execute inspect/revise/apply using a prior shared response as real input.
+
+    This deliberately scripted loop demonstrates mechanics. It performs no
+    semantic scoring and makes no claim about spontaneous narrative intention.
+    """
+    public = [row for row in frame.objects if not row.get("private_scope")]
+    contents = sorted((row for row in public if row["kind"] == "content"
+                       and row.get("role") != "主体背景" and not row["id"].startswith("surface:")),
+                      key=lambda row: row["id"])
+    if not contents:
+        raise ProviderError("FIXTURE_FRAME_INVALID", "离线程序示例需要可共同读取的材料。")
+    methods = [row for row in public if row["kind"] == "method"]
+    active = [row for row in methods if row["id"] in frame.active_methods]
+    old = sorted(active, key=lambda row: row["id"])[-1] if active else None
+    visible_methods = {row["id"] for row in methods}
+    responses = [row for row in public if row["kind"] == "response" and row.get("visibility") == "shared"
+                 and set(row.get("about", [])).intersection(visible_methods)]
+    response = responses[-1] if responses else None
+    primary = contents[0]
+    secondary = response or contents[min(1, len(contents) - 1)]
+    next_program = {
+        "steps": [
+            {"id": "experience", "op": "read", "refs": [{"object_id": primary["id"]}]},
+            {"id": "return", "op": "read", "refs": [{"object_id": secondary["id"]}]},
+            {"id": "continued", "op": "relate", "inputs": ["experience", "return"],
+             "relations": [{"source": "experience", "target": "return",
+                            "label": "组织后的局部回应参与继续" if response else "相邻经历共同进入"}]},
+        ], "output": "continued",
+    }
+    program = next_program
+    if old is not None:
+        # The replacement is a compact program. We inspect the actual prior
+        # definition, replace its body, then execute the revised definition.
+        program = {"steps": [
+            {"id": "prior", "op": "inspect", "ref": {"object_id": old["id"]}},
+            {"id": "changed", "op": "revise", "input": "prior", "patch": {
+                "program": next_program,
+                "instruction": "让这次返回的经验改变接下来关注的关系。"}},
+            {"id": "used", "op": "apply", "method": "changed"},
+        ], "output": "used"}
+    method = MethodDraft(
+        title="离线程序·阅读回流" if reading else "离线程序·关系续接",
+        instruction="沿实际选中的经历与回应继续，让关系落实为人物当前的生活。",
+        language_version=2, program=PolicyProgram.model_validate(program),
+        revises=old["id"] if old else None,
+    )
+    scopes = [scope_id]
+    if reading:
+        actor = next((row["id"] for row in frame.scopes if row["id"].startswith("position:")), None)
+        if actor:
+            scopes.append(actor)
+    releases = [AdoptionDraft(scope_id=scope_id, method_id=value, action="release")
+                for value in frame.active_methods if value in {row["id"] for row in frame.objects}
+                and value != method.revises]
+    local_responses = []
+    if old:
+        groups = len(frame.view.groups) if frame.view else len(frame.groups)
+        effects = [row for row in public if row["kind"] == "effect" and old["id"] in row.get("method_ids", [])]
+        effect = effects[-1] if effects else None
+        observation = effect["text"] if effect else f"{groups}组经历共同进入当前叙述。"
+        local_responses.append(ResponseDraft(
+            text=f"这次组织留下这样的经历：{observation}人物继续时，先前的经历与返回的理解可以互相改变。",
+            about=[old["id"], *([effect["id"]] if effect else [])],
+            evidence=[primary["id"], *([effect["id"]] if effect else [])], visibility="shared",
+        ))
+    return ReflectionProposal(methods=[method], responses=local_responses,
+                              adoptions=[*releases, *(AdoptionDraft(scope_id=scope, method_id="draft:0")
+                                                      for scope in scopes)])
+
+
 def _selected_life(frame: ReflectionFrame, name: str) -> str:
     # The exact selected snapshots and adopted instruction affect this deterministic surface.
     material = "。".join(value.text[:180] for value in frame.materials[:6])
     if not material:
         material = "她走到窗边，抬手摸了摸窗框"
     direction = frame.instruction[:160]
-    return f"{name}接续眼前的经历：{material}。" + (f"这些经历使她想到：{direction}。" if direction else "")
+    structure = ""
+    if frame.language_version == 2 and frame.view:
+        labels = [group.label for group in frame.view.groups if group.label]
+        labels.extend(relation.label for relation in frame.view.relations)
+        structure = "、".join(labels)[:160]
+    return (f"{name}接续眼前的经历：{material}。"
+            + (f"这些经历使她想到：{direction}。" if direction else "")
+            + (f"眼前的牵连逐渐清楚：{structure}。" if structure else ""))
 
 
 class FixtureProvider:
+    def request_projection(self, frame: GenerationFrame | ReadingFrame, method: str, *, repair=None) -> dict:
+        """Deterministic fixture inputs, safely separated from full resolver state."""
+        if method not in {"propose", "realize", "present"}:
+            raise ValueError("Unknown generation method")
+        result = {"provider": "fixture", "fixture_version": 2, "method": method,
+                  "revision": frame.revision}
+        if frame.reflection is not None:
+            result["reflection"] = reflection_data(frame.reflection) if method != "realize" else {
+                "materials": materials_data(frame.reflection), "view": view_data(frame.reflection),
+                "instruction": frame.reflection.instruction,
+            }
+        else:
+            if isinstance(frame, GenerationFrame):
+                result["frame"] = {
+                    "seed_text": frame.seed_text,
+                    "active_uses": [{key: row[key] for key in ("expression_id", "text", "role", "values")
+                                     if key in row} for row in frame.active_uses],
+                    "peers": [{"id": row["id"], "name": row["name"]} for row in frame.peers],
+                    "peer_interfaces": [{key: row[key] for key in ("position_id", "expression_id", "role")
+                                         if key in row} for row in frame.peer_interfaces],
+                }
+        if isinstance(frame, GenerationFrame):
+            result["name"] = frame.name
+        else:
+            result["reading"] = {
+                "candidates": [{"position_id": row["position_id"], "name": row["name"],
+                                "text": row["text"],
+                                "active_uses": [{key: use[key] for key in ("expression_id", "text", "role", "values")
+                                                 if key in use} for use in row.get("active_uses", [])]}
+                               for row in frame.candidates],
+                "previous_segments": [{key: row[key] for key in
+                                       ("id", "revision", "text", "focus_position_id", "expression_ids", "reinterprets")
+                                       if key in row} for row in frame.previous_segments],
+                "start_position_id": frame.start_position_id,
+                "required_focus_position_id": frame.required_focus_position_id,
+                "current_focus": frame.current_focus,
+                "open_relations": [{key: row[key] for key in
+                                    ("expression_id", "role", "position_id", "position_ids") if key in row}
+                                   for row in frame.open_relations],
+            }
+        return result
+
     """Deterministic fixtures intentionally expose the causal dependency in surface text."""
 
     async def propose(

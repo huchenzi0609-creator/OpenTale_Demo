@@ -2,6 +2,9 @@ import { useEffect, useState } from "react";
 import type { Snapshot } from "../types";
 import type { Workbench } from "../useWorkbench";
 import { readingTracks } from "../readings";
+import MaterialBrowser from "./MaterialBrowser";
+import NarrativeView from "./NarrativeView";
+import ReflectionConsequences from "./ReflectionConsequences";
 
 const PAGE_SIZE = 10;
 const STAGES = { propose: "构想", realize: "续延", present: "阅读" };
@@ -56,9 +59,12 @@ export default function ReflectionPanel({ snapshot, model }: {
     <section className="panel reflection-intro">
       <p className="eyebrow">REFLEXIVE / EXECUTABLE METHODS</p>
       <h2>方法与实际选择</h2>
-      <p className="helper">方法可以采用内容、已有方法与实际选择记录，改变后续输入。以下是软件执行证据，不是模型的内心推理；正文仍在“连续阅读”中独立呈现。</p>
+      <p className="helper">{snapshot.run.mode === "reflexive_v2"
+        ? "查看方法如何组织材料、形成视图，以及这些组织在其他位置产生的执行后果与局部回应。计划变化和实际输入变化分别记录；回应保留各自立场。"
+        : "方法可以采用内容、已有方法与实际选择记录，改变后续输入。"}以下是软件执行证据，不是模型的内心推理；正文仍在“连续阅读”中独立呈现。</p>
       {!reflection && <p className="helper" role="status">当前快照没有反身记录。已有正文仍可阅读；刷新存档后查看最新记录。</p>}
     </section>
+    {snapshot.run.mode === "reflexive_v2" && <MaterialBrowser snapshot={snapshot} />}
     <section className="panel" aria-label="已生成方法">
       <div className="section-header"><h2>方法版本</h2><span className="count-pill">{methods.length}</span></div>
       <p className="helper">方法版本保留原记录。修改关系与采用作用域分别显示，修改并不自动覆盖所有位置。暂停或技术错误后可停止某个作用域的采用，仅改变后续采用关系；已冻结的调用输入保留，模型可以再次采用。</p>
@@ -69,18 +75,23 @@ export default function ReflectionPanel({ snapshot, model }: {
           <dt>输入对象</dt><dd><code>{method.inputs.join(" → ")}</code></dd>
           <dt>排序与选材</dt><dd>{method.order === "reverse" ? "倒序" : "列出顺序"} · {method.limit === null ? "全部材料" : `最多 ${method.limit} 项`}</dd>
           <dt>修改关系</dt><dd>{method.revises ? <>修改 {methodName(method.revises)} <code>{method.revises}</code></> : "初始版本"}</dd>
+          {method.language_version === 2 && <><dt>执行语言</dt><dd>视图程序 v2</dd></>}
           <dt>创建作用域</dt><dd>{scopeName(method.source_scope)} <code>{method.source_scope}</code></dd>
           <dt>当前采用处</dt><dd>{Object.entries(reflection?.adoptions ?? {}).filter(([, ids]) => ids.includes(method.id)).length
             ? Object.entries(reflection?.adoptions ?? {}).filter(([, ids]) => ids.includes(method.id)).map(([id]) =>
               <div className="reflection-adoption" key={id}>
                 <span>{scopeName(id)}（{id}）</span>
-                <button className="text-button" disabled={frozen}
+                <button className="text-button" disabled={frozen || snapshot.pending?.deferred_releases?.some((release) => release.scope_id === id && release.method_id === method.id)}
                   aria-label={`停止采用 ${method.title} · ${scopeName(id)}（${id}）`}
                   onClick={() => void releaseReflection(id, method.id)}>
-                  {busy === "停止采用方法" ? "正在停止…" : "停止采用"}
+                  {snapshot.pending?.deferred_releases?.some((release) => release.scope_id === id && release.method_id === method.id)
+                    ? "已排队停止采用" : busy === "停止采用方法" ? "正在停止…" : "停止采用"}
                 </button>
               </div>) : "当前未被采用"}</dd>
         </dl>
+        {method.program && <details><summary>查看方法定义 · {method.program.steps.length} 个操作</summary>
+          <pre className="method-program">{JSON.stringify(method.program, null, 2)}</pre>
+        </details>}
       </details>)}
       {!methods.length && <p className="helper">尚未生成方法。执行窗口后查看创建与采用结果。</p>}
       <Pager page={methodPage} total={methods.length} label="方法" onChange={setMethodPage} />
@@ -88,7 +99,10 @@ export default function ReflectionPanel({ snapshot, model }: {
     <section className="panel" aria-label="实际选择历史">
       <div className="section-header"><h2>实际选择历史</h2><span className="count-pill">{choices.length}</span></div>
       <p className="helper">按最新记录在前排列，每页至多 {PAGE_SIZE} 条。指纹记录实际输入；变化不等于文学效果改善。</p>
-      {choices.slice(choicePage * PAGE_SIZE, (choicePage + 1) * PAGE_SIZE).map((choice) => <details className="reflection-record" key={choice.id}>
+      {choices.slice(choicePage * PAGE_SIZE, (choicePage + 1) * PAGE_SIZE).map((choice) => {
+        const index = choices.indexOf(choice);
+        const previous = choices.slice(index + 1).find((item) => item.scope_id === choice.scope_id && item.stage === choice.stage);
+        return <details className="reflection-record" key={choice.id}>
         <summary><strong>{scopeName(choice.scope_id)} · {STAGES[choice.stage]}</strong><small>R{choice.revision} · {choice.id}</small></summary>
         <dl className="reflection-fields">
           <dt>采用方法</dt><dd>{choice.methods.map((id) => `${methodName(id)}（${id}）`).join("、") || "默认材料选择"}</dd>
@@ -97,16 +111,29 @@ export default function ReflectionPanel({ snapshot, model }: {
           <dt>输入分组</dt><dd>{choice.groups.length ? choice.groups.map((group, index) =>
             <p key={index}>组 {index + 1}：<code>{group.join(" → ") || "空组"}</code></p>) : "默认分组"}</dd>
           <dt>输入指纹</dt><dd><code className="fingerprint">{choice.input_fingerprint}</code></dd>
+          {choice.plan_fingerprint && <>
+            <dt>计划指纹</dt><dd><code className="fingerprint">{choice.plan_fingerprint}</code></dd>
+            <dt>与同位置上次比较</dt><dd>{previous?.plan_fingerprint
+              ? `计划${previous.plan_fingerprint === choice.plan_fingerprint ? "未变" : "变化"} · 实际输入${previous.input_fingerprint === choice.input_fingerprint ? "未变" : "变化"}`
+              : "首次记录，尚无可比计划。"}</dd>
+          </>}
+          {!!choice.dependencies?.length && <><dt>冻结依赖</dt><dd>{choice.dependencies.map((ref, index) => <p key={index}>
+            <code>{ref.object_id}</code> · {ref.mode === "version" ? "固定版本" : "调用时解析"}
+            {ref.version && <code className="fingerprint">{ref.version}</code>}
+            {(ref.start != null || ref.end != null) && <span>范围 {ref.start ?? 0}—{ref.end ?? "末尾"}</span>}
+          </p>)}</dd></>}
         </dl>
+        {choice.view && <NarrativeView view={choice.view} />}
         <details><summary>查看冻结的输入材料（{choice.materials.length} 项）</summary>
           {choice.materials.map((material, index) => <div className="reflection-material" key={`${material.id}-${index}`}>
             <code>{material.id} · {material.role}</code><p>{material.text}</p>
           </div>)}
         </details>
-      </details>)}
+      </details>; })}
       {!choices.length && <p className="helper">尚无选择记录。记录由运行时根据实际输入生成。</p>}
       <Pager page={choicePage} total={choices.length} label="选择记录" onChange={setChoicePage} />
     </section>
+    {snapshot.run.mode === "reflexive_v2" && <ReflectionConsequences snapshot={snapshot} />}
     <section className="panel reflection-ablation" aria-label="方法离线消融">
       <h2>移除方法，输入会改变吗？</h2>
       <p className="helper">仅移除所选作用域当前采用的一项方法，在独立副本中比较输入。不会调用模型，也不会修改原存档。</p>
@@ -136,6 +163,28 @@ export default function ReflectionPanel({ snapshot, model }: {
           <dt>原始选择</dt><dd><code>{reflectionAblation.before_selected.join("、") || "无"}</code></dd>
           <dt>移除后选择</dt><dd><code>{reflectionAblation.after_selected.join("、") || "无"}</code></dd>
         </dl>
+      </div>}
+      {snapshot.run.mode === "reflexive_v2" && <div className="intervention-controls" aria-label="配对干预实验">
+        <h3>从同一恢复点继续比较</h3>
+        <p className="helper">保存两个独立实验：对照分支保留当前采用关系，干预分支停止所选位置采用所选方法。创建不调用模型，之后分别开始或单步。方法可在后续再次被采用；文本差异需要结合执行记录判断。</p>
+        <button className="button secondary" disabled={frozen || !!snapshot.pending || !scopeId || !methodId}
+          onClick={() => void model.createInterventionPair(scopeId, methodId)}>
+          {busy === "创建配对实验" ? "正在创建…" : "创建配对实验（不调用模型）"}
+        </button>
+        {model.interventionPair && <div className="counter-result" role="status">
+          <strong>两个分支已保存</strong>
+          <p className="helper">共同起点 R{model.interventionPair.manifest.origin_revision} · 仅干预分支停止指定采用。</p>
+          <div className="controls">
+            <button className="button secondary" disabled={frozen} onClick={() => void model.selectRun(model.interventionPair!.control.run.id)}>打开对照分支</button>
+            <button className="button secondary" disabled={frozen} onClick={() => void model.selectRun(model.interventionPair!.intervention.run.id)}>打开干预分支</button>
+          </div>
+          <details><summary>配对起点证据</summary><dl className="reflection-fields">
+            <dt>配对标识</dt><dd><code>{model.interventionPair.manifest.id}</code></dd>
+            <dt>起点摘要</dt><dd><code className="fingerprint">{model.interventionPair.manifest.origin_digest}</code></dd>
+            <dt>干预方法</dt><dd>{methodName(model.interventionPair.manifest.method_id)}</dd>
+            <dt>干预位置</dt><dd>{scopeName(model.interventionPair.manifest.scope_id)}</dd>
+          </dl></details>
+        </div>}
       </div>}
     </section>
   </div>;
