@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useWorkbench } from "./useWorkbench";
 import Sidebar from "./components/Sidebar";
 import StoryReader from "./components/StoryReader";
@@ -8,6 +8,7 @@ import Verification from "./components/Verification";
 import ReflectionPanel from "./components/ReflectionPanel";
 import { readingTracks } from "./readings";
 import { budgetText } from "./budgetLimits";
+import GrowthWorkbench from "./components/GrowthWorkbench";
 
 const STATUS: Record<string, string> = {
   idle: "待命",
@@ -25,6 +26,20 @@ const PHASE: Record<string, string> = {
 const number = (value: number) => new Intl.NumberFormat("zh-CN").format(value);
 
 export default function App() {
+  const [workspace, setWorkspace] = useState<"shared" | "growth">("shared");
+  const [growthOpened, setGrowthOpened] = useState(false);
+  return <>
+    <nav className="workspace-switch" aria-label="实验工作台模式">
+      <span>OPENTALE / EXPERIMENTS</span>
+      <button aria-pressed={workspace === "shared"} onClick={() => setWorkspace("shared")}>共同生成</button>
+      <button aria-pressed={workspace === "growth"} onClick={() => { setGrowthOpened(true); setWorkspace("growth"); }}>生长与遍历</button>
+    </nav>
+    <div hidden={workspace !== "shared"}><SharedWorkbench /></div>
+    {growthOpened && <div hidden={workspace !== "growth"}><GrowthWorkbench /></div>}
+  </>;
+}
+
+function SharedWorkbench() {
   const workbench = useWorkbench();
   const {
     snapshot,

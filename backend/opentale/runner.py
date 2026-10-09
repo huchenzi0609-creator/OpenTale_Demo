@@ -44,6 +44,9 @@ class Runner:
         task = self.tasks.get(run_id)
         return bool((task and not task.done()) or (run_id in self.locks and self.locks[run_id].locked()))
 
+    def any_busy(self) -> bool:
+        return any(self.busy(run_id) for run_id in self.tasks.keys() | self.locks.keys())
+
     def event(self, state: Snapshot, kind: str, **data: Any) -> None:
         state.events.append(Event(id=uuid4().hex, type=kind, revision=state.run.revision, data=data))
         self.store.save(state)

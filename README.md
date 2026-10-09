@@ -1,5 +1,20 @@
 # OpenTale Demo
 
+0.6.0 在 `experiment/growth-reading` 提供独立的 **生长与遍历** 工作台：叙事窗口可以分枝、交汇和重释，读轨沿实际节点和关系进行不完全访问，方法在试写、反馈、改版和再应用中持续使用。世界提交、工作动作和阅读序号分别推进。旧模式和旧档保持原有解释，详见[新模式说明](docs/GROWTH_READING.md)及[合同](docs/GROWTH_READING_CONTRACT.md)。
+
+独立启动新版：
+
+```sh
+.venv/bin/python scripts/dev.py build --profile growth
+.venv/bin/python scripts/dev.py detach --profile growth --port 8233
+```
+
+打开 `http://127.0.0.1:8233`，点击顶栏 **生长与遍历**。先使用“离线夹具”验证操作：填写窗口的长 Markdown、共同入口和可选方向，可以保存为窗口预设；创建实验后“生长一步”推进一个工作动作，试写经过明确发布才增加世界节点。选择节点创建多条阅读，分别单步或持续运行，点击“查看来源”核对原文和实际访问路线。同一世界版本可以多次阅读。
+
+数据在 `runtime/growth/data/`，其中新模式独立存放于 `growth/graph-runs.sqlite3`，窗口预设在 `growth/presets/`；旧 `runtime/` 和 `runtime/reflexive/` 数据不自动迁移。密钥仍仅由后端读取根目录 `.env.local`，无需复制。配置好模型后可以自行选择 DeepSeek；累计预算默认不设上限，调用及 Token 记录保留。持续任务等待新枝桠时不反复请求模型。
+
+离线验收：`.venv/bin/python scripts/verify_growth.py`。它验证方法闭环、分枝交汇、独立读轨、权限、分页和确定性内核重放，不加载密钥或消耗真实模型 Token。真实模型的意图与文学效果仍需单独采样评估。
+
 实验分支 `experiment/reflexive-generation` 的 0.5.0 新增“反身实验 v2”：有类型的方法程序保存嵌套视图，可以检查、改写和应用其他方法；局部回应及实际组织变化进入后续生成。完整材料检索、精确请求证据和配对干预可在网页操作。使用入口、执行机制与边界见 [v2 引擎说明](docs/V2_ENGINE.md)和[模型协议](docs/V2_PROVIDER.md)。经典模式仍为默认对照，旧反身模式按[原执行说明](docs/REFLEXIVE_EXPERIMENT.md)继续运行，旧存档不自动转换。
 
 0.5.1 为 v2 增加[上下文整理](docs/CONTEXT_COMPACTION.md)：共享重复文本和元信息，精简候选目录，必要时使用有原文范围的摘录；完整资料仍在存档中。单次整理软目标与实验累计预算独立，默认 96000 字符，无额外摘要 API 调用。旧恢复点保留已接受阶段，新版从缺失阶段继续。

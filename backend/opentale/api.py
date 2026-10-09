@@ -90,17 +90,24 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
     store = Store(directory)
     settings, configuration_diagnostics = load_settings_with_diagnostics(config_root)
     runner = Runner(store, settings)
+    from .growth_runner import GrowthRunner
+    growth_runner = GrowthRunner(directory / "growth", settings)
     library = PresetLibrary(PROJECT_ROOT / "presets", directory / "presets")
-    store.recover()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        store.recover()
+        growth_runner.recover()
         yield
         await runner.shutdown()
+        await growth_runner.shutdown()
 
-    app = FastAPI(title="OpenTale", version="0.5.2", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="OpenTale", version="0.6.0", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.root = store, runner, config_root
     app.state.presets = library
+    app.state.growth_runner = growth_runner
+    from .growth_api import register_graph_routes
+    register_graph_routes(app, growth_runner, library)
 
     @app.middleware("http")
     async def origin_and_size(request: Request, call_next):
@@ -122,7 +129,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
                 length = int(request.headers.get("content-length", "0"))
             except ValueError:
                 return safe_error("REQUEST_INVALID", "请求格式无效。", 400)
-            bound = 1048576 if request.url.path.startswith("/api/presets") else 65536
+            bound = 1048576 if request.url.path.startswith(("/api/presets", "/api/graph-presets", "/api/graph-runs")) else 65536
             if length < 0 or length > bound:
                 return safe_error("REQUEST_TOO_LARGE", "请求内容过大。", 413)
             if len(await request.body()) > bound:
@@ -139,7 +146,9 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.exception_handler(KernelError)
     async def kernel_error(_: Request, error: KernelError):
-        status = 409 if error.code in {"RUN_BUSY", "STALE_PROPOSAL"} else 422
+        status = 404 if error.code == "RUN_NOT_FOUND" else 409 if error.code in {
+            "RUN_BUSY", "STALE_PROPOSAL", "PRESET_CONFLICT", "SCOPE_CONFLICT"
+        } else 422
         return safe_error(error.code, error.message, status, error.retryable)
 
     @app.exception_handler(ProviderError)
@@ -173,7 +182,7 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True, "version": "0.5.2"}
+        return {"ok": True, "version": "0.6.0"}
 
     @app.get("/api/config")
     async def config():
@@ -185,11 +194,13 @@ def create_app(root: Path | None = None, data_dir: Path | None = None) -> FastAP
     @app.post("/api/config/reload")
     async def reload_config():
         nonlocal settings, configuration_diagnostics
-        if any(runner.busy(state.run.id) for state in store.list()):
+        if growth_runner.busy() or runner.any_busy():
             raise KernelError("RUN_BUSY", "请先暂停所有运行任务，再重新加载配置。")
         # Publish settings and their safe provenance from the same successful read.
         settings, configuration_diagnostics = load_settings_with_diagnostics(config_root)
         runner.settings = settings
+        growth_runner.settings = settings
+        app.state.graph_presets.credential = settings.api_key.get_secret_value()
         return {
             **settings.public(), "diagnostics": configuration_diagnostics,
             "budget_bounds": budget_bounds(),

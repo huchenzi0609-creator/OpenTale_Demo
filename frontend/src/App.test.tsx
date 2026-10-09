@@ -9,6 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { ReadingTrack, Segment, Snapshot } from "./types";
+import { growthFixture } from "./growthFixture";
 
 const fixture = (): Snapshot => ({
   schema_version: 1,
@@ -224,6 +225,26 @@ function withReflection() {
 }
 
 describe("reflexive experiment interface", () => {
+  it("opens growth only on request and preserves both workspaces when switching modes", async () => {
+    const graph = growthFixture();
+    requestOverrides["GET /api/graph-runs"] = () => response({ items: [] });
+    requestOverrides["GET /api/graph-presets"] = () => response({ presets: [] });
+    requestOverrides["POST /api/graph-runs"] = () => response(graph);
+    await createRun();
+    fireEvent.click(screen.getByRole("button", { name: "单步" }));
+    await screen.findByText("他拿起信，窗外的雨停了。");
+    expect(fetchMock.mock.calls.some(([url]) => url.startsWith("/api/graph-"))).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "生长与遍历" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "＋ 创建生长实验" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "＋ 创建生长实验" }));
+    await screen.findByRole("heading", { name: "图世界实验" });
+    fireEvent.click(screen.getByRole("button", { name: "共同生成" }));
+    expect(screen.getByRole("region", { name: "叙事正文" })).toHaveTextContent("他拿起信，窗外的雨停了。");
+    fireEvent.click(screen.getByRole("button", { name: "生长与遍历" }));
+    expect(screen.getByRole("heading", { name: "图世界实验" })).toBeInTheDocument();
+    expect(fetchMock.mock.calls.filter(([url, options]) => url === "/api/graph-runs" && options?.method === "POST")).toHaveLength(1);
+  });
+
   it("keeps legacy saves classic and allows selecting the opt-in mode for new runs only", async () => {
     await createRun();
     expect(screen.getByLabelText("新实验模式")).toHaveValue("classic");

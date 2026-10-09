@@ -31,8 +31,8 @@ class DevError(Exception):
 
 
 def state_path(profile: str | None = None) -> Path:
-    if profile not in {None, "reflexive"}:
-        raise DevError("运行配置无效；请省略 --profile 或使用 --profile reflexive。")
+    if profile not in {None, "reflexive", "growth"}:
+        raise DevError("运行配置无效；请省略 --profile 或使用 reflexive、growth。")
     return STATE if profile is None else ROOT / "runtime" / profile / "server-process.json"
 
 
@@ -236,7 +236,7 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["bootstrap", "build", "serve", "detach", "stop", "status", "_child"])
     parser.add_argument("--port", type=int, default=8231)
-    parser.add_argument("--profile", choices=["reflexive"],
+    parser.add_argument("--profile", choices=["reflexive", "growth"],
                         help="独立的实验进程、前端及数据目录；默认保留主服务目录。")
     parser.add_argument("--token", help=argparse.SUPPRESS)
     args = parser.parse_args()

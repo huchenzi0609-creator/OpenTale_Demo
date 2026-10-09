@@ -1,5 +1,14 @@
 # OpenTale Demo v0.5 — module contract
 
+## Opt-in growth and traversal engine v0.6
+
+`growth_reading` is a separate schema-6 runtime with method language 3 and indexed
+`graph-runs.sqlite3` storage. Legacy modes, frozen projections and schema 2–5 retain
+their interpreters. Narrative growth edges, generation dependencies and reading
+visits have separate contracts. See [growth and reading contract](GROWTH_READING_CONTRACT.md).
+New `/api/graph-runs` and `/api/graph-presets` routes do not replace `/api/runs`.
+Fixture validation and deterministic replay prove mechanisms, not literary semantics.
+
 ## Bounded context pages (v0.5.2)
 
 New v2 jobs use `provider-json-v3-bounded` and `source-pages-v1`. Version-1 and
