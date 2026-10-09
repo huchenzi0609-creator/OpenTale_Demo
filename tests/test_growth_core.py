@@ -55,6 +55,24 @@ def test_branches_multiple_parents_and_association_cycle(graph):
     assert initial.graph_commit == 0
 
 
+def test_first_visit_can_follow_declared_entry_edge_without_rendering_entry(graph):
+    store, state = graph
+    state = add_node(store, state, "a", "这段开端可以不呈现。", request_id="entry")
+    entry = state.windows["a"].working_node_id
+    state = add_node(store, state, "a", "读者沿着它进入另一段生活。", parents=[entry], request_id="child")
+    child = state.windows["a"].working_node_id
+    state.reading_tracks["r1"].entry_node_ids = [entry]
+    store.save(state)
+    link = next(link for link in store.list("g", "link") if link["target_id"] == child)
+    state = navigate(store, state, "r1", child, via_link_id=link["id"], transition="edge",
+                     observed_graph_commit=state.graph_commit, request_id="first-hop")
+    visit = store.list("g", "visit", scope_id="reading:r1")[0]
+    assert visit["from_node_id"] == entry and visit["node_id"] == child
+    assert state.reading_tracks["r1"].cursor_node_id == child
+    assert state.reading_tracks["r1"].read_seq == 1
+    assert not store.list("g", "passage", scope_id="reading:r1")
+
+
 def test_same_patch_local_ids_atomicity_and_no_growth_cycle(graph):
     store, initial = graph
     patch = GrowthPatch(id="two", window_id="a", base_graph_commit=0,

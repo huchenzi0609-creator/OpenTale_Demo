@@ -272,8 +272,12 @@ def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | N
         valid &= edge is None or type(edge) is str and edge in offered["edge"]
         if transition == "edge":
             links = [row for row in _visible_rows(frame, "link") if row.get("id") == edge]
-            valid &= bool(links) and any(args["node_id"] in {row.get("source_id"), row.get("target_id")}
-                                         for row in links)
+            cursor = frame.get("cursor")
+            if isinstance(cursor, dict):
+                cursor = cursor.get("node_id") or cursor.get("id")
+            origins = [cursor] if cursor else frame.get("entry_node_ids", [])
+            valid &= bool(links) and any({row.get("source_id"), row.get("target_id")} == {
+                origin, args["node_id"]} for row in links for origin in origins)
         elif edge is not None:
             valid = False
         if transition == "revisit":

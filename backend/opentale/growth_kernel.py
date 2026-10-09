@@ -316,11 +316,16 @@ def navigate(
             raise GrowthError("FUTURE_GRAPH", "读取图版本不存在。")
         scope = canonical_scope(current, f"reading:{track_key}")
         node = _node(store, current.run_id, node_id, scope, observed)
+        origin = track.cursor_node_id
         if via_link_id is not None:
             link = store.get(current.run_id, "link", via_link_id, at_commit=observed, scope_id=scope)
-            if link is None or track.cursor_node_id is None or {
+            if link is not None and origin is None:
+                origin = next((entry for entry in track.entry_node_ids if {
+                    link["source_id"], link["target_id"]
+                } == {entry, node_id}), None)
+            if link is None or origin is None or {
                 link["source_id"], link["target_id"]
-            } != {track.cursor_node_id, node_id}:
+            } != {origin, node_id}:
                 raise GrowthError("INVALID_TRAVERSAL", "此关系不能连接当前游标与目标节点。")
         elif track.cursor_node_id is None:
             if track.entry_node_ids and node_id not in track.entry_node_ids and not transition:
@@ -338,7 +343,7 @@ def navigate(
         visit = store.put(current.run_id, "visit", ReadVisit(
             id=object_id(current.run_id, action_id, "visit:0"), track_id=track_key,
             read_seq=track.read_seq + 1, node_id=node_id, node_version=node["version"],
-            observed_graph_commit=observed, from_node_id=track.cursor_node_id,
+            observed_graph_commit=observed, from_node_id=origin,
             via_link_id=via_link_id, transition=transition, source_spans=[span],
             private_scope=scope,
         ))
