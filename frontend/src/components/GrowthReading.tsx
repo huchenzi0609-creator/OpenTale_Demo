@@ -8,7 +8,7 @@ export function graphStatusText(status: string) {
   return ({ ready: "可继续", idle: "待命", calling: "模型正在工作", running: "持续运行中", waiting: "等待可读节点", paused: "已暂停", error: "需要恢复", budget_exhausted: "预算已用尽" } as Record<string, string>)[status] ?? "可继续";
 }
 export function graphActionText(action: string) {
-  return ({ ready: "准备开始", query: "已检索材料，可继续选择", read_page: "已读取原文片段", inspect: "已检查组织方法", apply: "已应用组织方法", revise: "已生成方法修订", adopt: "已采用组织方法", try_write: "候选已生成，等待评议与发布", publish: "候选已发布到图世界", respond: "已保存局部回应", navigate: "已进入节点，等待组织阅读", render: "已保存阅读正文", wait: "等待下一步条件" } as Record<string, string>)[action] ?? "工作进度已保存";
+  return ({ ready: "准备开始", query: "已检索材料，可继续选择", read_page: "已读取原文片段", inspect: "已检查组织方法", apply: "已应用组织方法", revise: "已生成方法修订", adopt: "已采用组织方法", try_write: "候选已生成，等待评议与发布", publish: "候选已发布到图世界", respond: "已保存局部回应", reflect: "已评议自身工作方法", navigate: "已进入节点，等待组织阅读", render: "已保存阅读正文", wait: "等待下一步条件" } as Record<string, string>)[action] ?? "工作进度已保存";
 }
 
 export default function GrowthReading({ snapshot, model, selectedId, onSelect, onInspect }: {

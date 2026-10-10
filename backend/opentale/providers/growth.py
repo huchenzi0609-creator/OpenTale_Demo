@@ -21,16 +21,24 @@ from opentale.capacity import (
     MAX_REALIZATION_TEXT_CHARS,
 )
 from opentale.config import Settings
+from opentale.growth_capabilities import (
+    KINDS,
+    CapabilityError,
+    capability_table,
+    collect_capabilities,
+    offered_ids,
+    resolve_handle,
+)
 from opentale.security import contains_credential
 
 from .base import ModelResult, ProviderError
 from .deepseek import DeepSeekProvider
 from .feedback import OutputFeedback
 
-GrowthStage = Literal["decide", "draft", "render"]
+GrowthStage = Literal["decide", "draft", "render", "review"]
 Action = Literal[
     "query", "read_page", "inspect", "apply", "revise", "adopt", "try_write",
-    "publish", "navigate", "render", "respond", "wait",
+    "publish", "navigate", "render", "respond", "reflect", "wait",
 ]
 PROJECTION_VERSION = "growth-pages-v1"
 
@@ -45,6 +53,10 @@ class GrowthProvider(Protocol):
     ) -> ModelResult[str]: ...
 
     async def render(
+        self, frame: dict, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[str]: ...
+
+    async def review(
         self, frame: dict, *, repair: OutputFeedback | None = None,
     ) -> ModelResult[str]: ...
 
@@ -72,16 +84,17 @@ class _Rendered(BaseModel):
 _ACTIONS = frozenset(_Decision.model_json_schema()["properties"]["action"]["enum"])
 _FIELDS = {
     "query": ({"query", "kind"}, {"query", "kind", "offset"}),
-    "read_page": ({"kind", "id"}, {"kind", "id", "start", "end"}),
-    "inspect": ({"method_id"}, {"method_id"}),
-    "apply": ({"method_id"}, {"method_id"}),
-    "adopt": ({"method_id"}, {"method_id"}),
-    "revise": ({"method_id", "instruction"}, {"method_id", "instruction", "input_ids", "purpose", "program"}),
+    "read_page": ({"kind", "id"}, {"kind", "id", "version", "start", "end"}),
+    "inspect": ({"method_id"}, {"method_id", "method_version"}),
+    "apply": ({"method_id"}, {"method_id", "method_version"}),
+    "adopt": ({"method_id"}, {"method_id", "method_version"}),
+    "revise": ({"method_id", "instruction"}, {"method_id", "method_version", "instruction", "input_ids", "input_refs", "purpose", "program"}),
     "try_write": ({"parent_ids"}, {"parent_ids", "direction"}),
-    "publish": ({"trial_id"}, {"trial_id", "parent_ids", "association_ids", "relation"}),
+    "publish": ({"trial_id"}, {"trial_id", "trial_version", "parent_ids", "association_ids", "relation"}),
     "navigate": ({"node_id"}, {"node_id", "edge_id", "transition", "start", "end"}),
     "render": ({"visit_ids"}, {"visit_ids"}),
-    "respond": ({"text"}, {"text", "about_ids", "evaluation_method_id"}),
+    "respond": ({"text"}, {"text", "about_ids", "about_refs", "evaluation_method_id", "evaluation_method_version"}),
+    "reflect": ({"method_id"}, {"method_id", "method_version", "about_ids", "about_refs", "purpose"}),
     "wait": (set(), {"reason"}),
 }
 _FRAME_FIELDS = frozenset({
@@ -93,7 +106,8 @@ _FRAME_FIELDS = frozenset({
     "observed_graph_commit", "evaluation_method", "window", "entries", "status",
     "parent_ids", "entry_node_ids", "catalog_page",
     "view", "method_evidence", "method_dependencies", "feedback_catalog", "response_page", "selected_node_ids",
-    "views", "method_work", "reading_work",
+    "views", "method_work", "reading_work", "capabilities", "method_execution", "method_cache",
+    "iteration_work", "work_protocol", "review_targets", "review_order", "purpose",
 })
 _PRIVATE_KEYS = frozenset({
     "api_key", "authorization", "Authorization", "base_url", "endpoint", "settings",
@@ -103,10 +117,13 @@ _PRIVATE_KEYS = frozenset({
 })
 
 
-def _invalid(*, usage: tuple[int, int] | None = None) -> ProviderError:
+def _invalid(*, usage: tuple[int, int] | None = None, field: str | None = None,
+             issue: str = "SCHEMA_INVALID") -> ProviderError:
     return ProviderError(
         "MODEL_OUTPUT_INVALID", "工作动作的字段或可用句柄无效，请依据当前目录重新选择。", True,
-        usage=usage, feedback=OutputFeedback("SCHEMA_VALIDATION", ("SCHEMA_INVALID",)),
+        usage=usage, feedback=OutputFeedback("SCHEMA_VALIDATION", (
+            *((f"{field}:schema_invalid",) if field else ()), issue,
+        )),
     )
 
 
@@ -140,45 +157,10 @@ def _visible_rows(frame: dict, kind: Literal["link", "view"]) -> list[dict]:
 
 
 def _offered(frame: dict) -> dict[str, set[str]]:
-    offered = {
-        "node": _ids(frame, "nodes") | _ids(frame, "sources"),
-        "method": _ids(frame, "methods"),
-        "trial": _ids(frame, "trials"),
-        "response": _ids(frame, "responses") | _ids(frame, "feedback_catalog"),
-        "visit": _ids(frame, "visits"),
-        "passage": _ids(frame, "reading_history"),
-        "edge": {row["id"] for row in _visible_rows(frame, "link") if type(row.get("id")) is str},
-        "view": {row["id"] for row in _visible_rows(frame, "view") if type(row.get("id")) is str},
-    }
-    offered["link"] = offered["edge"]
-    for link in _visible_rows(frame, "link"):
-        offered["node"].update(link[field] for field in ("source_id", "target_id") if type(link.get(field)) is str)
-    for view in _visible_rows(frame, "view"):
-        members = view.get("members", [])
-        if isinstance(members, list):
-            offered["node"].update(member["object_id"] for member in members if isinstance(member, dict)
-                                   and member.get("kind") == "node" and type(member.get("object_id")) is str)
-    for field, kind in (("method", "method"), ("evaluation_method", "method"), ("pending_trial", "trial")):
-        item = frame.get(field)
-        if isinstance(item, dict) and type(item.get("id")) is str:
-            offered[kind].add(item["id"])
-    for page in _catalog(frame, "pages"):
-        if page.get("kind") in offered and type(page.get("id")) is str:
-            offered[page["kind"]].add(page["id"])
-        if page.get("kind") in offered and isinstance(page.get("items"), list):
-            offered[page["kind"]].update(
-                item["id"] for item in page["items"] if isinstance(item, dict) and type(item.get("id")) is str
-            )
-        method = page.get("method")
-        if isinstance(method, dict) and type(method.get("id")) is str:
-            offered["method"].add(method["id"])
-    for name in ("method_evidence", "method_dependencies"):
-        for ref in _catalog(frame, name):
-            key = ref.get("id") or ref.get("object_id")
-            kind = ref.get("kind")
-            if type(kind) is str and kind in offered and type(key) is str:
-                offered[kind].add(key)
-    return offered
+    try:
+        return offered_ids(frame)
+    except CapabilityError:
+        raise ProviderError("GROWTH_FRAME_INVALID", "当前工作句柄目录格式无效。") from None
 
 
 def _string(value: object, *, maximum: int = 32_000) -> bool:
@@ -193,9 +175,42 @@ def _references(value: object, allowed: set[str], *, nonempty: bool = False) -> 
     )
 
 
-def _valid_program(program: object, nodes: set[str]) -> bool:
-    if type(program) is not dict or not program.keys() <= {"node_ids", "groups", "relations", "purpose"}:
+def _valid_exact_ref(ref: object, frame: dict, kind: str | None = None) -> bool:
+    if (type(ref) is not dict or set(ref) != {"kind", "object_id", "version"}
+            or type(ref["kind"]) is not str or ref["kind"] not in KINDS
+            or not _string(ref["object_id"]) or not _string(ref["version"])
+            or kind is not None and ref["kind"] != kind):
         return False
+    try:
+        resolve_handle(frame, ref["object_id"], ref["kind"], ref["version"])
+    except CapabilityError:
+        return False
+    return True
+
+
+def _valid_exact_refs(refs: object, frame: dict) -> bool:
+    return (type(refs) is list and len(refs) <= 256
+            and all(_valid_exact_ref(ref, frame) for ref in refs)
+            and len({(ref["kind"], ref["object_id"], ref["version"]) for ref in refs}) == len(refs))
+
+
+def _valid_program(program: object, frame: dict) -> bool:
+    nodes = _offered(frame)["node"]
+    if type(program) is not dict or not program.keys() <= {
+        "node_ids", "groups", "relations", "purpose", "inputs", "calls",
+    }:
+        return False
+    if "inputs" in program and not _valid_exact_refs(program["inputs"], frame):
+        return False
+    calls = program.get("calls", [])
+    if type(calls) is not list or len(calls) > 256:
+        return False
+    for call in calls:
+        if (type(call) is not dict or not {"method_ref"} <= call.keys()
+                or not call.keys() <= {"method_ref", "input_refs"}
+                or not _valid_exact_ref(call["method_ref"], frame, "method")
+                or not _valid_exact_refs(call.get("input_refs", []), frame)):
+            return False
     if "node_ids" in program and not _references(program["node_ids"], nodes):
         return False
     if "purpose" in program and not _string(program["purpose"], maximum=200):
@@ -228,6 +243,12 @@ def _complete_method(frame: dict, method_id: str) -> dict | None:
         return current
     for page in _catalog(frame, "pages"):
         method = page.get("method")
+        if isinstance(method, dict) and method.get("id") == method_id:
+            return method
+    cache = frame.get("method_cache", [])
+    if isinstance(cache, dict):
+        cache = cache.get("methods", [])
+    for method in cache if isinstance(cache, list) else []:
         if isinstance(method, dict) and method.get("id") == method_id:
             return method
     return None
@@ -276,27 +297,66 @@ def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | N
         if field in args:
             valid &= type(args[field]) is int and args[field] >= 0
     if "method_id" in args:
-        valid &= type(args["method_id"]) is str and args["method_id"] in offered["method"]
+        try:
+            if "method_version" in args and not _string(args["method_version"]):
+                raise _invalid(usage=usage, field="method_version")
+            resolve_handle(frame, args["method_id"], "method", args.get("method_version"))
+        except CapabilityError as exc:
+            raise _invalid(usage=usage, field="method_id", issue=exc.issue) from None
     if "evaluation_method_id" in args:
-        valid &= type(args["evaluation_method_id"]) is str and args["evaluation_method_id"] in offered["method"]
+        try:
+            if "evaluation_method_version" in args and not _string(args["evaluation_method_version"]):
+                raise _invalid(usage=usage, field="evaluation_method_version")
+            resolve_handle(frame, args["evaluation_method_id"], "method", args.get("evaluation_method_version"))
+        except CapabilityError as exc:
+            raise _invalid(usage=usage, field="evaluation_method_id", issue=exc.issue) from None
+    elif "evaluation_method_version" in args:
+        raise _invalid(usage=usage, field="evaluation_method_id")
     if "trial_id" in args:
-        valid &= type(args["trial_id"]) is str and args["trial_id"] in offered["trial"]
+        try:
+            if "trial_version" in args and not _string(args["trial_version"]):
+                raise _invalid(usage=usage, field="trial_version")
+            resolve_handle(frame, args["trial_id"], "trial", args.get("trial_version"))
+        except CapabilityError as exc:
+            raise _invalid(usage=usage, field="trial_id", issue=exc.issue) from None
     for field in ("parent_ids", "association_ids"):
         if field in args:
-            valid &= _references(args[field], offered["node"])
+            if not _references(args[field], offered["node"]):
+                raise _invalid(usage=usage, field=field)
+            for key in args[field]:
+                try:
+                    resolve_handle(frame, key, "node")
+                except CapabilityError as exc:
+                    raise _invalid(usage=usage, field=field, issue=exc.issue) from None
     for field in ("input_ids", "about_ids"):
         if field in args:
-            valid &= _references(args[field], all_ids)
+            if not _references(args[field], all_ids):
+                raise _invalid(usage=usage, field=field, issue="HANDLE_UNKNOWN")
+            for key in args[field]:
+                try:
+                    resolve_handle(frame, key)
+                except CapabilityError as exc:
+                    raise _invalid(usage=usage, field=field, issue=exc.issue) from None
+    for field in ("input_refs", "about_refs"):
+        if field in args and not _valid_exact_refs(args[field], frame):
+            raise _invalid(usage=usage, field=field)
     if "program" in args:
-        valid &= _valid_program(args["program"], offered["node"])
+        if not _valid_program(args["program"], frame):
+            raise _invalid(usage=usage, field="program")
     if action == "query":
-        valid &= args["kind"] in {"node", "method", "response", "link", "view"} if type(args["kind"]) is str else False
+        valid &= args["kind"] in KINDS if type(args["kind"]) is str else False
     elif action == "read_page":
         kind = args["kind"]
         valid &= (
-            type(kind) is str and kind in {"node", "method", "response", "trial", "link", "view"}
+            type(kind) is str and kind in KINDS
             and type(args["id"]) is str and args["id"] in offered[kind]
         )
+        try:
+            if "version" in args and not _string(args["version"]):
+                raise _invalid(usage=usage, field="version")
+            resolve_handle(frame, args["id"], kind, args.get("version"))
+        except CapabilityError as exc:
+            raise _invalid(usage=usage, field="id", issue=exc.issue) from None
         if "end" in args and type(args["end"]) is int and type(args.get("start", 0)) is int:
             valid &= args["end"] > args.get("start", 0)
     elif action == "navigate":
@@ -333,11 +393,9 @@ def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | N
         valid &= _references(args["visit_ids"], offered["visit"], nonempty=True)
     if not valid:
         raise _invalid(usage=usage)
-    if action == "revise" and not _revision_has_change(frame, args):
-        raise ProviderError(
-            "MODEL_OUTPUT_INVALID", "方法修订重复了已交付的指令与组织方式，请提出实际改变或继续采用原方法。", True,
-            usage=usage, feedback=OutputFeedback("SCHEMA_VALIDATION", ("instruction:schema_invalid",)),
-        )
+    # A repeated method is valid work, rather than broken JSON. The host reports
+    # a no-change receipt and can reuse the exact version; the next decision
+    # then works from that observation instead of retrying an impossible format.
     return copy.deepcopy(decision)
 
 
@@ -351,11 +409,12 @@ def _clean(value: object) -> object:
 
 def project_frame(frame: dict, stage: GrowthStage) -> dict:
     """Keep action-local data; full chosen sources and own feedback stay intact."""
-    if stage not in {"decide", "draft", "render"} or type(frame) is not dict:
+    if stage not in {"decide", "draft", "render", "review"} or type(frame) is not dict:
         raise ProviderError("GROWTH_FRAME_INVALID", "当前工作输入格式无效。")
     try:
         data = _clean({key: value for key, value in frame.items() if key in _FRAME_FIELDS})
         json.dumps(data, ensure_ascii=False, allow_nan=False)
+        data["capabilities"] = capability_table(data)
         _offered(data)
         actions = data.get("allowed_actions")
         if (type(actions) is not list or not actions
@@ -365,15 +424,15 @@ def project_frame(frame: dict, stage: GrowthStage) -> dict:
             raise ValueError("Invalid work observation")
     except (TypeError, ValueError, RecursionError):
         raise ProviderError("GROWTH_FRAME_INVALID", "当前工作输入格式无效。") from None
-    if stage in {"draft", "render"}:
+    if stage in {"draft", "render", "review"}:
         method = data.get("method")
         if not isinstance(method, dict) or not _string(method.get("id")) or not _string(method.get("version")):
             raise ProviderError("GROWTH_FRAME_INVALID", "试写或阅读需要已冻结的精确方法版本。")
         if not _string(method.get("instruction"), maximum=MAX_MODEL_REQUEST_CHARS):
             raise ProviderError("GROWTH_FRAME_INVALID", "当前采用方法的完整指令尚未交付。", True)
-        if not _catalog(data, "sources"):
+        if stage != "review" and not _catalog(data, "sources"):
             raise ProviderError("GROWTH_SOURCE_UNREAD", "先读取所选原文页面，再继续试写或阅读。", True)
-        for source in data["sources"]:
+        for source in _catalog(data, "sources"):
             if not _string(source.get("id")) or not _string(source.get("version")) or not _string(source.get("text"), maximum=MAX_MODEL_REQUEST_CHARS):
                 raise ProviderError("GROWTH_SOURCE_UNREAD", "所选原文页面尚未完整交付。", True)
     if stage == "render":
@@ -381,7 +440,8 @@ def project_frame(frame: dict, stage: GrowthStage) -> dict:
         # alternative global catalog from which to quietly invent a new story.
         data = {key: value for key, value in data.items() if key in {
             "scope_id", "role", "graph_commit", "work_seq", "direction", "allowed_actions", "method",
-            "sources", "source_spans", "visit_ids", "reading_history", "responses",
+            "sources", "source_spans", "visit_ids", "reading_history", "responses", "method_execution",
+            "method_evidence", "work_protocol",
         }}
     return data
 
@@ -432,6 +492,19 @@ respond 写明一个已发生的具体效果及值得检验的工作差异，abo
 它应继承有用经验，并提出可辨识的改变，避免重复通用口号、只换措辞或预定未来情节。
 input_ids 引用本次修订实际依据的节点、方法、试写或回应；也可把方法和对方法的回应当作材料，
 检查选择/评价方法本身怎样影响后续构造。方法可以继续成为其他方法的输入，层次由实际问题生长。
+capabilities 是宿主本轮交付的类型化精确句柄表。kind 区分节点、方法、试写、回应、访问、阅读、
+连接与组织。同一 ID 的多个版本或类型，用 input_refs/about_refs 的完整
+{kind,object_id,version} 引用；method_version 和 read_page.version 指定已交付版本。
+publish.trial_version 选择试写的精确版本；respond.about_refs 引用精确依据，
+evaluation_method_version 指定评议方法版本。多版本句柄据实际版本选择，形成可重放的工作。
+method_cache 标明已经完整交付的方法，可直接 apply、reflect 或组合调用，把读取用于新增材料。
+program.inputs 让方法、组织、结果与回应实际进入方法执行；program.calls 是声明式的嵌套调用，
+每项给出 method_ref 的精确方法引用及 input_refs。一次调用的输出可进入上层方法；层次来自
+实际组合执行。把改变选材、检验效果和改变检验方法本身落实为可执行的组合。
+reflect 使用 method_id 指定评议方法，about_ids/about_refs 指定实际评议对象；省略对象即评议
+该方法自身。宿主执行方法评议并保存公开工作回应。再次 reflect 上一次回应及其方法，可以
+检验评议方式怎样影响接下来的选择；在 iteration_work 提供的未评议结果上及时完成这一工作。
+review 是可检验的工作产物，写出已见效果、采用方式和可执行下一步，随后 revise/calls 可使用。
 revise 只保存候选；从返回收据找到候选，inspect 取得完整定义，可 apply 该候选执行组织并
 临时试用，再通过 try_write 或 navigate/render 比较实际效果。adopt 正式采用选定精确版本；
 采用决定与组织执行分别记录，采用后 apply 新版本的组织，再继续工作。检验后可继续修订、
@@ -461,6 +534,16 @@ groups 共享分组与 relations 结构关系；这些均引用当前可用节�
 阅读的经验变化，让路径选择形成意义，而不是一再复述原文的相同细节。
 直接返回 {"text":完整第三人称阅读正文}。
 """.strip(),
+    "review": """
+按 method 的精确版本、完整 instruction 及 method_execution 评议 method_evidence 的实际材料。
+review_targets 指定实际评议对象，review_order 记录此次评议在已执行对象关系中的阶位。
+材料可以是生活文本、方法、组织、试写、访问、阅读或以前的工作回应；以交付的真实文本、结构和
+范围为依据。先找出采用这套方式产生的具体效果，再提出下一次如何选择、组合或检验材料。
+当评议对象本身是方法或评议时，检查它采用了什么选择与判断，怎样使某些后果进入后续构造；
+让更高一层的判断改变实际工作方式。把评议写成可被其他方法继续调用的公开工作产物。
+具体指出已经发生的变化和可执行的差异。用正向、直接的工作描述展开判断，保留材料的局部范围。
+直接返回 {"text":完整公开工作判断及可执行下一步}。
+""".strip(),
 }
 
 
@@ -470,6 +553,7 @@ def _work_guidance(data: dict) -> str:
     last = receipts[-1].get("action") if receipts else None
     method_work = data.get("method_work") or {}
     reading_work = data.get("reading_work") or {}
+    iteration_work = data.get("iteration_work") or {}
     hints = []
     if data.get("role") == "reading":
         if reading_work.get("unrendered_visit_ids"):
@@ -479,7 +563,7 @@ def _work_guidance(data: dict) -> str:
     if method_work.get("bootstrap") and (method_work.get("recent_result_refs") or data.get("sources")):
         hints.append("当前仍采用初始通用方法。结合已见生活或实际结果，形成适用于本位置的具体做法，保存依据、修订并试用。")
     if method_work.get("candidate_refs"):
-        hints.append("已有当前未采用的方法候选。读取完整定义并比较它会怎样改变工作，再决定 adopt 或继续检验现用方法。")
+        hints.append("已有当前未采用的方法候选。method_cache 中已交付完整定义时直接比较并试用，再决定 adopt 或继续检验现用方法。")
     method = data.get("method") or {}
     active = ({"kind": "method", "object_id": method["id"], "version": method["version"]}
               if method.get("id") and method.get("version") else None)
@@ -489,13 +573,29 @@ def _work_guidance(data: dict) -> str:
     if method_work.get("pending_trial_unpublished"):
         hints.append("当前已有尚未发布的试写。先从实际结果形成评价、修订/试用方法或选择 publish，再展开下一次试写。")
     if last == "revise":
-        hints.append("刚保存了方法候选。查看收据里的新方法句柄，取得完整定义后可 apply 临时试用、比较效果，再决定 adopt 正式采用。")
+        details = receipts[-1].get("details") or {}
+        if details.get("changed") is False:
+            hints.append("上一次修订沿用了现有指令与组织，宿主复用了原版本。从实际反馈改变选材、组合调用或检验方式，使下一次差异可以观察。")
+        else:
+            hints.append("刚保存了方法候选。method_cache 中已有完整定义时可直接 apply 临时试用、比较效果，再决定 adopt 正式采用。")
     elif last == "adopt":
         hints.append("刚采用了方法版本。apply 执行其组织方式，再在实际写作或访问/阅读中检验这次改变。")
     elif last in {"try_write", "publish", "render", "navigate"}:
         hints.append("刚产生了实际结果。结合已见正文与反馈，识别本方法造成的具体差异；可先 respond 保存判断，再修订并检验下一种做法。")
     elif last == "respond":
         hints.append("刚保存了工作回应。若回应指出可操作的差异，用实际依据 revise；若当前方式仍有效，则继续检验它。")
+    elif last == "reflect":
+        hints.append("刚执行了一次方法评议。把其精确回应作为 program.inputs 或下一次 reflect 的对象，检验这次判断怎样改变方法的选择与执行。")
+    if iteration_work:
+        if iteration_work.get("unchanged_actions") or iteration_work.get("recent_no_change_count"):
+            hints.append("近期有工作未产生新的读取、组织或采用结果。复用 method_cache 与现有执行计划，将动作转向新材料、实际评议、方法修订或生活延展。")
+        if iteration_work.get("method_review_due"):
+            hints.append("当前方法与新结果已有可评议材料。reflect 执行评议，让这次具体效果进入下一次方法选择。")
+        if iteration_work.get("last_review_ref"):
+            hints.append("已有精确的工作评议。把评议及其判断方式作为下一次 reflect 对象，检验其标准对实际构造的影响，再形成可执行的变化。")
+        hints.append("formal_review_order 来自已执行的评议对象关系。program.calls 的实际嵌套层次记录在 method_execution；方法版本继承表示沿革。用已见效果发展这些工作。")
+    if data.get("method_execution"):
+        hints.append("method_execution 记录方法实际的嵌套执行、输入与挂起位置。依据这些实际差异组合下一次调用，让层次转化为材料选择、动作后果或阅读理解的改变。")
     if not hints:
         hints.append("从本位置的当前生活和已有工作结果选择下一步。方法也属于可继续读取、比较、修改和试用的材料。")
     return "\n".join(hints)
@@ -512,6 +612,18 @@ def _action_schema(frame: dict) -> dict:
         return {"type": "array", "items": {"type": "string", "enum": sorted(values)},
                 "uniqueItems": True, "minItems": int(nonempty), "maxItems": 256}
 
+    def exact_ref(kind: str | None = None) -> dict:
+        choices = [{"type": "object", "additionalProperties": False,
+                    "required": ["kind", "object_id", "version"],
+                    "properties": {"kind": {"const": cap.kind}, "object_id": {"const": cap.object_id},
+                                   "version": {"const": cap.version}}}
+                   for cap in collect_capabilities(frame) if cap.version is not None
+                   and (kind is None or cap.kind == kind)]
+        return {"oneOf": choices} if choices else {"type": "object", "not": {}}
+
+    exact_refs = {"type": "array", "items": {"$ref": "#/$defs/exactRef"},
+                  "uniqueItems": True, "maxItems": 256}
+
     options = []
     for action in sorted(_ACTIONS.intersection(frame.get("allowed_actions", _ACTIONS))):
         required, fields = _FIELDS[action]
@@ -521,6 +633,18 @@ def _action_schema(frame: dict) -> dict:
                 properties[field] = integer
             elif field in {"method_id", "evaluation_method_id"}:
                 properties[field] = {"type": "string", "enum": sorted(offered["method"])}
+            elif field == "method_version":
+                properties[field] = {"type": "string", "enum": sorted({cap.version for cap in
+                    collect_capabilities(frame) if cap.kind == "method" and cap.version is not None})}
+            elif field == "evaluation_method_version":
+                properties[field] = {"type": "string", "enum": sorted({cap.version for cap in
+                    collect_capabilities(frame) if cap.kind == "method" and cap.version is not None})}
+            elif field == "trial_version":
+                properties[field] = {"type": "string", "enum": sorted({cap.version for cap in
+                    collect_capabilities(frame) if cap.kind == "trial" and cap.version is not None})}
+            elif field == "version":
+                properties[field] = {"type": "string", "enum": sorted({cap.version for cap in
+                    collect_capabilities(frame) if cap.version is not None})}
             elif field == "trial_id":
                 properties[field] = {"type": "string", "enum": sorted(offered["trial"])}
             elif field == "node_id":
@@ -533,20 +657,26 @@ def _action_schema(frame: dict) -> dict:
                 properties[field] = refs(offered["node"])
             elif field in {"input_ids", "about_ids"}:
                 properties[field] = refs(set(all_ids))
+            elif field in {"input_refs", "about_refs"}:
+                properties[field] = exact_refs
             elif field == "transition":
                 properties[field] = {"type": "string", "enum": ["edge", "revisit", "entry"]}
             elif field == "kind":
-                properties[field] = {"type": "string", "enum": ["node", "method", "response", "link", "view"] +
-                                     (["trial"] if action == "read_page" else [])}
+                properties[field] = {"type": "string", "enum": sorted(KINDS)}
             elif field == "id":
-                properties[field] = {"type": "string", "enum": sorted(set().union(
-                    *(offered[kind] for kind in ("node", "method", "response", "trial", "link", "view"))))}
+                properties[field] = {"type": "string", "enum": all_ids}
             elif field == "program":
                 handle = {"type": "string", "enum": sorted(offered["node"])}
                 properties[field] = {
                     "type": "object", "additionalProperties": False,
                     "properties": {
                         "node_ids": refs(offered["node"]),
+                        "inputs": exact_refs,
+                        "calls": {"type": "array", "maxItems": 256, "items": {
+                            "type": "object", "additionalProperties": False, "required": ["method_ref"],
+                            "properties": {"method_ref": {"$ref": "#/$defs/methodRef"},
+                                           "input_refs": exact_refs},
+                        }},
                         "purpose": {**scalar, "maxLength": 200},
                         "groups": {"type": "object", "maxProperties": 64,
                                    "propertyNames": {"minLength": 1, "maxLength": 80},
@@ -568,7 +698,7 @@ def _action_schema(frame: dict) -> dict:
                 "properties": properties,
             }},
         })
-    return {"oneOf": options}
+    return {"oneOf": options, "$defs": {"exactRef": exact_ref(), "methodRef": exact_ref("method")}}
 
 
 class DeepSeekGrowthProvider(DeepSeekProvider):
@@ -613,7 +743,7 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
     @staticmethod
     def _prepare(frame: dict, stage: GrowthStage) -> tuple:
         data = project_frame(frame, stage)
-        schema = {"decide": _Decision, "draft": _Draft, "render": _Rendered}[stage]
+        schema = {"decide": _Decision, "draft": _Draft, "render": _Rendered, "review": _Rendered}[stage]
         shape = _action_schema(data) if stage == "decide" else schema.model_json_schema()
         return _INSTRUCTIONS[stage], data, schema, shape
 
@@ -630,7 +760,7 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
         value = validate_decision(data, result.value.model_dump(), usage=(result.input_tokens, result.output_tokens))
         return ModelResult(value, result.input_tokens, result.output_tokens)
 
-    async def _prose(self, frame: dict, stage: Literal["draft", "render"], repair) -> ModelResult[str]:
+    async def _prose(self, frame: dict, stage: Literal["draft", "render", "review"], repair) -> ModelResult[str]:
         instructions, data, schema, shape = self._prepare(frame, stage)
         result = await self._request(instructions, data, schema, output_schema=shape, repair=repair)
         text = result.value.text
@@ -652,6 +782,9 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
 
     async def render(self, frame: dict, *, repair: OutputFeedback | None = None) -> ModelResult[str]:
         return await self._prose(frame, "render", repair)
+
+    async def review(self, frame: dict, *, repair: OutputFeedback | None = None) -> ModelResult[str]:
+        return await self._prose(frame, "review", repair)
 
 
 class FixtureGrowthProvider:
@@ -759,6 +892,13 @@ class FixtureGrowthProvider:
     async def render(self, frame: dict, *, repair=None) -> ModelResult[str]:
         data = project_frame(frame, "render")
         return ModelResult("\n\n".join(item["text"] for item in data["sources"]))
+
+    async def review(self, frame: dict, *, repair=None) -> ModelResult[str]:
+        data = project_frame(frame, "review")
+        evidence = _catalog(data, "method_evidence")
+        cue = next((str(item.get("text", item.get("instruction", "")))[:80]
+                    for item in evidence if item.get("text") or item.get("instruction")), "本次交付的方法与实际结果")
+        return ModelResult(f"这次方法接住了{cue}。下一次把实际回应和改变选材的方式共同作为输入，检验两种去处怎样留下不同后果。")
 
 
 def make_growth_provider(mode: str, settings: Settings, client: httpx.AsyncClient | None = None) -> GrowthProvider:

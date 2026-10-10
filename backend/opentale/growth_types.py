@@ -270,3 +270,5 @@ class SharedView(Record):
     relations: list[dict[str, Any]] = Field(default_factory=list)
     occurrences: list[dict[str, Any]] = Field(default_factory=list)
     private_scope: str | None = None
+    input_refs: list[ObjectRef] = Field(default_factory=list)
+    execution: dict[str, Any] = Field(default_factory=dict)

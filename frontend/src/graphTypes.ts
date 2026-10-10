@@ -84,7 +84,18 @@ export interface GraphSession {
   work_seq: number;
   last_action: string;
   status: string;
-  error?: SafeError | null;
+  error?: (SafeError & { validation_feedback?: { category: string; issues: string[] } }) | null;
+  last_review_ref?: GraphObjectRef | null;
+  max_review_order?: number;
+  view?: {
+    execution?: {
+      max_call_depth?: number;
+      application_frames?: { status: "completed" | "reused" | "suspended"; [field: string]: unknown }[];
+      completed?: number | unknown[];
+      reused?: number | unknown[];
+      suspended?: number | unknown[];
+    };
+  } | null;
 }
 export interface GraphRecord {
   id: string;
@@ -104,6 +115,8 @@ export interface GraphRecord {
   parent_ref?: GraphObjectRef | null;
   source_refs?: GraphObjectRef[];
   evaluation_method_ref?: GraphObjectRef | null;
+  review_order?: number;
+  review_request_id?: string;
   source_spans?: GraphSourceSpan[];
   [field: string]: unknown;
 }

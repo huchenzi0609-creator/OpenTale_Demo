@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import GrowthWorkbench, { sourceTextParts } from "./components/GrowthWorkbench";
+import GrowthEvidence from "./components/GrowthEvidence";
 import { graphNeighborhood } from "./components/GraphNeighborhood";
 import { growthFixture } from "./growthFixture";
 import type { GraphPreset, GraphSnapshot, GraphSourceSpan } from "./graphTypes";
@@ -320,6 +321,116 @@ describe("growth and independent reading workbench", () => {
     fireEvent.click(screen.getByRole("button", { name: "载入更多记录" }));
     await waitFor(() => expect(current).toHaveTextContent("仍被采用的旧版本。"));
     expect(current).not.toHaveTextContent("该精确版本正文尚未载入");
+  });
+
+  it("shows real method inputs, calls and review execution separately from reading prose", async () => {
+    const method = { kind: "method", object_id: "recursive-method", version: "recursive-version" };
+    const review = { kind: "response", object_id: "actual-review", version: "review-version" };
+    snapshot.windows[0].method_ref = method;
+    snapshot.sessions = [{ id: "recursive-session", scope_id: "window:a", work_seq: 9, last_action: "reflect", status: "ready",
+      last_review_ref: review, max_review_order: 4, view: { execution: { max_call_depth: 3,
+        application_frames: [{ status: "completed" }, { status: "reused" }, { status: "completed" }, { status: "suspended" }] } } }];
+    snapshot.events = [{ id: "reflection-event", action: "reflect", graph_commit: 2, details: { scope_id: "window:a", work_seq: 9 } }];
+    overrides["GET /api/graph-runs/graph-1/methods?offset=0"] = () => json({ items: [{ id: method.object_id, version: method.version,
+      instruction: "比较选材方式造成的实际关系变化。", program: { inputs: [method, review], calls: [{ method_ref: method }], node_ids: ["node-grown"] } }] });
+    overrides["GET /api/graph-runs/graph-1/responses?offset=0"] = () => json({ items: [
+      { id: review.object_id, version: review.version, text: "重新评价上次用于选材的依据。", review_order: 3, review_request_id: "review-request", evaluation_method_ref: method },
+      { id: "legacy-response", text: "历史局部回应。", method_ref: method },
+    ] });
+    await create();
+    expect(screen.queryByText(/实际评议对象阶次/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "方法、试验与回应" }));
+    expect(await screen.findByText("实际评议对象阶次 3")).toBeInTheDocument();
+    expect(screen.getAllByText("通用输入 2 个 · 方法调用 1 次").length).toBeGreaterThan(0);
+    const responses = screen.getByRole("region", { name: "局部回应" });
+    const actual = within(responses).getByText("actual-review").closest("article")!;
+    expect(actual).toHaveTextContent("实际评议方法 recursive-method");
+    expect(actual).toHaveTextContent("实际评议对象阶次 3");
+    const legacy = within(responses).getByText("legacy-response").closest("article")!;
+    expect(legacy).not.toHaveTextContent("实际评议对象阶次");
+    expect(screen.getByRole("region", { name: "近期方法动作" })).toHaveTextContent("写信人 · 评议自身方法");
+    fireEvent.click(screen.getByRole("button", { name: "运行诊断" }));
+    const sessions = screen.getByRole("region", { name: "独立工作会话" });
+    expect(sessions).toHaveTextContent("最近实际评议 actual-review");
+    expect(sessions).toHaveTextContent("已观察最高评议对象阶次 4");
+    expect(sessions).toHaveTextContent("最大方法调用深度3完成调用2复用调用1暂挂调用1");
+    expect(sessions).toHaveTextContent("文本质量需结合实际阅读判断");
+    fireEvent.click(screen.getByRole("button", { name: "连续阅读" }));
+    expect(screen.queryByText(/实际评议对象阶次/)).not.toBeInTheDocument();
+    expect(screen.queryByText("通用输入 2 个 · 方法调用 1 次")).not.toBeInTheDocument();
+    expect(screen.queryByText("最近实际评议 actual-review")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(start|step)$/.test(url))).toBe(false);
+  });
+
+  it("keeps absent legacy review metrics distinct from an observed order of zero", async () => {
+    snapshot.sessions = [
+      { id: "legacy-session", scope_id: "window:a", work_seq: 1, last_action: "respond", status: "ready" },
+      { id: "zero-review-session", scope_id: "window:b", work_seq: 2, last_action: "reflect", status: "ready", max_review_order: 0,
+        view: { execution: { max_call_depth: 0, application_frames: [{ status: "completed" }] } } },
+    ];
+    await create();
+    fireEvent.click(screen.getByRole("button", { name: "运行诊断" }));
+    const sessions = screen.getByRole("region", { name: "独立工作会话" });
+    const legacy = within(sessions).getByText("window:a").closest(".growth-record")!;
+    expect(legacy).not.toHaveTextContent("已观察最高评议对象阶次");
+    expect(legacy).not.toHaveTextContent("最大方法调用深度");
+    const zero = within(sessions).getByText("window:b").closest(".growth-record")!;
+    expect(zero).toHaveTextContent("已观察最高评议对象阶次 0");
+    expect(zero).toHaveTextContent("最大方法调用深度0完成调用1复用调用0暂挂调用0");
+  });
+
+  it("shows safe field diagnostics for a failed session while preserving legacy errors", async () => {
+    snapshot.sessions = [
+      { id: "diagnostic-session", scope_id: "window:a", work_seq: 4, last_action: "respond", status: "error", error: Object.assign({
+        code: "MODEL_OUTPUT_INVALID", message: "工作动作字段无效。", retryable: true, validation_feedback: { category: "SCHEMA_VALIDATION", issues: ["args.id:handle_unavailable", "args.kind:schema_invalid"] },
+      }, { raw_error: "private-provider-body", rejected_value: "private-rejected-text" }) },
+      { id: "legacy-error-session", scope_id: "window:b", work_seq: 2, last_action: "read_page", status: "error", error: { code: "TARGET_UNKNOWN", message: "历史对象暂不可见。", retryable: true } },
+    ];
+    await create();
+    fireEvent.click(screen.getByRole("button", { name: "运行诊断" }));
+    const sessions = screen.getByRole("region", { name: "独立工作会话" });
+    const failed = within(sessions).getByText("window:a").closest(".growth-record")!;
+    expect(failed).toHaveTextContent("格式诊断 · SCHEMA_VALIDATION · args.id:handle_unavailable；args.kind:schema_invalid");
+    expect(failed).toHaveTextContent("工作动作字段无效。（MODEL_OUTPUT_INVALID）");
+    const legacy = within(sessions).getByText("window:b").closest(".growth-record")!;
+    expect(legacy).toHaveTextContent("历史对象暂不可见。（TARGET_UNKNOWN）");
+    expect(legacy).not.toHaveTextContent("格式诊断");
+    expect(screen.queryByText("private-provider-body")).not.toBeInTheDocument();
+    expect(screen.queryByText("private-rejected-text")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "连续阅读" }));
+    expect(screen.queryByText(/格式诊断/)).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(start|step)$/.test(url))).toBe(false);
+  });
+
+  it("refreshes evidence after a saved trial or automatic review without advancing the work sequence", async () => {
+    snapshot.responses = [];
+    snapshot.trials = [];
+    snapshot.sessions = [{ id: "pending-session", scope_id: "window:a", work_seq: 4, last_action: "respond", status: "ready" }];
+    const responsesUrl = "GET /api/graph-runs/graph-1/responses?offset=0";
+    const trialsUrl = "GET /api/graph-runs/graph-1/trials?offset=0";
+    overrides[responsesUrl] = () => json({ items: snapshot.responses, next_offset: null });
+    overrides[trialsUrl] = () => json({ items: snapshot.trials, next_offset: null });
+    const count = (path: string) => fetchMock.mock.calls.filter(([url]) => url === path.slice(4)).length;
+    const responseBefore = count(responsesUrl);
+    const trialBefore = count(trialsUrl);
+    const component = render(<GrowthEvidence snapshot={snapshot} />);
+    await screen.findByText("当前没有局部回应记录。");
+    const commit = snapshot.graph_commit;
+    snapshot = { ...snapshot, responses: [{ id: "automatic-review", version: "review-v1", text: "依据已完成的试写重新评价方法。", review_order: 1 }],
+      trials: [{ id: "saved-trial", version: "trial-v1", text: "刚完成并落盘的试写。" }],
+      sessions: [{ ...snapshot.sessions[0], last_review_ref: { kind: "response", object_id: "automatic-review", version: "review-v1" } }] };
+    component.rerender(<GrowthEvidence snapshot={snapshot} />);
+    expect(await screen.findByText("依据已完成的试写重新评价方法。")).toBeInTheDocument();
+    expect(await screen.findByText("刚完成并落盘的试写。")).toBeInTheDocument();
+    expect(snapshot.graph_commit).toBe(commit);
+    expect(snapshot.sessions[0].work_seq).toBe(4);
+    expect(count(responsesUrl)).toBe(responseBefore + 2);
+    expect(count(trialsUrl)).toBe(trialBefore + 2);
+    snapshot = { ...snapshot, run: { ...snapshot.run, usage: { ...snapshot.run.usage, calls: snapshot.run.usage.calls + 1 } } };
+    component.rerender(<GrowthEvidence snapshot={snapshot} />);
+    await act(async () => { await Promise.resolve(); });
+    expect(count(responsesUrl)).toBe(responseBefore + 2);
+    expect(count(trialsUrl)).toBe(trialBefore + 2);
   });
 
   it("distinguishes dynamic method selection from an explicit empty node selection", async () => {

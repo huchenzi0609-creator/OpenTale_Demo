@@ -167,7 +167,7 @@ def test_feedback_directory_reoffers_full_response_page_without_blanking_deliver
     assert projected["feedback_catalog"][1]["length"] == 7000
 
 
-def test_delivered_reading_history_is_method_evidence_without_becoming_world_node_or_page_capability():
+def test_delivered_reading_history_is_readable_evidence_without_becoming_world_node():
     current = frame("reading")
     current["reading_history"] = [{
         "id": "passage-a", "version": "passage-version-a", "text": "先前的阅读只跟着门前的脚步。",
@@ -182,14 +182,17 @@ def test_delivered_reading_history_is_method_evidence_without_becoming_world_nod
     ]:
         assert validate_decision(current, decision) == decision
     for decision in [
-        {"action": "read_page", "args": {"kind": "passage", "id": "passage-a"}},
-        {"action": "query", "args": {"kind": "passage", "query": "*"}},
         {"action": "navigate", "args": {"node_id": "passage-a", "transition": "entry"}},
         {"action": "revise", "args": {"method_id": "method-old", "instruction": "选另一枝。",
                                          "program": {"node_ids": ["passage-a"]}}},
     ]:
         with pytest.raises(ProviderError):
             validate_decision(current, decision)
+    for decision in [
+        {"action": "read_page", "args": {"kind": "passage", "id": "passage-a"}},
+        {"action": "query", "args": {"kind": "passage", "query": "*"}},
+    ]:
+        assert validate_decision(current, decision) == decision
     projection = DeepSeekGrowthProvider(Settings()).projection(current, "decide")
     body = json.loads(projection["messages"][1]["content"])
     assert body["reading_history"] == current["reading_history"]
@@ -262,7 +265,7 @@ def test_revision_program_and_feedback_criteria_only_use_offered_handles():
     assert "evaluation_method_id" in system and '"program"' in system and '"groups"' in system
 
 
-def test_exact_unchanged_revision_returns_safe_actionable_repair_without_new_evidence_masking_it():
+def test_unchanged_revision_is_valid_work_with_host_owned_nochange_detection():
     current = frame()
     current["method"]["program"] = {"node_ids": ["node-a"]}
     current["responses"] = [{"id": "response-a", "text": "同一结果仍然出现。"}]
@@ -270,25 +273,21 @@ def test_exact_unchanged_revision_returns_safe_actionable_repair_without_new_evi
         "method_id": "method-old", "instruction": current["method"]["instruction"],
         "input_ids": ["response-a"], "program": {"node_ids": ["node-a"]},
     }}
-    with pytest.raises(ProviderError) as captured:
-        validate_decision(current, decision, usage=(81, 23))
-    assert captured.value.code == "MODEL_OUTPUT_INVALID"
-    assert captured.value.retryable and captured.value.usage == (81, 23)
-    assert captured.value.feedback.prompt_data() == {
-        "category": "SCHEMA_VALIDATION", "issues": ["instruction:schema_invalid"],
-    }
-    assert "method-old" not in str(captured.value)
-    assert current["method"]["instruction"] not in str(captured.value)
+    assert validate_decision(current, decision, usage=(81, 23)) == decision
+    current["receipts"] = [{"action": "revise", "details": {"changed": False}}]
+    system = DeepSeekGrowthProvider(Settings()).projection(current, "decide")["messages"][0]["content"]
+    assert "宿主复用了原版本" in system
+    assert "改变选材、组合调用或检验方式" in system
 
 
-def test_node_evidence_cannot_mask_unchanged_explicit_selection():
+def test_node_evidence_preserves_unchanged_explicit_selection_for_host_review():
     current = frame()
     current["method"]["program"] = {"node_ids": ["node-a"]}
-    with pytest.raises(ProviderError):
-        validate_decision(current, {"action": "revise", "args": {
-            "method_id": "method-old", "instruction": current["method"]["instruction"],
-            "input_ids": ["node-b"], "program": {"node_ids": ["node-a"]},
-        }})
+    decision = {"action": "revise", "args": {
+        "method_id": "method-old", "instruction": current["method"]["instruction"],
+        "input_ids": ["node-b"], "program": {"node_ids": ["node-a"]},
+    }}
+    assert validate_decision(current, decision) == decision
 
 
 @pytest.mark.parametrize("change", [
@@ -313,8 +312,7 @@ def test_shortened_method_catalog_is_never_an_equality_witness_for_noop_revision
     decision = {"action": "revise", "args": {"method_id": "method-other", "instruction": "简介"}}
     assert validate_decision(current, decision) == decision
     current["pages"] = [{"method": {"id": "method-other", "version": "other-version", "instruction": "简介"}}]
-    with pytest.raises(ProviderError):
-        validate_decision(current, decision)
+    assert validate_decision(current, decision) == decision
 
 
 def test_method_iteration_prompt_reaches_model_with_real_evidence_and_reader_role():
@@ -409,36 +407,36 @@ async def test_grounded_refusal_and_denial_remain_valid_narrative(stage):
 
 @pytest.mark.parametrize("program", [{"node_ids": ["node-a"], "purpose": "回应仍然有效"},
                                     {"node_ids": ["node-a"], "groups": {"同一入口": ["node-a"]}}])
-def test_omitting_purpose_preserves_existing_method_goal_and_is_not_a_change(program):
+def test_omitting_purpose_preserves_existing_method_goal_for_host_comparison(program):
     current = frame()
     current["method"]["program"] = program
-    with pytest.raises(ProviderError):
-        validate_decision(current, {"action": "revise", "args": {
-            "method_id": "method-old", "instruction": current["method"]["instruction"],
-        }})
+    decision = {"action": "revise", "args": {
+        "method_id": "method-old", "instruction": current["method"]["instruction"],
+    }}
+    assert validate_decision(current, decision) == decision
 
 
-async def test_unchanged_revision_can_be_repaired_into_evidence_backed_material_change():
+async def test_safe_typed_handle_feedback_can_repair_an_unoffered_reference():
     current = frame()
     current["method"]["program"] = {"node_ids": ["node-a"]}
-    current["responses"] = [{"id": "response-a", "text": "只看门前让放下杯子的回应无法进入下一段。"}]
+    current["responses"] = [{"id": "response-a", "version": "response-v", "text": "把杯子的回应接入下一段。"}]
     received = []
     def handler(request):
         received.append(json.loads(request.content))
-        args = {"method_id": "method-old", "instruction": current["method"]["instruction"]}
+        args = {"method_id": "method-old", "instruction": "先接住门外的回应，再选择去处。",
+                "input_ids": ["unoffered-private-reference"]}
         if len(received) > 1:
-            args.update({"input_ids": ["response-a"], "program": {
-                "node_ids": ["node-b", "node-a"], "groups": {"回应后的处境": ["node-b", "node-a"]},
-            }})
+            args["input_ids"] = ["response-a"]
         return httpx.Response(200, json=envelope({"action": "revise", "args": args}))
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         provider = DeepSeekGrowthProvider(Settings(api_key=KEY), client)
         with pytest.raises(ProviderError) as captured:
             await provider.decide(current)
         repaired = await provider.decide(current, repair=captured.value.feedback)
-    assert repaired.value["args"]["program"]["node_ids"] == ["node-b", "node-a"]
     assert repaired.value["args"]["input_ids"] == ["response-a"]
-    assert "instruction:schema_invalid" in received[1]["messages"][0]["content"]
+    system = received[1]["messages"][0]["content"]
+    assert "input_ids:schema_invalid" in system and "HANDLE_UNKNOWN" in system
+    assert "unoffered-private-reference" not in system
     assert len(received) == 2
 
 
@@ -655,6 +653,141 @@ def test_projection_cannot_disclose_credential_embedded_in_configured_model():
     with pytest.raises(ProviderError) as captured:
         provider.projection(frame(), "decide")
     assert KEY not in str(captured.value)
+
+
+def test_recursive_method_program_and_explicit_reflection_use_exact_delivered_versions():
+    current = frame()
+    current["allowed_actions"].append("reflect")
+    current["responses"] = [{"id": "review", "version": "review-v", "text": "比较两种选材的后果。"}]
+    method_ref = {"kind": "method", "object_id": "method-old", "version": "version-old"}
+    review_ref = {"kind": "response", "object_id": "review", "version": "review-v"}
+    program = {"inputs": [method_ref, review_ref], "calls": [
+        {"method_ref": method_ref, "input_refs": [review_ref]},
+    ], "node_ids": ["node-b"]}
+    revision = {"action": "revise", "args": {
+        "method_id": "method-old", "method_version": "version-old", "instruction": "比较选材方式留下的后果。",
+        "input_refs": [review_ref], "program": program,
+    }}
+    assert validate_decision(current, revision) == revision
+    reflection = {"action": "reflect", "args": {
+        "method_id": "method-old", "about_refs": [method_ref, review_ref], "purpose": "检验上次判断的标准",
+    }}
+    assert validate_decision(current, reflection) == reflection
+    assert validate_decision(current, {"action": "reflect", "args": {"method_id": "method-old"}})
+    body = DeepSeekGrowthProvider(Settings()).projection(current, "decide")
+    assert '"calls"' in body["messages"][0]["content"]
+    assert '"$defs"' in body["messages"][0]["content"]
+    assert "方法版本继承表示沿革" not in body["messages"][0]["content"]  # no fabricated observation
+
+
+@pytest.mark.parametrize("field", ["inputs", "calls"])
+def test_recursive_program_rejects_unseen_versions_and_private_method_ids_without_echo(field):
+    current = frame()
+    private = {"kind": "method", "object_id": "private-method", "version": "private-version"}
+    program = {field: [private] if field == "inputs" else [{"method_ref": private}]}
+    with pytest.raises(ProviderError) as error:
+        validate_decision(current, {"action": "revise", "args": {
+            "method_id": "method-old", "instruction": "组合实际方式。", "program": program,
+        }})
+    assert error.value.feedback.prompt_data()["issues"] == ["program:schema_invalid", "SCHEMA_INVALID"]
+    assert "private" not in str(error.value)
+
+
+def test_multi_version_handle_requires_exact_reference_or_explicit_method_version():
+    current = frame()
+    current["pages"] = [{"method": {**current["method"], "version": "older-version"}}]
+    decision = {"action": "inspect", "args": {"method_id": "method-old"}}
+    with pytest.raises(ProviderError) as error:
+        validate_decision(current, decision)
+    assert error.value.feedback.prompt_data()["issues"] == ["method_id:schema_invalid", "HANDLE_AMBIGUOUS"]
+    decision["args"]["method_version"] = "older-version"
+    assert validate_decision(current, decision) == decision
+    reading = {"action": "read_page", "args": {
+        "kind": "method", "id": "method-old", "version": "older-version",
+    }}
+    assert validate_decision(current, reading) == reading
+
+
+def test_method_cache_and_executed_plan_offer_deep_exact_method_handles():
+    current = frame()
+    nested = {"id": "method-deep", "version": "deep-v", "instruction": "从评议标准选择新的材料。"}
+    current["method_cache"] = [nested]
+    current["method_execution"] = {"instruction_refs": [{"method_ref": {
+        "kind": "method", "object_id": "method-deep", "version": "deep-v",
+    }}], "max_call_depth": 3}
+    current["iteration_work"] = {"unchanged_actions": ["inspect"], "recent_no_change_count": 2,
+                                 "method_review_due": True, "formal_review_order": 3,
+                                 "last_review_ref": {"kind": "response", "object_id": "review", "version": "rv"}}
+    assert validate_decision(current, {"action": "apply", "args": {"method_id": "method-deep"}})
+    projected = DeepSeekGrowthProvider(Settings()).projection(current, "decide")
+    system = projected["messages"][0]["content"]
+    data = json.loads(projected["messages"][1]["content"])
+    assert data["method_cache"] == [nested]
+    assert "复用 method_cache" in system
+    assert "方法版本继承表示沿革" in system
+
+
+async def test_review_is_public_positive_work_product_not_hidden_reasoning_or_narrative_event():
+    current = frame()
+    current["sources"] = []
+    current["method_evidence"] = [{"kind": "method", "id": "method-old", "version": "version-old",
+                                   "instruction": current["method"]["instruction"]}]
+    current["method_execution"] = {"max_call_depth": 2}
+    text = "这次选择让门内的回应进入下一步。把两人的去处共同作为选材，再检验实际行动留下的差异。"
+    received = []
+    def handler(request):
+        received.append(json.loads(request.content))
+        return httpx.Response(200, json=envelope({"text": text}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await DeepSeekGrowthProvider(Settings(api_key=KEY), client).review(current)
+    assert result.value == text and len(received) == 1
+    system = received[0]["messages"][0]["content"]
+    data = json.loads(received[0]["messages"][1]["content"])
+    assert "完整公开工作判断及可执行下一步" in system
+    assert "正向、直接" in system
+    assert data["method_evidence"] == current["method_evidence"]
+    assert data["method_execution"] == current["method_execution"]
+    assert "private transport reasoning" not in str(result.value)
+    assert await FixtureGrowthProvider().review(current)
+
+
+def test_publish_and_response_can_choose_exact_versions_from_history():
+    current = frame()
+    current["trials"] = [{"id": "trial", "version": "current-trial"}]
+    current["method_dependencies"] = [{"kind": "trial", "object_id": "trial", "version": "previous-trial"},
+                                      {"kind": "method", "object_id": "method-old", "version": "past-method"}]
+    publication = {"action": "publish", "args": {"trial_id": "trial"}}
+    with pytest.raises(ProviderError) as error:
+        validate_decision(current, publication)
+    assert "HANDLE_AMBIGUOUS" in error.value.feedback.issues
+    publication["args"]["trial_version"] = "current-trial"
+    assert validate_decision(current, publication) == publication
+    response = {"action": "respond", "args": {
+        "text": "比较反馈更新前后的选材效果。", "evaluation_method_id": "method-old",
+        "evaluation_method_version": "past-method", "about_refs": [
+            {"kind": "trial", "object_id": "trial", "version": "previous-trial"}],
+    }}
+    assert validate_decision(current, response) == response
+    response["args"]["evaluation_method_version"] = "unseen-version"
+    with pytest.raises(ProviderError) as error:
+        validate_decision(current, response)
+    assert "HANDLE_VERSION_MISMATCH" in error.value.feedback.issues
+    assert "unseen-version" not in str(error.value)
+
+
+def test_review_and_render_receive_protocol_and_exact_work_evidence():
+    current = frame("reading")
+    current.update(work_protocol="growth-work-v2", purpose="检验选择方法本身", review_order=4,
+                   review_targets=[{"kind": "method", "object_id": "method-old", "version": "version-old"}],
+                   method_evidence=[{"kind": "method", "id": "method-old", "version": "version-old",
+                                     "instruction": current["method"]["instruction"]}])
+    reviewed = project_frame(current, "review")
+    assert reviewed["review_order"] == 4
+    assert reviewed["review_targets"] == current["review_targets"]
+    assert reviewed["purpose"] == current["purpose"]
+    rendered = project_frame(current, "render")
+    assert rendered["work_protocol"] == "growth-work-v2"
+    assert rendered["method_evidence"] == current["method_evidence"]
 
 
 @pytest.mark.parametrize("actions", [None, [], ["unknown"], [True], {"wait": True}])

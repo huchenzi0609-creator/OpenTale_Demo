@@ -80,6 +80,9 @@ async def test_saved_accepted_trial_read_recovers_without_any_new_model_call(run
         "feedback_refs": [], "adopted": False})
     session.update(pending_trial_id=trial["id"], status="error", error={"code": "SOURCE_RANGE_INVALID"})
     runner.put(run_id, "session", session)
+    frame = runner.frame(state, scope, session)
+    frame.pop("capabilities")
+    frame.pop("work_protocol")
     request_id = f"request-{identifier(scope, 1, 'decide')}"
     decision = {"action": "read_page", "args": {"kind": "trial", "id": trial["id"], "start": 0, "end": 2400}}
     accepted = runner.put(run_id, "request", {"id": request_id, "scope_id": scope, "private_scope": scope,

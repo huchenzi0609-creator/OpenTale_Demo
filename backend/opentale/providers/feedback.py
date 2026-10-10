@@ -17,6 +17,12 @@ _FIELDS = frozenset({
     "focus_index", "expression_indices", "reinterprets_indices",
     "reflection", "methods", "adoptions", "title", "instruction", "object_indices", "order", "limit",
     "revises_index", "scope_index", "method_index", "draft_index", "action",
+    "args", "method_id", "method_version", "evaluation_method_id", "evaluation_method_version",
+    "trial_id", "trial_version", "node_id", "edge_id",
+    "input_ids", "input_refs", "about_ids", "parent_ids", "association_ids", "visit_ids", "id", "kind",
+    "object_id", "version", "program", "inputs", "calls", "method_ref", "input_refs", "groups", "relations",
+    "source_id", "target_id", "relation", "purpose", "query", "offset", "start", "end", "direction",
+    "transition", "reason", "node_ids", "about_refs",
 })
 _ERROR_TYPES = frozenset({
     "missing", "extra_forbidden", "string_type", "string_too_short", "string_too_long",
@@ -31,6 +37,8 @@ _REASONS = frozenset({
     "READING_SHARED_REQUIRED",
     "TECHNICAL_PROSE", "SCHEMA_INVALID", "WRAPPING_TOO_DEEP",
     "REFLECTION_REFERENCE_INVALID",
+    "HANDLE_UNKNOWN", "HANDLE_KIND_MISMATCH", "HANDLE_AMBIGUOUS", "HANDLE_VERSION_MISMATCH",
+    "METHOD_UNCHANGED",
 })
 
 

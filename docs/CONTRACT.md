@@ -17,6 +17,14 @@ direction does not replace the initial scope direction. Frozen requests, publish
 bodies and previous method versions remain stored. See the work/recovery details in
 [growth execution guide](GROWTH_READING.md).
 
+V0.6.3 graph frames freeze `growth-work-v2` plus a scope-filtered typed capability
+table; legacy frames derive the same finite handles from their actual catalogs.
+Composed method programs support exact `inputs` and `calls`, explicit-stack
+execution and root output selection. `reflect` invokes a public `review` stage;
+new DeepSeek drafts/renders invoke one recorded result review. Calls use the
+existing budget and independent accepted-stage recovery. See
+[method iteration protocol](GROWTH_METHOD_ITERATION.md).
+
 ## Bounded context pages (v0.5.2)
 
 New v2 jobs use `provider-json-v3-bounded` and `source-pages-v1`. Version-1 and
