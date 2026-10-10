@@ -1768,6 +1768,12 @@ progress::-moz-progress-bar {
 .growth-record > .helper { margin: 5px 0; }
 .growth-record-body { white-space: pre-wrap; font-size: 12px; line-height: 1.9; margin: 10px 0; }
 .growth-record-panel > .helper { margin-top: 14px; }
+.growth-current-methods { padding: 14px; margin: 18px 0; background: #eff3e9; border-radius: 8px; }
+.growth-current-methods h3 { margin: 0; font-size: 13px; }
+.growth-method-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.growth-method-program { margin-top: 10px; }
+.growth-method-program .helper, .growth-method-program li { font-size: 11px; line-height: 1.8; }
+.growth-method-program ul { padding-left: 18px; }
 .growth-diagnostic-fields { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 14px; margin: 20px 0 0; font-size: 12px; }
 .growth-diagnostic-fields dt { color: var(--muted); }
 .growth-diagnostic-fields dd { margin: 0; color: var(--teal); }

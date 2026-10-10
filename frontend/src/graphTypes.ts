@@ -101,6 +101,8 @@ export interface GraphRecord {
   definition?: unknown;
   program?: unknown;
   method_ref?: GraphObjectRef | null;
+  parent_ref?: GraphObjectRef | null;
+  source_refs?: GraphObjectRef[];
   evaluation_method_ref?: GraphObjectRef | null;
   source_spans?: GraphSourceSpan[];
   [field: string]: unknown;

@@ -90,7 +90,7 @@ class GrowthRunner:
             method = MethodVersion(id=f"method-{identifier(scope)}", scope_id=scope,
                                    instruction=("从已构造的生活中发现值得继续的方向；用具体经验展开关系，"
                                                 "让行动留下可继续承接的后果。"),
-                                   program={"node_ids": window.entry_node_ids}, private_scope=scope,
+                                   program={}, private_scope=scope,
                                    created_commit=state.graph_commit)
             row = self.put(state.run_id, "method", method.model_dump(), commit_seq=state.graph_commit)
             window.method_ref = ObjectRef(kind="method", object_id=row["id"], version=row["version"])
@@ -126,6 +126,11 @@ class GrowthRunner:
         elif row.get("text_ref"):
             result["text"] = self.body(row)
         return result
+
+    def page_text(self, state, kind, row):
+        if kind in {"link", "view"}:
+            return json.dumps(row, ensure_ascii=False)
+        return self.expand(state, kind, row).get("text", row.get("instruction", ""))
 
     def snapshot(self, run_id):
         state = self.load(run_id)
@@ -165,7 +170,7 @@ class GrowthRunner:
         scope = f"reading:{track_id}"
         method = MethodVersion(id=f"method-{identifier(scope)}", scope_id=scope,
                                instruction="沿已有叙事选择值得进入的枝桠，保留不同位置的差异；根据访问形成阅读。",
-                               program={"node_ids": entries}, private_scope=scope,
+                               program={}, private_scope=scope,
                                created_commit=state.graph_commit)
         row = self.put(run_id, "method", method.model_dump(), commit_seq=state.graph_commit)
         state.reading_tracks[track_id] = ReadingTrack(id=track_id, label=title, entry_node_ids=entries,
@@ -187,6 +192,14 @@ class GrowthRunner:
         if key not in mapping:
             raise KernelError("SCOPE_INVALID", "工作位置不存在。")
         return mapping[key]
+
+    def base_direction(self, state, scope, session):
+        if "base_direction" not in session:
+            first = self.store.get(state.run_id, "request", f"request-{identifier(scope, 1, 'decide')}",
+                                   include_private=True)
+            session["base_direction"] = (first["frame"].get("direction", self.actor(state, scope).direction)
+                                         if first else self.actor(state, scope).direction)
+        return session["base_direction"]
 
     def frame(self, state, scope, session):
         actor = self.actor(state, scope)
@@ -224,19 +237,50 @@ class GrowthRunner:
             trial = self.store.get(state.run_id, "trial", session["pending_trial_id"], scope_id=scope)
             if trial:
                 pending = self.expand(state, "trial", trial)
+                pending.update(start=0, end=len(pending.get("text", "")),
+                               full_length=len(pending.get("text", "")), partial=False)
         visits = [v for v in self.rows(state, "visit", scope, latest=True)[::-1]
                   if v.get("track_id") == scope.split(":", 1)[1]]
         reading_history = []
+        passages = []
         if scope.startswith("reading:"):
-            for passage in self.rows(state, "passage", scope, latest=True, limit=3)[::-1]:
+            passages = self.rows(state, "passage", scope, latest=True)
+            for passage in passages[:3][::-1]:
                 text = self.body(passage)
                 reading_history.append({"id": passage["id"], "version": passage["version"],
                     "text": text[:2000], "start": 0, "end": min(2000, len(text)), "full_length": len(text),
                     "source_spans": passage["source_spans"]})
+        adopted_ref = actor.method_ref.model_dump() if actor.method_ref else None
+        active_ref = ({"kind": "method", "object_id": method["id"], "version": method["version"]}
+                      if method else None)
+        organized_ref = session.get("organized_method_ref")
+        if organized_ref is None and session.get("view"):
+            latest_apply = next((r for r in reversed(receipts) if r["action"] == "apply"), None)
+            if latest_apply:
+                details = latest_apply["details"]
+                organized_ref = {"kind": "method", "object_id": details["method_id"], "version": details["version"]}
+        trials = self.rows(state, "trial", scope, latest=True)
+        def ref(kind, row):
+            return {"kind": kind, "object_id": row["id"], "version": row["version"]}
+        method_work = {
+            "bootstrap": bool(method and method["id"] == f"method-{identifier(scope)}"
+                              and not method.get("parent_ref")),
+            "adopted_ref": adopted_ref, "applied_ref": organized_ref,
+            "candidate_refs": [ref("method", m) for m in methods if m.get("scope_id") == scope
+                               and m.get("parent_ref") and ref("method", m) not in (adopted_ref, active_ref)],
+            "recent_result_refs": [ref("trial", t) for t in trials[:5]]
+                                  + [ref("passage", p) for p in passages[:3]],
+            "recent_feedback_refs": [ref("response", r) for r in feedback[-5:]],
+            "recent_actions": [r["action"] for r in receipts],
+            "pending_trial_unpublished": bool(pending and not pending.get("adopted")),
+        }
+        rendered_visits = {key for p in passages for key in p.get("visit_ids", [])}
+        reading_work = {"unrendered_visit_ids": [v["id"] for v in visits if v["id"] not in rendered_visits],
+                        "recent_passage_ids": [p["id"] for p in passages[:3]]}
         return {"scope_id": scope, "role": "window" if scope.startswith("window:") else "reading",
                 "graph_commit": state.graph_commit, "work_seq": session["work_seq"],
                 "actor_revision": actor.revision,
-                "direction": actor.direction, "cursor": getattr(actor, "cursor_node_id", None)
+                "direction": self.base_direction(state, scope, session), "cursor": getattr(actor, "cursor_node_id", None)
                     or getattr(actor, "working_node_id", None),
                 "frontier": getattr(actor, "frontier_node_ids", []) or actor.entry_node_ids,
                 "entry_node_ids": actor.entry_node_ids,
@@ -246,9 +290,11 @@ class GrowthRunner:
                 "nodes": [{"id": n["id"], "version": n["version"], "created_commit": n["created_commit"],
                            "text_preview": self.body(n)[:120] if not n.get("private_scope") else "",
                            "text_ref": n["text_ref"]} for n in nodes],
-                "methods": [{**m, "instruction": m["instruction"][:160]} for m in methods],
+                "methods": [{**m, "instruction": m["instruction"][:160],
+                             "full_length": len(m["instruction"])} for m in methods],
                 "links": links, "method": method, "sources": sources, "view": session.get("view"),
-                "pending_trial": pending, "trials": self.rows(state, "trial", scope), "visits": visits,
+                "pending_trial": pending, "trials": trials[::-1], "visits": visits,
+                "method_work": method_work, "reading_work": reading_work,
                 "responses": responses, "receipts": receipts[-12:], "pages": session.get("pages", []),
                 "reading_history": reading_history,
                 "feedback_catalog": [{"id": r["id"], "version": r["version"], "length": r["text_ref"]["length"]}
@@ -374,7 +420,11 @@ class GrowthRunner:
                     "args": decision.get("args", {}), "details": result, "graph_commit": state.graph_commit}
                 self.put(run_id, "receipt", receipt, commit_seq=state.graph_commit)
                 self.put(run_id, "session", session)
-                self.actor(state, scope).status = session["status"]
+                actor = self.actor(state, scope)
+                actor.status = session["status"]
+                if actor.direction != session["base_direction"]:
+                    actor.direction = session["base_direction"]
+                    actor.revision += 1
                 state.status = "idle"
                 self.store.save_head(state)
                 self.event(state, decision["action"], {"scope_id": scope, "work_seq": seq, **result})
@@ -395,7 +445,8 @@ class GrowthRunner:
         rid = state.run_id
         offered_versions = {}
         for catalog, kind in (("methods", "method"), ("nodes", "node"), ("trials", "trial"),
-                              ("visits", "visit"), ("responses", "response"), ("links", "link")):
+                              ("visits", "visit"), ("responses", "response"), ("links", "link"),
+                              ("reading_history", "passage")):
             offered_versions.update({(kind, row["id"]): row["version"] for row in frame.get(catalog, [])
                                      if row.get("version")})
         if frame.get("method"):
@@ -415,21 +466,28 @@ class GrowthRunner:
             session["pages"] = [{"kind": kind, "items": [{"id": r["id"], "version": r["version"],
                                   **({k: r[k] for k in ("source_id", "target_id", "kind", "relation")}
                                      if kind == "link" else {}),
-                                  "text_preview": (self.body(r) or r.get("instruction", ""))[:160]} for r in rows],
+                                  "text_preview": self.page_text(state, kind, r)[:160],
+                                  "full_length": len(self.page_text(state, kind, r))} for r in rows],
                                  "offset": args.get("offset", 0), "next_offset": args.get("offset", 0) + 100}]
             return {"objects": [r["id"] for r in rows], "page": session["pages"][0]}
         if action == "read_page":
             row = get(args.get("kind", "node"), args["id"])
-            expanded = self.expand(state, args.get("kind", "node"), row)
-            text = expanded.get("text", row.get("instruction", ""))
-            if args.get("kind") in {"link", "view"}:
-                text = json.dumps(row, ensure_ascii=False)
-            start, end = args.get("start", 0), args.get("end", min(len(text), args.get("start", 0) + 2500))
-            if not 0 <= start <= end <= len(text):
-                raise KernelError("SOURCE_RANGE_INVALID", "读取区间超出原文。")
+            text = self.page_text(state, args.get("kind", "node"), row)
+            requested_start = args.get("start", 0)
+            requested_end = args.get("end", requested_start + 2500)
+            if (type(requested_start) is not int or type(requested_end) is not int
+                    or not 0 <= requested_start <= requested_end):
+                raise KernelError("SOURCE_RANGE_INVALID", "读取区间无效。")
+            # Page reads use capacity semantics, like a bounded file read. A
+            # requested end beyond EOF never invents a source span or poisons
+            # the saved accepted decision; exact navigation spans stay strict.
+            start, end = min(requested_start, len(text)), min(requested_end, len(text))
             session["pages"] = [{"kind": args.get("kind", "node"), "id": row["id"],
                                  "version": row["version"], "text": text[start:end],
                                  "start": start, "end": end, "full_length": len(text),
+                                 "requested_start": requested_start, "requested_end": requested_end,
+                                 "clipped": (start, end) != (requested_start, requested_end),
+                                 "eof": end == len(text),
                                  "next_start": end if end < len(text) else None}]
             if args.get("kind") in {"link", "view"}:
                 session["pages"][0]["object"] = row if len(text) <= 2500 else {"id": row["id"],
@@ -442,9 +500,13 @@ class GrowthRunner:
                 session["pages"] = [{"method": method}]
             elif action == "apply":
                 session["applied_method"] = ref
-                view = compile_method(self.store, state, scope, ref, actor.entry_node_ids)
+                current = getattr(actor, "working_node_id", None) or getattr(actor, "cursor_node_id", None)
+                inputs = list(dict.fromkeys([*session.get("selected_node_ids", []),
+                    *actor.entry_node_ids, *getattr(actor, "frontier_node_ids", []), *([current] if current else [])]))
+                view = compile_method(self.store, state, scope, ref, inputs)
                 session["selected_node_ids"] = [m.object_id for m in view.members]
                 session["view"] = view.model_dump()
+                session["organized_method_ref"] = ref
             elif action == "adopt":
                 actor.method_ref = ObjectRef.model_validate(ref)
                 session["applied_method"] = ref
@@ -455,8 +517,9 @@ class GrowthRunner:
                 nodes = []
                 for key in inputs:
                     found = None
-                    for kind in ("node", "method", "response", "trial", "visit"):
-                        found = self.store.get(rid, kind, key, scope_id=scope)
+                    for kind in ("node", "method", "response", "trial", "visit", "passage"):
+                        found = self.store.get(rid, kind, key, scope_id=scope,
+                                               version=offered_versions.get((kind, key)))
                         if found:
                             evidence.append(ObjectRef(kind=kind, object_id=key, version=found["version"]))
                             if kind == "node":
@@ -464,12 +527,13 @@ class GrowthRunner:
                             break
                     if found is None:
                         raise KernelError("TARGET_UNKNOWN", "方法依据在此位置不可见。")
+                program = {**(method.get("program") or {}), **(args.get("program") or {})}
+                if "node_ids" not in (args.get("program") or {}) and nodes:
+                    program["node_ids"] = nodes
+                if "purpose" in args:
+                    program["purpose"] = args["purpose"]
                 new = MethodVersion(id=f"method-{identifier(scope, seq)}", scope_id=scope,
-                    instruction=args["instruction"], program={**(args.get("program") or method.get("program") or {}),
-                    "node_ids": (args.get("program") or {}).get("node_ids") if
-                    "node_ids" in (args.get("program") or {}) else
-                    nodes or (method.get("program") or {}).get("node_ids", actor.entry_node_ids),
-                    "purpose": args.get("purpose", "")},
+                    instruction=args["instruction"], program=program,
                     parent_ref=ObjectRef.model_validate(ref), source_refs=[ObjectRef.model_validate(ref), *evidence],
                     private_scope=scope, created_commit=state.graph_commit)
                 row = self.put(rid, "method", new.model_dump(), commit_seq=state.graph_commit)
@@ -518,12 +582,7 @@ class GrowthRunner:
                 "feedback_refs": [], "adopted": False})
             session["pending_trial_id"] = trial["id"]
             if args.get("direction"):
-                current = self.load(rid)
-                current_actor = self.actor(current, scope)
-                if current_actor.revision == frame.get("actor_revision", current_actor.revision):
-                    current_actor.direction = args["direction"]
-                    current_actor.revision += 1
-                    self.store.save_head(current)
+                session["last_trial_direction"] = args["direction"]
             return {"trial_id": trial["id"], "method_ref": ref, "draft_request": draft_request}
         if action == "publish":
             trial = get("trial", args["trial_id"])

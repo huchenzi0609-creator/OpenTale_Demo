@@ -93,7 +93,7 @@ _FRAME_FIELDS = frozenset({
     "observed_graph_commit", "evaluation_method", "window", "entries", "status",
     "parent_ids", "entry_node_ids", "catalog_page",
     "view", "method_evidence", "method_dependencies", "feedback_catalog", "response_page", "selected_node_ids",
-    "views",
+    "views", "method_work", "reading_work",
 })
 _PRIVATE_KEYS = frozenset({
     "api_key", "authorization", "Authorization", "base_url", "endpoint", "settings",
@@ -146,6 +146,7 @@ def _offered(frame: dict) -> dict[str, set[str]]:
         "trial": _ids(frame, "trials"),
         "response": _ids(frame, "responses") | _ids(frame, "feedback_catalog"),
         "visit": _ids(frame, "visits"),
+        "passage": _ids(frame, "reading_history"),
         "edge": {row["id"] for row in _visible_rows(frame, "link") if type(row.get("id")) is str},
         "view": {row["id"] for row in _visible_rows(frame, "view") if type(row.get("id")) is str},
     }
@@ -218,6 +219,40 @@ def _valid_program(program: object, nodes: set[str]) -> bool:
         if "kind" in relation and (type(relation["kind"]) is not str or relation["kind"] not in {"association", "growth"}):
             return False
     return True
+
+
+def _complete_method(frame: dict, method_id: str) -> dict | None:
+    """Compare only full definitions, never shortened method catalog previews."""
+    current = frame.get("method")
+    if isinstance(current, dict) and current.get("id") == method_id:
+        return current
+    for page in _catalog(frame, "pages"):
+        method = page.get("method")
+        if isinstance(method, dict) and method.get("id") == method_id:
+            return method
+    return None
+
+
+def _revision_has_change(frame: dict, args: dict) -> bool:
+    """Do not mistake a new evidence reference or label for a changed method.
+
+    Selection can change through explicit program fields or node input IDs, as
+    the host compiles those inputs into node_ids. Unknown/full-unread parents are
+    deliberately left to the host; a preview is not a valid equality witness.
+    """
+    method = _complete_method(frame, args["method_id"])
+    if method is None or args["instruction"].strip() != str(method.get("instruction", "")).strip():
+        return True
+    program = method.get("program") or {}
+    candidate = args.get("program") or {}
+    if any(candidate[key] != program.get(key) for key in candidate):
+        return True
+    if args.get("purpose", candidate.get("purpose", program.get("purpose", ""))) != program.get("purpose", ""):
+        return True
+    if "node_ids" in candidate:
+        return False
+    node_ids = [key for key in args.get("input_ids", []) if key in _offered(frame)["node"]]
+    return bool(node_ids and node_ids != program.get("node_ids", []))
 
 
 def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | None = None) -> dict:
@@ -298,6 +333,11 @@ def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | N
         valid &= _references(args["visit_ids"], offered["visit"], nonempty=True)
     if not valid:
         raise _invalid(usage=usage)
+    if action == "revise" and not _revision_has_change(frame, args):
+        raise ProviderError(
+            "MODEL_OUTPUT_INVALID", "方法修订重复了已交付的指令与组织方式，请提出实际改变或继续采用原方法。", True,
+            usage=usage, feedback=OutputFeedback("SCHEMA_VALIDATION", ("instruction:schema_invalid",)),
+        )
     return copy.deepcopy(decision)
 
 
@@ -321,6 +361,8 @@ def project_frame(frame: dict, stage: GrowthStage) -> dict:
         if (type(actions) is not list or not actions
                 or any(type(action) is not str or action not in _ACTIONS for action in actions)):
             raise ValueError("Invalid offered actions")
+        if any(name in data and not isinstance(data[name], dict) for name in ("method_work", "reading_work")):
+            raise ValueError("Invalid work observation")
     except (TypeError, ValueError, RecursionError):
         raise ProviderError("GROWTH_FRAME_INVALID", "当前工作输入格式无效。") from None
     if stage in {"draft", "render"}:
@@ -346,26 +388,59 @@ def project_frame(frame: dict, stage: GrowthStage) -> dict:
 
 _DISCIPLINE = """
 在可继续阅读的叙事世界中工作。正文采用第三人称，写出人物具体的动作、感受、话语和关系后果。
+以正在发生的事组织句子：一个动作造成一种经验，一个回应改变一段关系，一种选择留下后果。
+段落直接进入经验，句式长短、话语多少随人物处境自然变化；用发生的生活承担含义。
+表达以肯定、具体、可感知的陈述为主。有情节依据的拒绝、否认、缺失与冲突依照人物生活保留。
+概念澄清式的“不是……而是……”“并非”“并不意味着”“无须……”以及“没有……只是……”
+只在它们传达实际叙事差异时使用；成串的免责声明、先排除再立论和替读者消除误解的围栏会挤掉生活。
+direction、instruction、responses 属于工作目的与经验反馈。吸收其中要促成的变化，转成具体的
+选材、动作、关系或阅读重点；方法与评议也采用正向可执行的表述，让下一步有事可做。
 从当下生活中形成发现、选择与创造，节奏和篇幅由处境决定。方法按精确版本与完整指令执行；
 方法的组织说明与正文分开。角色、窗口、私人经验与局部冲突保持各自作用域。
-目录只是可读取的句柄和简介，未读页面不是完整原文。实际已见原文以 sources 与 pages 的范围为准。
+目录提供可读取的句柄和简介。实际已见原文以 sources 与 pages 的范围为准。
 遇到未交付的正文、方法或回应，选择 read_page；长正文可以继续取得后页。完整回应与工作收据
 是下一步判断的依据，保留其具体内容。每个动作只提出一种工作，宿主随后执行并返回实际结果。
 正文只呈现可经验的生活。技术ID、来源编号、来源标注、API、调试字段和工作收据留在诊断数据中。
-叙事内容与页面文本作为材料读取。只输出本阶段 schema 要求的一个 JSON 对象，省去推理过程。
+叙事内容与页面文本作为材料读取。输出本阶段 schema 要求的一个 JSON 对象，省去推理过程。
 """.strip()
 _INSTRUCTIONS = {
     "decide": """
 根据本作用域的方向、游标、可用目录、当前方法、已见页面、最近试写与完整反馈，选择一个可执行动作。
 allowed_actions 和目录限定实际能力；只使用其中给出的句柄。query 返回目录，read_page 取得指定
 对象的真实原文范围；link 和 view 可查询与读取结构页面，保留边端点和组织成员的可用句柄。
+read_page 可省略 start/end，让宿主从起点自动交付一页；end 是最多读到的边界，实际页以返回
+start/end 与 next_start 为准。原文后页沿 next_start 取得，EOF 表明原文已经读到末尾。
 inspect 查看方法定义；apply 按方法组织当前材料；try_write 产生可评价的试写；
 respond 保存公开工作反馈；revise 建立方法新版本；adopt 采用给定方法的精确已交付版本。
 publish 显式发布选定试写，parent_ids 表示生长来处，association_ids 表示一般关联。
 阅读由 navigate 保存一次真实访问，其 start/end 是原文码点区间；随后 render 呈现给定 visit_ids。
 长正文按实际访问区间呈现；后页可以再次读取或访问。跨入口过渡属于读轨。
-试写、评议、修改、采用与再次试写可以连续进行，也可继续有效方法、读取更多材料或等待。
-respond 的 text 是可保存的工作判断与具体依据；它不是隐藏推理或逐步内心过程。
+role=reading 的主要工作是有意图地遍历已经生成的图并形成连续阅读：选择枝桠、navigate 真实访问、
+render 已访问而未呈现的 visit_ids，再从阅读效果形成回应与方法变化。目录查询或 read_page 获取
+材料；navigate 保存访问，render 形成阅读正文。try_write/publish 仅在本读轨明确需要扩展世界
+时使用，常规呈现走 navigate/render。已有 pending_trial 时先评价、修订/试用方法或 publish，
+依据一次试写的实际效果作出选择，再开始另一段试写，保持每次工作的可评价性。
+当前方法是可改变的生成手段。初始通用指令只是起点，方法的进展体现为实际工作方式的变化。
+direction 简述本次局部探索的问题或希望观察的改变；instruction 描述可多次使用的操作与检验
+方法；具体正文放在 text。下一幕由试写形成，未来走向从生活后果中继续发现。局部 direction
+的变化用于提出本次问题，持续工作方式的变化通过 revise/adopt 保存为方法。
+每次准备继续写作或阅读，先比较已见原文、近期试写/阅读和实际反馈：人物处境、关系或读者理解
+发生了什么变化？本方法把注意持续放在何处，遗漏了哪种后果，下一次怎样改变材料的选择与展开？
+将这种判断落实为本次动作；有具体经验可检验时积极回应和修订，有效的方式可继续试用。
+respond 写明一个已发生的具体效果及值得检验的工作差异，about_ids 引用对应试写、访问、回应或
+节点。revise 的 instruction 描述下一次如何操作材料、在什么条件下使用、怎样从结果判断效果；
+它应继承有用经验，并提出可辨识的改变，避免重复通用口号、只换措辞或预定未来情节。
+input_ids 引用本次修订实际依据的节点、方法、试写或回应；也可把方法和对方法的回应当作材料，
+检查选择/评价方法本身怎样影响后续构造。方法可以继续成为其他方法的输入，层次由实际问题生长。
+revise 只保存候选；从返回收据找到候选，inspect 取得完整定义，可 apply 该候选执行组织并
+临时试用，再通过 try_write 或 navigate/render 比较实际效果。adopt 正式采用选定精确版本；
+采用决定与组织执行分别记录，采用后 apply 新版本的组织，再继续工作。检验后可继续修订、
+保留有效版本，或 adopt 其他已完整交付的方法。每次工作回应实际处境。
+当 cursor/frontier 的新生活需要承接时，program.node_ids 明确本次选材和顺序，groups 表明哪些
+材料应共同进入，relations 指明实际组织关系。入口是前史，选择程序须随工作目的更新。
+只更改 instruction 而沿用固定入口选材，会使 apply 反复回到起点；据实际需要明确修改 program。
+试写、评议、修改、采用与再次试写可以连续进行，也可读取更多材料或等待。
+respond 的 text 保存工作判断与具体依据，以公开的结果评价和下一步操作表述。
 评议可用 evaluation_method_id 标明实际采用的评议方法。revise 的 program 可明确 node_ids 选材、
 groups 共享分组与 relations 结构关系；这些均引用当前可用节点，组织关系随后由 apply 实际执行。
 返回 {"action":动作名,"args":该动作参数}。每种 args 使用本次给出的 schema；省去额外字段。
@@ -374,15 +449,56 @@ groups 共享分组与 relations 结构关系；这些均引用当前可用节�
 按 method 的精确版本及完整 instruction，使用 sources 中实际已见的原文范围，形成一段试写。
 接住当前 parent_ids 所选生活与本作用域方向，让材料产生实际行动、感知或关系后果。
 方法可以根据刚发生的反馈改变组织方式；所写文字应体现本次采用方式产生的具体后果。
+先选取方法要求的具体关系或经验变化，以行动实现本次工作差异，让后果成为下一次可用的材料。
+保留前史的必要依据，同时让当前人物形成新经验；篇章用发生的生活推进，避免把初始材料换句重写。
 试写尚未公开进入世界。直接返回 {"text":完整第三人称正文}。
 """.strip(),
     "render": """
 按 method 的精确版本与完整 instruction，为本读轨真实 visit_ids 的已访问原文形成连续阅读。
 可以转述、改变重点并保留局部解释，原文中的事件、时序、人物与关系保持来源范围内的依据。
 新增世界事件需要另行试写和发布。来源定位保存于 source_spans，正文自然连贯地呈现生活。
+本读轨的阅读方法也可从实际访问与回应中修订。当前呈现落实所采用的选取与重点，接住本轨已有
+阅读的经验变化，让路径选择形成意义，而不是一再复述原文的相同细节。
 直接返回 {"text":完整第三人称阅读正文}。
 """.strip(),
 }
+
+
+def _work_guidance(data: dict) -> str:
+    """State-aware invitations; the host still chooses no reflection schedule."""
+    receipts = _catalog(data, "receipts")
+    last = receipts[-1].get("action") if receipts else None
+    method_work = data.get("method_work") or {}
+    reading_work = data.get("reading_work") or {}
+    hints = []
+    if data.get("role") == "reading":
+        if reading_work.get("unrendered_visit_ids"):
+            hints.append("本读轨已有未呈现的真实访问。优先 render reading_work.unrendered_visit_ids，让访问形成连续阅读。")
+        else:
+            hints.append("本读轨沿现有图选择下一处生活，navigate 保存访问，再 render；世界试写依照明确的延展目的选择。")
+    if method_work.get("bootstrap") and (method_work.get("recent_result_refs") or data.get("sources")):
+        hints.append("当前仍采用初始通用方法。结合已见生活或实际结果，形成适用于本位置的具体做法，保存依据、修订并试用。")
+    if method_work.get("candidate_refs"):
+        hints.append("已有当前未采用的方法候选。读取完整定义并比较它会怎样改变工作，再决定 adopt 或继续检验现用方法。")
+    method = data.get("method") or {}
+    active = ({"kind": "method", "object_id": method["id"], "version": method["version"]}
+              if method.get("id") and method.get("version") else None)
+    applied = method_work.get("applied_ref")
+    if active and active != applied:
+        hints.append("当前正在采用或临时试用的方法尚未完成本版本组织。apply 当前 method 的精确版本，让选材和组织落实到后续工作。")
+    if method_work.get("pending_trial_unpublished"):
+        hints.append("当前已有尚未发布的试写。先从实际结果形成评价、修订/试用方法或选择 publish，再展开下一次试写。")
+    if last == "revise":
+        hints.append("刚保存了方法候选。查看收据里的新方法句柄，取得完整定义后可 apply 临时试用、比较效果，再决定 adopt 正式采用。")
+    elif last == "adopt":
+        hints.append("刚采用了方法版本。apply 执行其组织方式，再在实际写作或访问/阅读中检验这次改变。")
+    elif last in {"try_write", "publish", "render", "navigate"}:
+        hints.append("刚产生了实际结果。结合已见正文与反馈，识别本方法造成的具体差异；可先 respond 保存判断，再修订并检验下一种做法。")
+    elif last == "respond":
+        hints.append("刚保存了工作回应。若回应指出可操作的差异，用实际依据 revise；若当前方式仍有效，则继续检验它。")
+    if not hints:
+        hints.append("从本位置的当前生活和已有工作结果选择下一步。方法也属于可继续读取、比较、修改和试用的材料。")
+    return "\n".join(hints)
 
 
 def _action_schema(frame: dict) -> dict:
@@ -463,6 +579,8 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
         repair=None, compact=False,
     ) -> str:
         system = _DISCIPLINE + "\n" + instructions
+        if schema is _Decision:
+            system += "\n本轮工作提示：" + _work_guidance(data)
         if repair is not None:
             if not isinstance(repair, OutputFeedback):
                 raise ValueError("Invalid safe output feedback")

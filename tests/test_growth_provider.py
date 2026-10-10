@@ -167,6 +167,35 @@ def test_feedback_directory_reoffers_full_response_page_without_blanking_deliver
     assert projected["feedback_catalog"][1]["length"] == 7000
 
 
+def test_delivered_reading_history_is_method_evidence_without_becoming_world_node_or_page_capability():
+    current = frame("reading")
+    current["reading_history"] = [{
+        "id": "passage-a", "version": "passage-version-a", "text": "先前的阅读只跟着门前的脚步。",
+        "start": 0, "end": 16, "full_length": 16,
+    }]
+    for decision in [
+        {"action": "respond", "args": {"text": "这次把杯子的回应接入路径。", "about_ids": ["passage-a"]}},
+        {"action": "revise", "args": {
+            "method_id": "method-old", "instruction": "从先前阅读的选择中找出被略过的回应，进入相连的另一枝。",
+            "input_ids": ["passage-a"],
+        }},
+    ]:
+        assert validate_decision(current, decision) == decision
+    for decision in [
+        {"action": "read_page", "args": {"kind": "passage", "id": "passage-a"}},
+        {"action": "query", "args": {"kind": "passage", "query": "*"}},
+        {"action": "navigate", "args": {"node_id": "passage-a", "transition": "entry"}},
+        {"action": "revise", "args": {"method_id": "method-old", "instruction": "选另一枝。",
+                                         "program": {"node_ids": ["passage-a"]}}},
+    ]:
+        with pytest.raises(ProviderError):
+            validate_decision(current, decision)
+    projection = DeepSeekGrowthProvider(Settings()).projection(current, "decide")
+    body = json.loads(projection["messages"][1]["content"])
+    assert body["reading_history"] == current["reading_history"]
+    assert '"passage-a"' in projection["messages"][0]["content"]
+
+
 def test_late_link_query_page_offers_endpoints_and_navigation_handles():
     current = frame("reading")
     current["links"] = []
@@ -231,6 +260,186 @@ def test_revision_program_and_feedback_criteria_only_use_offered_handles():
     assert validate_decision(current, feedback) == feedback
     system = DeepSeekGrowthProvider(Settings()).projection(current, "decide")["messages"][0]["content"]
     assert "evaluation_method_id" in system and '"program"' in system and '"groups"' in system
+
+
+def test_exact_unchanged_revision_returns_safe_actionable_repair_without_new_evidence_masking_it():
+    current = frame()
+    current["method"]["program"] = {"node_ids": ["node-a"]}
+    current["responses"] = [{"id": "response-a", "text": "同一结果仍然出现。"}]
+    decision = {"action": "revise", "args": {
+        "method_id": "method-old", "instruction": current["method"]["instruction"],
+        "input_ids": ["response-a"], "program": {"node_ids": ["node-a"]},
+    }}
+    with pytest.raises(ProviderError) as captured:
+        validate_decision(current, decision, usage=(81, 23))
+    assert captured.value.code == "MODEL_OUTPUT_INVALID"
+    assert captured.value.retryable and captured.value.usage == (81, 23)
+    assert captured.value.feedback.prompt_data() == {
+        "category": "SCHEMA_VALIDATION", "issues": ["instruction:schema_invalid"],
+    }
+    assert "method-old" not in str(captured.value)
+    assert current["method"]["instruction"] not in str(captured.value)
+
+
+def test_node_evidence_cannot_mask_unchanged_explicit_selection():
+    current = frame()
+    current["method"]["program"] = {"node_ids": ["node-a"]}
+    with pytest.raises(ProviderError):
+        validate_decision(current, {"action": "revise", "args": {
+            "method_id": "method-old", "instruction": current["method"]["instruction"],
+            "input_ids": ["node-b"], "program": {"node_ids": ["node-a"]},
+        }})
+
+
+@pytest.mark.parametrize("change", [
+    {"program": {"node_ids": ["node-b", "node-a"]}},
+    {"program": {"groups": {"两种回应": ["node-a", "node-b"]}}},
+    {"program": {"relations": [{"source_id": "node-a", "target_id": "node-b", "relation": "回应"}]}},
+    {"input_ids": ["node-b"]},
+    {"instruction": "先把两处人物的实际回应并置，再从差异选择后续行动。"},
+])
+def test_method_revision_can_change_real_organization_with_same_instruction(change):
+    current = frame()
+    current["method"]["program"] = {"node_ids": ["node-a"]}
+    decision = {"action": "revise", "args": {
+        "method_id": "method-old", "instruction": current["method"]["instruction"], **change,
+    }}
+    assert validate_decision(current, decision) == decision
+
+
+def test_shortened_method_catalog_is_never_an_equality_witness_for_noop_revision():
+    current = frame()
+    current["methods"].append({"id": "method-other", "version": "other-version", "instruction": "简介"})
+    decision = {"action": "revise", "args": {"method_id": "method-other", "instruction": "简介"}}
+    assert validate_decision(current, decision) == decision
+    current["pages"] = [{"method": {"id": "method-other", "version": "other-version", "instruction": "简介"}}]
+    with pytest.raises(ProviderError):
+        validate_decision(current, decision)
+
+
+def test_method_iteration_prompt_reaches_model_with_real_evidence_and_reader_role():
+    current = frame("reading")
+    current["receipts"] = [{"action": "render", "details": {"visit_ids": ["visit-a"]}}]
+    current["responses"] = [{"id": "response-a", "text": "两次阅读都重述门闩，却未展开两个人对去处的差异。"}]
+    current["method_work"] = {"bootstrap": True, "candidate_refs": []}
+    current["reading_work"] = {"unrendered_visit_ids": ["visit-a"]}
+    projection = DeepSeekGrowthProvider(Settings()).projection(current, "decide")
+    system = projection["messages"][0]["content"]
+    body = json.loads(projection["messages"][1]["content"])
+    assert "revise 只保存候选" in system
+    assert "program.node_ids" in system and "cursor/frontier" in system
+    assert "条件下使用" in system and "从结果判断效果" in system
+    assert "方法可以继续成为其他方法的输入" in system
+    assert "navigate/render" in system and "常规呈现" in system
+    assert "刚产生了实际结果" in system
+    assert body["responses"] == current["responses"]
+    assert body["method_work"] == current["method_work"]
+    assert body["reading_work"] == current["reading_work"]
+
+
+def test_work_observations_expose_real_open_work_without_forcing_reflection_order():
+    current = frame("reading")
+    current["method_work"] = {
+        "bootstrap": True,
+        "adopted_ref": {"kind": "method", "object_id": "method-old", "version": "version-old"},
+        "applied_ref": None,
+        "candidate_refs": [{"kind": "method", "object_id": "method-other", "version": "version-other"}],
+        "recent_result_refs": [], "recent_feedback_refs": [], "recent_actions": [],
+        "pending_trial_unpublished": True,
+    }
+    current["reading_work"] = {"unrendered_visit_ids": ["visit-a"], "recent_passage_ids": []}
+    provider = DeepSeekGrowthProvider(Settings())
+    projected = provider.projection(current, "decide")
+    system = projected["messages"][0]["content"]
+    assert "优先 render reading_work.unrendered_visit_ids" in system
+    assert "当前仍采用初始通用方法" in system
+    assert "已有当前未采用的方法候选" in system
+    assert "当前正在采用或临时试用的方法尚未完成本版本组织" in system
+    assert "尚未发布的试写" in system
+    assert "direction 简述本次局部探索的问题" in system
+    assert "instruction 描述可多次使用的操作与检验" in system
+    assert "持续工作方式的变化通过 revise/adopt" in system
+    # Guidance observes work, while the finite menu still permits keeping an
+    # effective method, waiting, inspecting, and revising at arbitrary depth.
+    for action, args in [
+        ("wait", {}), ("inspect", {"method_id": "method-old"}), ("apply", {"method_id": "method-old"}),
+        ("revise", {"method_id": "method-old", "instruction": "先接住门外的回应，检验去处差异。"}),
+    ]:
+        assert validate_decision(current, {"action": action, "args": args})
+
+
+@pytest.mark.parametrize("organized", [False, True])
+def test_temporary_candidate_trial_guidance_follows_active_exact_method_not_formal_adoption(organized):
+    current = frame()
+    old = {"kind": "method", "object_id": "method-old", "version": "version-old"}
+    active = {"kind": "method", "object_id": "method-candidate", "version": "version-candidate"}
+    current["method"] = {"id": active["object_id"], "version": active["version"],
+                         "instruction": "把两种回应并置，检验各自的后果。"}
+    current["method_work"] = {"adopted_ref": old, "applied_ref": active if organized else old}
+    system = DeepSeekGrowthProvider(Settings()).projection(current, "decide")["messages"][0]["content"]
+    assert ("当前正在采用或临时试用的方法尚未完成本版本组织" in system) is not organized
+    assert "apply 该候选执行组织并" in system
+    assert "临时试用" in system and "adopt 正式采用" in system
+    assert "adopt 后才能影响" not in system
+
+
+@pytest.mark.parametrize("stage", ["decide", "draft", "render"])
+def test_positive_experiential_style_guides_methods_feedback_and_all_prose_stages(stage):
+    projection = DeepSeekGrowthProvider(Settings()).projection(frame(), stage)
+    system = projection["messages"][0]["content"]
+    assert "以正在发生的事组织句子" in system
+    assert "表达以肯定、具体、可感知的陈述为主" in system
+    assert "有情节依据的拒绝、否认、缺失与冲突" in system
+    assert "direction、instruction、responses" in system
+    assert "方法与评议也采用正向可执行的表述" in system
+
+
+@pytest.mark.parametrize("stage", ["draft", "render"])
+async def test_grounded_refusal_and_denial_remain_valid_narrative(stage):
+    text = '她握住门闩：“我不跟你走。”他放下杯子，回答自己没有见过那封信。'
+    requests = []
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=envelope({"text": text}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await getattr(DeepSeekGrowthProvider(Settings(api_key=KEY), client), stage)(frame())
+    assert result.value == text
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("program", [{"node_ids": ["node-a"], "purpose": "回应仍然有效"},
+                                    {"node_ids": ["node-a"], "groups": {"同一入口": ["node-a"]}}])
+def test_omitting_purpose_preserves_existing_method_goal_and_is_not_a_change(program):
+    current = frame()
+    current["method"]["program"] = program
+    with pytest.raises(ProviderError):
+        validate_decision(current, {"action": "revise", "args": {
+            "method_id": "method-old", "instruction": current["method"]["instruction"],
+        }})
+
+
+async def test_unchanged_revision_can_be_repaired_into_evidence_backed_material_change():
+    current = frame()
+    current["method"]["program"] = {"node_ids": ["node-a"]}
+    current["responses"] = [{"id": "response-a", "text": "只看门前让放下杯子的回应无法进入下一段。"}]
+    received = []
+    def handler(request):
+        received.append(json.loads(request.content))
+        args = {"method_id": "method-old", "instruction": current["method"]["instruction"]}
+        if len(received) > 1:
+            args.update({"input_ids": ["response-a"], "program": {
+                "node_ids": ["node-b", "node-a"], "groups": {"回应后的处境": ["node-b", "node-a"]},
+            }})
+        return httpx.Response(200, json=envelope({"action": "revise", "args": args}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = DeepSeekGrowthProvider(Settings(api_key=KEY), client)
+        with pytest.raises(ProviderError) as captured:
+            await provider.decide(current)
+        repaired = await provider.decide(current, repair=captured.value.feedback)
+    assert repaired.value["args"]["program"]["node_ids"] == ["node-b", "node-a"]
+    assert repaired.value["args"]["input_ids"] == ["response-a"]
+    assert "instruction:schema_invalid" in received[1]["messages"][0]["content"]
+    assert len(received) == 2
 
 
 @pytest.mark.parametrize("program", [
@@ -455,3 +664,13 @@ def test_invalid_frozen_capability_table_is_safe_frame_error(actions):
     with pytest.raises(ProviderError) as captured:
         project_frame(current, "decide")
     assert captured.value.code == "GROWTH_FRAME_INVALID"
+
+
+@pytest.mark.parametrize("field", ["method_work", "reading_work"])
+def test_invalid_work_observation_is_safe_frame_error(field):
+    current = frame()
+    current[field] = ["untrusted diagnostic data"]
+    with pytest.raises(ProviderError) as captured:
+        DeepSeekGrowthProvider(Settings()).projection(current, "decide")
+    assert captured.value.code == "GROWTH_FRAME_INVALID"
+    assert "untrusted" not in str(captured.value)

@@ -9,6 +9,14 @@ visits have separate contracts. See [growth and reading contract](GROWTH_READING
 New `/api/graph-runs` and `/api/graph-presets` routes do not replace `/api/runs`.
 Fixture validation and deterministic replay prove mechanisms, not literary semantics.
 
+In v0.6.2, graph page reads treat an end offset as page capacity and return explicit
+requested/effective ranges, EOF and clipping evidence; immutable navigation spans
+remain strict. New bootstrap programs omit fixed selection and use current input
+fallback. Runtime method revisions sparsely merge program fields; local draft
+direction does not replace the initial scope direction. Frozen requests, published
+bodies and previous method versions remain stored. See the work/recovery details in
+[growth execution guide](GROWTH_READING.md).
+
 ## Bounded context pages (v0.5.2)
 
 New v2 jobs use `provider-json-v3-bounded` and `source-pages-v1`. Version-1 and

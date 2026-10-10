@@ -266,6 +266,81 @@ describe("growth and independent reading workbench", () => {
     expect(screen.queryByText("这是候选试验里的文本。")).not.toBeInTheDocument();
   });
 
+  it("distinguishes exact adopted versions, starting methods, candidates and real organization", async () => {
+    const parent = { kind: "method", object_id: "shared-method", version: "starting-version" };
+    snapshot.windows[0].method_ref = { ...parent, version: "adopted-version" };
+    snapshot.windows[1].method_ref = parent;
+    snapshot.events = [
+      { id: "revision-event", action: "revise", graph_commit: 2, details: { scope_id: "window:a", work_seq: 3, method_id: "shared-method", version: "adopted-version" } },
+      { id: "apply-event", action: "apply", graph_commit: 2, details: { scope_id: "window:a", work_seq: 4, method_id: "shared-method", version: "adopted-version" } },
+      { id: "adoption-event", action: "adopt", graph_commit: 2, details: { scope_id: "window:a", work_seq: 5, method_id: "shared-method", version: "adopted-version" } },
+    ];
+    overrides["GET /api/graph-runs/graph-1/methods?offset=0"] = () => json({ items: [
+      { id: "shared-method", version: "starting-version", instruction: "通用起步方向。", program: { node_ids: ["node-a"] } },
+      { id: "shared-method", version: "adopted-version", instruction: "以迟到的信与回复并置，继续一次实际交付。", parent_ref: parent,
+        source_refs: [parent, { kind: "response", object_id: "reply-1", version: "response-version" }],
+        program: { node_ids: ["node-a", "node-grown"], purpose: "让回复改变交付次序。", groups: { "来信与回信": ["node-a", "node-grown"] }, relations: [{ source_id: "node-a", target_id: "node-grown", relation: "回信改变了去路" }] } },
+      { id: "candidate-method", version: "candidate-version", instruction: "尚未采用的新候选。", parent_ref: parent, program: { node_ids: [] } },
+    ] });
+    await create();
+    fireEvent.click(screen.getByRole("button", { name: "方法、试验与回应" }));
+    await screen.findByText("尚未采用的新候选。");
+    const current = screen.getByRole("region", { name: "方法版本" }).querySelector('[aria-label="当前采用方法"]')!;
+    const first = within(current as HTMLElement).getByText("写信人").closest(".growth-record")!;
+    expect(first).toHaveTextContent("已采用修改版本");
+    expect(first).toHaveTextContent("以迟到的信与回复并置");
+    expect(first).not.toHaveTextContent("通用起步方向。");
+    expect(first).toHaveTextContent("选材 2 个节点 · 分组 1 个 · 关系 1 条");
+    expect(first).toHaveTextContent("让回复改变交付次序。");
+    const second = within(current as HTMLElement).getByText("读信人").closest(".growth-record")!;
+    expect(second).toHaveTextContent("仍使用起步版本");
+    expect(second).toHaveTextContent("通用起步方向。");
+    expect(screen.getByText("当前采用 · 写信人")).toBeInTheDocument();
+    expect(screen.getByText("未被当前工作位置采用")).toBeInTheDocument();
+    expect(screen.getByText("方法依据 · 2 个精确对象")).toBeInTheDocument();
+    const actions = screen.getByRole("region", { name: "近期方法动作" });
+    expect(actions).toHaveTextContent("写信人 · 修改方法");
+    expect(actions).toHaveTextContent("写信人 · 临时试用");
+    expect(actions).toHaveTextContent("写信人 · 正式采用");
+    fireEvent.click(screen.getByRole("button", { name: "连续阅读" }));
+    expect(screen.queryByText("以迟到的信与回复并置，继续一次实际交付。")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(start|step)$/.test(url))).toBe(false);
+  });
+
+  it("loads adopted method history without substituting a newer version under the same ID", async () => {
+    snapshot.windows[0].method_ref = { kind: "method", object_id: "same-id", version: "still-adopted" };
+    overrides["GET /api/graph-runs/graph-1/methods?offset=0"] = () => json({ items: [{ id: "same-id", version: "new-candidate", instruction: "较新的候选版本。", parent_ref: snapshot.windows[0].method_ref }], next_offset: 100 });
+    overrides["GET /api/graph-runs/graph-1/methods?offset=100"] = () => json({ items: [{ id: "same-id", version: "still-adopted", instruction: "仍被采用的旧版本。" }], next_offset: null });
+    await create();
+    fireEvent.click(screen.getByRole("button", { name: "方法、试验与回应" }));
+    await screen.findByText("较新的候选版本。");
+    const current = document.querySelector('[aria-label="当前采用方法"]')!;
+    expect(current).toHaveTextContent("该精确版本正文尚未载入");
+    expect(current).not.toHaveTextContent("较新的候选版本。");
+    fireEvent.click(screen.getByRole("button", { name: "载入更多记录" }));
+    await waitFor(() => expect(current).toHaveTextContent("仍被采用的旧版本。"));
+    expect(current).not.toHaveTextContent("该精确版本正文尚未载入");
+  });
+
+  it("distinguishes dynamic method selection from an explicit empty node selection", async () => {
+    snapshot.windows[0].method_ref = { kind: "method", object_id: "dynamic-method", version: "dynamic-version" };
+    snapshot.windows[1].method_ref = { kind: "method", object_id: "empty-method", version: "empty-version" };
+    overrides["GET /api/graph-runs/graph-1/methods?offset=0"] = () => json({ items: [
+      { id: "dynamic-method", version: "dynamic-version", instruction: "根据实际来处继续。", program: {} },
+      { id: "empty-method", version: "empty-version", instruction: "暂时保留空选材。", program: { node_ids: [] } },
+    ] });
+    await create();
+    fireEvent.click(screen.getByRole("button", { name: "方法、试验与回应" }));
+    await screen.findByText("当前采用 · 写信人");
+    const current = document.querySelector('[aria-label="当前采用方法"]')!;
+    const dynamic = within(current as HTMLElement).getByText("写信人").closest(".growth-record")!;
+    const empty = within(current as HTMLElement).getByText("读信人").closest(".growth-record")!;
+    expect(dynamic).toHaveTextContent("动态选材 · 当前来处与前沿");
+    expect(dynamic).not.toHaveTextContent("选材 0 个节点");
+    expect(empty).toHaveTextContent("选材 0 个节点");
+    expect(empty).not.toHaveTextContent("动态选材");
+  });
+
   it("polls only while independent work scopes are active and stops after pause", async () => {
     await create();
     vi.useFakeTimers();
