@@ -18,8 +18,9 @@ from .security import contains_credential
 
 
 class GrowthPresetLibrary:
-    def __init__(self, root: Path, credential=""):
+    def __init__(self, root: Path, credential="", builtins_root: Path | None = None):
         self.root, self.credential, self.lock = root, credential, threading.RLock()
+        self.builtins_root = builtins_root
         try:
             with _directory_fd(root, create=True):
                 pass
@@ -62,7 +63,7 @@ class GrowthPresetLibrary:
     def version(data):
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
-    def load_directory(self, directory, key, version):
+    def load_directory(self, directory, key, version=None):
         meta = _read_json(directory / "preset.json")
         if meta.get("id") != key or not isinstance(meta.get("windows"), list):
             raise KernelError("PRESET_INVALID", "预设清单无效。")
@@ -78,18 +79,40 @@ class GrowthPresetLibrary:
                             "direction": _read_text(folder / "orientation.md")})
         value = self.validate({"id": meta["id"], "name": meta.get("name"), "windows": windows,
                                "shared_seed": _read_text(directory / "shared.md")})
-        if self.version(value) != version:
+        computed = self.version(value)
+        if version is not None and computed != version:
             raise KernelError("PRESET_INVALID", "预设内容不匹配已保存的版本。")
-        return {**value, "version": version}
+        return {**value, "version": computed}
+
+    def builtin_exists(self, key):
+        self.group(key)
+        if self.builtins_root is None:
+            return False
+        try:
+            with _directory_fd(self.builtins_root / key):
+                return True
+        except FileNotFoundError:
+            return False
+        except (OSError, PresetError):
+            raise KernelError("PRESET_INVALID", "示例预设路径不安全。") from None
 
     def get(self, key):
         try:
             group = self.group(key)
+            # Existing custom data keeps precedence; adding a bundled example
+            # must not silently hide a user's already saved preset.
+            try:
+                with _directory_fd(group) as descriptor:
+                    has_custom = "current.json" in os.listdir(descriptor)
+            except FileNotFoundError:
+                has_custom = False
+            if not has_custom and self.builtin_exists(key):
+                return {**self.load_directory(self.builtins_root / key, key), "origin": "builtin"}
             current = _read_json(group / "current.json")
             version = current.get("version")
             if not isinstance(version, str) or not re.fullmatch(r"[0-9a-f]{64}", version):
                 raise KernelError("PRESET_INVALID", "预设版本无效。")
-            return self.load_directory(group / "versions" / version, key, version)
+            return {**self.load_directory(group / "versions" / version, key, version), "origin": "custom"}
         except FileNotFoundError:
             raise KernelError("PRESET_NOT_FOUND", "生成窗口预设不存在。") from None
         except (OSError, PresetError, TypeError, ValueError):
@@ -98,10 +121,15 @@ class GrowthPresetLibrary:
     def list(self):
         result = []
         try:
-            names = _directory_names(self.root)
+            names = set(_directory_names(self.root))
         except (OSError, PresetError):
-            return result
-        for name in names:
+            names = set()
+        if self.builtins_root is not None:
+            try:
+                names.update(_directory_names(self.builtins_root))
+            except (OSError, PresetError):
+                pass
+        for name in sorted(names):
             if self.valid_id(name):
                 try:
                     result.append(self.get(name))
@@ -111,6 +139,16 @@ class GrowthPresetLibrary:
 
     def save(self, data, expected_version=None):
         data = self.validate(data)
+        if self.builtin_exists(data["id"]):
+            try:
+                with _directory_fd(self.group(data["id"])) as descriptor:
+                    custom_exists = "current.json" in os.listdir(descriptor)
+            except FileNotFoundError:
+                custom_exists = False
+            except (OSError, PresetError):
+                raise KernelError("PRESET_INVALID", "预设路径不安全。") from None
+            if not custom_exists:
+                raise KernelError("PRESET_READ_ONLY", "内置示例请使用新 ID 另存为自己的预设。")
         if expected_version is not None and (not isinstance(expected_version, str)
                                             or not re.fullmatch(r"[0-9a-f]{64}", expected_version)):
             raise KernelError("PRESET_INVALID", "预设版本无效。")

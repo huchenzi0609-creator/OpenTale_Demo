@@ -101,7 +101,7 @@ def test_preset_reads_and_import_recheck_reloaded_credential(runner):
     with TestClient(app) as client:
         catalog = client.get("/api/graph-presets")
         assert catalog.status_code == 200 and KEY not in catalog.text
-        assert catalog.json()["presets"] == []
+        assert not [preset for preset in catalog.json()["presets"] if preset["origin"] == "custom"]
         for response in (client.get("/api/graph-presets/review"),
                          client.post("/api/graph-runs", json={"preset_id": "graph:review"})):
             assert response.status_code == 422 and KEY not in response.text

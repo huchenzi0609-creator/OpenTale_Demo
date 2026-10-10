@@ -12,6 +12,8 @@
 
 窗口预设通过 `/api/graph-presets` 单独保存。`story.md` 保存初始叙事文字，`orientation.md` 保存工作方向，`window.json` 与 `preset.json` 保存系统元数据。更新需要 `expected_version`，旧版本保持可用；载入新预设使用 `preset_id: "graph:<预设ID>"`。原人物预设也可以作为新实验的显式入口导入。
 
+原生内置示例从仓库 `examples/growth-presets/` 读取，与当前服务的运行时目录独立，返回 `origin: builtin`；自定义版本返回 `origin: custom`。内置示例无需 `current.json`，按其验证后的 Markdown 内容计算版本。可在编辑器改变本次使用的窗口，但保存须另用新 ID；已存在的同名自定义资料保持优先，不被新增示例隐藏。两组小说示例只保留选定截面，作者侧切点说明不注入模型。
+
 ## 离线验证
 
 从仓库根目录运行：

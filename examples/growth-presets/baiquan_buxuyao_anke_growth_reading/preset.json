@@ -1,0 +1,26 @@
+{
+  "id": "baiquan_buxuyao_anke_growth_reading",
+  "name": "败犬不需要安可 · 午后切面",
+  "windows": [
+    {
+      "id": "wang_lishi",
+      "label": "王丽诗"
+    },
+    {
+      "id": "under_desk",
+      "label": "收银台下"
+    },
+    {
+      "id": "sa_jie",
+      "label": "萨姐"
+    },
+    {
+      "id": "drink_counter_man",
+      "label": "饮品柜台的男人"
+    },
+    {
+      "id": "red_clothed_woman",
+      "label": "小说架边的红衣女人"
+    }
+  ]
+}

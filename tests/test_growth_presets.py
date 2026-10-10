@@ -196,5 +196,5 @@ def test_graph_preset_api_long_save_conflict_reload_and_prefixed_import(tmp_path
         body = client.get(f"/api/graph-runs/{snapshot['run']['id']}/nodes/{seed_id}").json()["text"]
         assert body == definition["windows"][0]["seed"]
         listed = client.get("/api/graph-presets").json()["presets"]
-        assert [preset["id"] for preset in listed] == [definition["id"]]
+        assert [preset["id"] for preset in listed if preset["origin"] == "custom"] == [definition["id"]]
     app.state.growth_runner.store.close()

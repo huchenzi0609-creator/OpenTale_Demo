@@ -1,0 +1,30 @@
+{
+  "id": "a_pale_view_of_hills_summer_opening",
+  "name": "远山淡影 · 河岸的夏天",
+  "windows": [
+    {
+      "id": "etsuko_window",
+      "label": "悦子 · 公寓窗边"
+    },
+    {
+      "id": "sachiko_window",
+      "label": "佐知子 · 木屋里的茶具"
+    },
+    {
+      "id": "mariko_window",
+      "label": "万里子 · 门边的画纸"
+    },
+    {
+      "id": "jiro_window",
+      "label": "二郎 · 下班以前"
+    },
+    {
+      "id": "ogata_window",
+      "label": "绪方 · 尚未收起的棋盘"
+    },
+    {
+      "id": "fujiwara_window",
+      "label": "藤原 · 午后面店"
+    }
+  ]
+}

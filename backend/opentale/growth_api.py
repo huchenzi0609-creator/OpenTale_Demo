@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 from fastapi import Query
 from fastapi.responses import StreamingResponse
@@ -58,7 +59,8 @@ class ForkGraph(Record):
 
 
 def register_graph_routes(app, runner, library):
-    presets = GrowthPresetLibrary(runner.store.path.parent / "presets", runner.settings.api_key.get_secret_value())
+    presets = GrowthPresetLibrary(runner.store.path.parent / "presets", runner.settings.api_key.get_secret_value(),
+                                 Path(__file__).resolve().parents[2] / "examples" / "growth-presets")
     app.state.graph_presets = presets
 
     @app.get("/api/graph-presets")

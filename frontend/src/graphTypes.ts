@@ -127,6 +127,7 @@ export interface GraphPreset {
   id: string;
   name: string;
   version: string;
+  origin?: "builtin" | "custom";
   windows: { id: string; label: string; seed: string; direction?: string }[];
   shared_seed: string;
 }

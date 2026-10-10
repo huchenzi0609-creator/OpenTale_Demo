@@ -70,6 +70,32 @@ async function create() {
 }
 
 describe("growth and independent reading workbench", () => {
+  it("offers bundled cross-sections and saves edited copies under fresh custom IDs", async () => {
+    const bundled: GraphPreset = { id: "summer-opening", name: "远山淡影 · 河岸的夏天", version: "builtin-version",
+      origin: "builtin", windows: [{ id: "river", label: "河岸", seed: "她刚搬到河岸。", direction: "" }], shared_seed: "夏日午后。" };
+    graphPresets = [bundled];
+    render(<GrowthWorkbench />);
+    await screen.findByRole("option", { name: "远山淡影 · 河岸的夏天 · 内置截面示例" });
+    fireEvent.change(screen.getByLabelText("种子来源"), { target: { value: "graph:summer-opening" } });
+    expect(screen.getByLabelText("种子 Markdown 1")).toHaveValue("她刚搬到河岸。");
+    expect(screen.getByLabelText("生长方向 1（可选）")).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("种子 Markdown 1"), { target: { value: "她在河岸遇见新的邻居。" } });
+    fireEvent.click(screen.getByRole("button", { name: "另存为我的预设" }));
+    await screen.findByRole("button", { name: "保存预设更新" });
+    const first = JSON.parse(fetchMock.mock.calls.filter(([url, options]) => url === "/api/graph-presets" && options?.method === "POST").at(-1)![1]!.body as string);
+    expect(first.id).not.toBe(bundled.id);
+    expect(first.expected_version).toBeUndefined();
+    expect(first.windows[0].seed).toBe("她在河岸遇见新的邻居。");
+    expect(graphPresets.find((preset) => preset.id === bundled.id)?.windows[0].seed).toBe("她刚搬到河岸。");
+    fireEvent.change(screen.getByLabelText("种子来源"), { target: { value: "graph:summer-opening" } });
+    fireEvent.click(screen.getByRole("button", { name: "另存为我的预设" }));
+    await screen.findByRole("button", { name: "保存预设更新" });
+    const second = JSON.parse(fetchMock.mock.calls.filter(([url, options]) => url === "/api/graph-presets" && options?.method === "POST").at(-1)![1]!.body as string);
+    expect(second.id).not.toBe(first.id);
+    expect(second.expected_version).toBeUndefined();
+    expect(fetchMock.mock.calls.some(([url, options]) => url === "/api/graph-runs" && options?.method === "POST")).toBe(false);
+  });
+
   it("retains complete Markdown, optional directions and one shared seed on creation without generating", async () => {
     render(<GrowthWorkbench />);
     await waitFor(() => expect(screen.getByRole("button", { name: "＋ 创建生长实验" })).toBeEnabled());

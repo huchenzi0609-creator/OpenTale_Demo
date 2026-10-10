@@ -19,6 +19,7 @@ export default function GrowthSetup({ model }: { model: GrowthWorkbenchModel }) 
   const customPresetId = useRef(`growth-${crypto.randomUUID().slice(0, 8)}`);
   const windowSource = source === "custom" || source.startsWith("graph:");
   const graphPreset = model.graphPresets.find((preset) => `graph:${preset.id}` === source);
+  const bundledPreset = graphPreset?.origin === "builtin";
   const disabled = model.booting || !!model.busy;
   const seedsValid = title.trim() && windows.every((window) => window.label.trim() && window.seed.trim());
   const valid = title.trim() && (!windowSource || seedsValid) &&
@@ -48,11 +49,12 @@ export default function GrowthSetup({ model }: { model: GrowthWorkbenchModel }) 
         }
       }} disabled={disabled}>
         <option value="custom">编辑种子与生成窗口</option>
-        {model.graphPresets.map((preset) => <option key={`graph:${preset.id}`} value={`graph:${preset.id}`}>{preset.name} · 图种子预设</option>)}
+        {model.graphPresets.map((preset) => <option key={`graph:${preset.id}`} value={`graph:${preset.id}`}>{preset.name}{preset.origin === "builtin" ? " · 内置截面示例" : " · 图种子预设"}</option>)}
         {model.presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}{preset.origin === "custom" ? " · 自定义" : ""}</option>)}
       </select></label>
       {windowSource ? <>
         <p className="helper">种子是起点。每个窗口可长出新节点，也可再次进入已有节点；方向可以留空。</p>
+        {bundledPreset && <p className="helper">此示例保留一个初始截面。后续情节与结局由模型自由构造；你可以直接修改本次起点，也可以另存自己的版本。</p>}
         {windows.map((window, index) => <fieldset key={window.id} className="growth-window-draft" disabled={disabled}>
           <legend>生成窗口 {index + 1}</legend>
           <label>窗口名称 {index + 1}<input value={window.label} onChange={(event) => patchWindow(window.id, "label", event.target.value)} /></label>
@@ -68,9 +70,10 @@ export default function GrowthSetup({ model }: { model: GrowthWorkbenchModel }) 
         <label>共同种子（可选）<textarea rows={4} value={sharedSeed} disabled={disabled} onChange={(event) => setSharedSeed(event.target.value)} /></label>
         <p className="helper">共同种子只创建一个原始节点，供多个窗口作为入口。正文与每个窗口自己的种子分别保存。</p>
         <button type="button" className="button secondary full" disabled={disabled || !seedsValid} onClick={async () => {
-          const saved = await model.savePreset({ id: graphPreset?.id ?? customPresetId.current, name: title.trim(), windows, shared_seed: sharedSeed, ...(graphPreset ? { expected_version: graphPreset.version } : {}) });
+          const saveId = bundledPreset ? `growth-${crypto.randomUUID().slice(0, 8)}` : graphPreset?.id ?? customPresetId.current;
+          const saved = await model.savePreset({ id: saveId, name: title.trim(), windows, shared_seed: sharedSeed, ...(graphPreset && !bundledPreset ? { expected_version: graphPreset.version } : {}) });
           if (saved) setSource(`graph:${saved.id}`);
-        }}>{model.busy === "保存图种子预设" ? "正在保存预设…" : graphPreset ? "保存预设更新" : "保存为图种子预设"}</button>
+        }}>{model.busy === "保存图种子预设" ? "正在保存预设…" : bundledPreset ? "另存为我的预设" : graphPreset ? "保存预设更新" : "保存为图种子预设"}</button>
         <p className="helper">以实验名称保存窗口、方向与完整 Markdown。保存预设不创建实验，也不调用模型。</p>
         {model.notice && <p className="helper" role="status">{model.notice}</p>}
       </> : <p className="helper">将所选预设的人物资料导入为生成窗口，共同表达导入为共享入口。原有预设保留。</p>}
