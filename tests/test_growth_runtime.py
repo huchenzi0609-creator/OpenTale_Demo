@@ -237,10 +237,13 @@ async def test_accepted_draft_keeps_original_method_and_source_refs_after_later_
     await runner.step_scope(run_id, scope)
     trial = own_rows(runner, run_id, "trial", scope)[0]
     assert trial["method_ref"] == original_ref
-    assert trial["source_refs"] == [
-        {"kind": "node", "object_id": source["id"], "version": source["version"]}
-        for source in original_frame["sources"]
-    ]
+    candidate = runner.store.get(run_id, "candidate", trial["result_ref"]["object_id"], include_private=True)
+    frozen_source_refs = list({(span["node_id"], span["node_version"]): {
+        "kind": "node", "object_id": span["node_id"], "version": span["node_version"]}
+        for span in candidate["source_spans"]}.values())
+    assert trial["source_refs"] == frozen_source_refs + [trial["generation_invocation_ref"]]
+    assert all({"kind": "node", "object_id": source["id"], "version": source["version"]}
+               in frozen_source_refs for source in original_frame["sources"])
     candidate = runner.store.get(run_id, "candidate", trial["result_ref"]["object_id"],
                                  version=trial["result_ref"]["version"], include_private=True)
     assert candidate["method_ref"] == original_ref
@@ -267,7 +270,7 @@ async def test_budget_exhaustion_preserves_cursor_and_other_scope_can_resume_whe
     assert own_rows(runner, run_id, "receipt", "window:stairs")[-1]["action"] == "inspect"
     snapshot = await runner.step_scope(run_id, scope)
     assert own_rows(runner, run_id, "receipt", scope)[-1]["action"] == "try_write"
-    assert snapshot["run"]["usage"]["calls"] == 5
+    assert snapshot["run"]["usage"]["calls"] == 6
 
 
 async def test_token_preflight_never_calls_or_leaves_reservation(runner, monkeypatch):
@@ -338,7 +341,7 @@ async def test_settings_and_hidden_transport_metadata_never_enter_saved_requests
     serialized = json.dumps(data, ensure_ascii=False)
     assert KEY not in serialized and "Authorization" not in serialized and "reasoning_content" not in serialized
     assert "api.deepseek.com" not in serialized
-    assert state.config["usage"]["calls"] == 11
+    assert state.config["usage"]["calls"] == 13
     assert state.config["usage"]["input_tokens"] == state.config["usage"]["output_tokens"] == 0
 
 

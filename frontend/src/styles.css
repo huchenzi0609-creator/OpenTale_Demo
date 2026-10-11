@@ -1699,6 +1699,9 @@ progress::-moz-progress-bar {
 .growth-window-card > .helper { margin-top: 8px; }
 .growth-window-direction { white-space: pre-wrap; font-size: 11px; line-height: 1.8; margin: 8px 0; color: var(--muted); }
 .growth-work-action { font-size: 11px; line-height: 1.8; color: #74896f; margin: 8px 0; }
+.growth-work-state { margin: 8px 0; }
+.growth-work-state > .helper { margin: 5px 0; }
+.growth-work-state > details { margin-top: 10px; font-size: 12px; }
 .growth-entry-nodes { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0 3px; }
 .growth-entry-nodes .text-button, .growth-window-card > .text-button { font-size: 10px; }
 .growth-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 12px; }

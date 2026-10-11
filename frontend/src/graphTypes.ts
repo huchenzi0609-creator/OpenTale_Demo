@@ -62,6 +62,7 @@ export interface GraphPassage {
   text?: string;
   visit_ids: string[];
   source_spans: GraphSourceSpan[];
+  generation_invocation_ref?: GraphObjectRef | null;
 }
 export interface GraphReading {
   id: string;
@@ -87,6 +88,10 @@ export interface GraphSession {
   error?: (SafeError & { validation_feedback?: { category: string; issues: string[] } }) | null;
   last_review_ref?: GraphObjectRef | null;
   max_review_order?: number;
+  phase?: "ready" | "draft_saved" | "review_pending" | "ready_to_publish";
+  saved_draft_ref?: GraphObjectRef | null;
+  review_debt?: { id: string; status: "pending" | "failed" | "complete"; stage: string; request_id: string; targets: GraphObjectRef[]; error?: Pick<SafeError, "code" | "message"> | null }[];
+  last_invocation_ref?: GraphObjectRef | null;
   view?: {
     execution?: {
       max_call_depth?: number;
@@ -117,6 +122,9 @@ export interface GraphRecord {
   evaluation_method_ref?: GraphObjectRef | null;
   review_order?: number;
   review_request_id?: string;
+  generation_invocation_ref?: GraphObjectRef | null;
+  child_result_refs?: GraphObjectRef[];
+  input_refs?: GraphObjectRef[];
   source_spans?: GraphSourceSpan[];
   [field: string]: unknown;
 }
@@ -169,6 +177,7 @@ export interface GraphSnapshot {
   responses: GraphRecord[];
   receipts: GraphRecord[];
   events: GraphRecord[];
+  invocations?: GraphRecord[];
   counts?: Record<string, number>;
 }
 export interface GraphProjection {

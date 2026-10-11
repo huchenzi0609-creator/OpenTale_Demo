@@ -10,6 +10,7 @@ from uuid import uuid4
 from .config import Settings
 from .domain import Limits
 from .growth_capabilities import KINDS, CapabilityError, capability_table, resolve_handle
+from .growth_invocations import attach_invocation_result, invocation_frame, plan_invocations
 from .growth_kernel import GrowthError, add_node, add_passage, navigate
 from .growth_methods import compile_method
 from .growth_store import GrowthStore
@@ -126,7 +127,20 @@ class GrowthRunner:
                 result["parent_ids"] = candidate.get("parent_ids", [])
         elif row.get("text_ref"):
             result["text"] = self.body(row)
+        if kind == "passage":
+            use = self.store.get(state.run_id, "generation_use", row["id"], include_private=True)
+            if use and use.get("object_ref", {}).get("version") == row["version"]:
+                result["generation_invocation_ref"] = use["generation_invocation_ref"]
         return result
+
+    @staticmethod
+    def aggregate_status(state):
+        statuses = [a.status for a in [*state.windows.values(), *state.reading_tracks.values()]]
+        if "calling" in statuses:
+            return "running"
+        if "error" in statuses:
+            return "error"
+        return "idle"
 
     def page_text(self, state, kind, row):
         if kind in {"link", "view", "visit"}:
@@ -157,11 +171,94 @@ class GrowthRunner:
         end = len(text) if ref.kind == "method" else min(len(text), 2500)
         value = {**ref.model_dump(), "text": text[:end], "start": 0, "end": end,
                  "full_length": len(text), "partial": end < len(text)}
-        if ref.kind in {"method", "view", "link", "visit"}:
+        value["origin"] = ({"response": "model_review_opinion" if row.get("review_request_id") else "model_comment",
+                            "trial": "private_draft", "passage": "reading_projection", "invocation": "method_proposal",
+                            "node": "published_narrative"}).get(ref.kind, "stored_structure")
+        if ref.kind in {"method", "view", "link", "visit", "trial", "passage", "invocation"}:
             value["object"] = ({**row, "execution": self.execution_projection(row.get("execution", {})),
                                 "input_refs": row.get("input_refs", [])[-12:], "object_partial": True}
                                if ref.kind == "view" else row)
         return value
+
+    async def prepare_generation(self, state, scope, session, frame, seq, stage):
+        """Execute precise method calls before prose; accepted historic requests stay frozen."""
+        saved = self.store.get(state.run_id, "request", f"request-{identifier(scope, seq, stage)}",
+                               include_private=True)
+        if saved:
+            return saved["frame"]
+        if frame.get("work_protocol") != "growth-work-v3":
+            return frame
+        method = frame["method"]
+        ref = {"kind": "method", "object_id": method["id"], "version": method["version"]}
+        refs = [{"kind": "node", "object_id": s["id"], "version": s["version"]}
+                for s in frame.get("sources", [])]
+        context = {"stage": stage, "goal": frame.get("direction", ""),
+                   "sources": [{k: s[k] for k in ("id", "version", "start", "end") if k in s}
+                               for s in frame.get("sources", [])],
+                   "parent_ids": frame.get("parent_ids", []), "visit_ids": frame.get("visit_ids", []),
+                   "frontier_refs": [{k: s[k] for k in ("id", "version", "start", "end") if k in s}
+                                     for s in frame.get("world_frontier", [])],
+                   "reading_history_refs": [{k: p[k] for k in ("id", "version", "start", "end", "source_spans") if k in p}
+                                            for p in frame.get("reading_history", [])],
+                   "feedback_refs": [{"kind": "response", "object_id": r["id"], "version": r["version"]}
+                                     for r in frame.get("responses", [])]}
+        plan = plan_invocations(self.store, state, scope, ref, refs, context=context)
+        base = {k: frame[k] for k in ("scope_id", "role", "direction", "work_protocol", "sources", "allowed_actions",
+                "responses", "reading_history", "visit_ids", "source_spans", "evidence_context",
+                "world_frontier") if k in frame}
+        results = {}
+        for application in plan["frames"]:
+            old = self.store.get(state.run_id, "invocation", application["frame_id"], scope_id=scope)
+            if old:
+                results[application["frame_id"]] = old
+                continue
+            task_frame = invocation_frame(self.store, self.load(state.run_id), scope, plan,
+                                          application["frame_id"], results, base_frame=base)
+            task_frame = self.delivered_frame(self.load(state.run_id), scope, task_frame)
+            request_key = f"request-{identifier(scope, 'invoke', application['fingerprint'])}"
+            text, request_id = await self.call(state.run_id, scope, seq, "invoke", task_frame,
+                                               request_key=request_key)
+            frozen_invoke = self.store.get(state.run_id, "request", request_id, include_private=True)["frame"]
+            children = [{"kind": "invocation", "object_id": results[key]["id"],
+                         "version": results[key]["version"]} for key in application["child_frame_ids"]]
+            results[application["frame_id"]] = self.put(state.run_id, "invocation", {
+                "id": application["frame_id"], "scope_id": scope, "private_scope": scope,
+                "method_ref": application["method_ref"], "input_refs": application["input_refs"],
+                "child_result_refs": children, "fingerprint": application["fingerprint"],
+                "text_ref": self.store.put_text(text).model_dump(), "request_id": request_id,
+                "used_source_spans": frozen_invoke.get("invocation_source_spans", []),
+                "status": "proposal_not_world_fact", "depth": application["depth"],
+                "max_call_depth": plan["max_call_depth"], "plan_id": plan["plan_id"]})
+        prepared = attach_invocation_result(self.store, self.load(state.run_id), scope, plan, results, frame)
+        session["last_invocation_ref"] = prepared["method_invocation"]["ref"]
+        return self.delivered_frame(self.load(state.run_id), scope, prepared)
+
+    async def review_product(self, state, scope, session, frame, seq, method, targets, **kwargs):
+        """A rejected advisory review cannot invalidate an already accepted product."""
+        session["phase"] = "review_pending"
+        self.put(state.run_id, "session", session)
+        try:
+            result = await self.review(state, scope, session, frame, seq, method, targets, **kwargs)
+            session["phase"] = "ready_to_publish" if session.get("pending_trial_id") else "ready"
+            return result
+        except ProviderError as exc:
+            feedback = exc.feedback
+            if (exc.code != "MODEL_OUTPUT_INVALID" or feedback is None or
+                    feedback.category not in {"JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION", "PROSE_INVALID"}
+                    or "WORK_PRIVATE_CONTENT" in feedback.issues):
+                raise
+            request_id = f"request-{identifier(scope, seq, 'review')}"
+            error = {"code": exc.code, "message": exc.message, "validation_feedback": feedback.prompt_data()}
+            debt = {"id": f"debt-{identifier(scope, seq)}", "status": "pending", "stage": "review",
+                    "request_id": request_id, "targets": targets, "error": error,
+                    "method_ref": {"kind": "method", "object_id": method["id"], "version": method["version"]},
+                    "automatic": kwargs.get("automatic", False), "purpose": kwargs.get("purpose", ""),
+                    "sequence": seq}
+            debts = session.setdefault("review_debt", [])
+            if not any(d["id"] == debt["id"] for d in debts):
+                debts.append(debt)
+            return {"review_status": "pending", "review_debt_id": debt["id"], "changed": True,
+                    "status": "deferred", "review_completed": False, "work_completed": False}
 
     def execution_materials(self, state, scope, execution, refs):
         chosen = [*refs, *[item["method_ref"] for item in (execution or {}).get("instruction_refs", [])[-12:]]]
@@ -198,7 +295,19 @@ class GrowthRunner:
         input_refs = [r.model_dump() for r in view.input_refs if r.kind != "node"][-12:]
         evidence = self.execution_materials(state, scope, view.execution, [*targets, *input_refs])
         review_frame = {key: frame[key] for key in ("scope_id", "role", "graph_commit", "work_seq", "direction",
-                            "allowed_actions", "sources", "responses") if key in frame}
+                            "allowed_actions", "sources", "responses", "visits", "visit_ids", "source_spans",
+                            "receipts", "evidence_context", "world_frontier", "method_invocation") if key in frame}
+        review_frame["evidence_context"] = {"coverage": "delivered_exact_versions_and_excerpts",
+            "method_results": "proposals_not_world_facts", "reviews": "model_opinions_not_verified_history",
+            "targets": [{"ref": {k: m[k] for k in ("kind", "object_id", "version")},
+                         "origin": m["origin"], "partial": m["partial"]} for m in evidence]}
+        visit_ids = list(frame.get("visit_ids", []))
+        for item in evidence:
+            if item["kind"] == "passage":
+                visit_ids.extend(item["object"].get("visit_ids", []))
+        if visit_ids:
+            review_frame["visits"] = [v for key in dict.fromkeys(visit_ids) if
+                (v := self.store.get(state.run_id, "visit", key, scope_id=scope)) is not None]
         review_frame.update(method=method, method_evidence=evidence, review_targets=targets, review_order=order,
                             method_execution=self.execution_projection(view.execution), purpose=purpose,
                             review_execution_ref={"kind": "view", "object_id": view.id, "version": view.version})
@@ -224,7 +333,7 @@ class GrowthRunner:
                 if response_ref not in trial.setdefault("feedback_refs", []):
                     trial["feedback_refs"].append(response_ref)
                     self.put(state.run_id, "trial", trial)
-        return {"response_id": response["id"], "review_order": frozen["review_order"],
+        return {"response_id": response["id"], "review_order": frozen["review_order"], "review_completed": True,
                 "evaluation_method_ref": response["evaluation_method_ref"], "changed": True}
 
     def snapshot(self, run_id):
@@ -244,7 +353,7 @@ class GrowthRunner:
             tracks.append(row)
         return self.ensure_safe({"run": {"id": run_id, "title": state.title, "provider": state.config["provider"],
                         "mode": "growth_reading", "revision": state.graph_commit,
-                        "status": "running" if active else state.status, "limits": state.config["limits"],
+                        "status": "running" if active else self.aggregate_status(state), "limits": state.config["limits"],
                         "usage": usage}, "graph_commit": state.graph_commit, "counts": state.counts,
                 "schema_version": 6, "engine_version": state.engine_version,
                 "windows": [w.model_dump() for w in state.windows.values()],
@@ -252,7 +361,7 @@ class GrowthRunner:
                 "readings": tracks, "active_scopes": active,
                 **{kind + "s": [self.expand(state, kind, row) for row in
                                  self.rows(state, kind, owner=True, latest=True)[::-1]]
-                   for kind in ("method", "trial", "response", "receipt", "event", "session")}})
+                   for kind in ("method", "trial", "response", "receipt", "event", "session", "invocation")}})
 
     def add_reading(self, run_id, title, entry_node_ids=None, direction=""):
         self.ensure_safe({"title": title, "entry_node_ids": entry_node_ids, "direction": direction})
@@ -402,11 +511,25 @@ class GrowthRunner:
         execution = (session.get("view") or {}).get("execution") or {}
         material_refs = [r for r in (session.get("view") or {}).get("input_refs", []) if r["kind"] != "node"][-12:]
         method_evidence = self.execution_materials(state, scope, execution, material_refs)
+        created = next(iter(self.rows(state, "event", owner=True, limit=1)), None)
+        seed_commit = created["graph_commit"] if created and created.get("action") == "created" else 0
+        frontier = []
+        if scope.startswith("window:"):
+            for node in nodes[-12:]:
+                if node.get("created_commit", 0) > seed_commit and not node.get("private_scope"):
+                    text = self.body(node)
+                    end = min(len(text), source_page_chars)
+                    frontier.append({"id": node["id"], "version": node["version"], "text": text[:end],
+                                     "start": 0, "end": end, "full_length": len(text),
+                                     "partial": end < len(text), "parent_ids": node.get("parent_ids", [])})
+        invocations = [self.expand(state, "invocation", i) for i in
+                       self.rows(state, "invocation", scope, limit=3, latest=True)[::-1]]
+        debts = [d for d in session.get("review_debt", []) if d["status"] in {"pending", "failed"}]
         projected_view = {**session["view"], "execution": self.execution_projection(execution),
                           "input_refs": material_refs, "input_refs_partial":
                               len((session["view"] or {}).get("input_refs", [])) > len(material_refs)} if session.get("view") else None
         frame = {"scope_id": scope, "role": "window" if scope.startswith("window:") else "reading",
-                "work_protocol": "growth-work-v2",
+                "work_protocol": "growth-work-v3",
                 "graph_commit": state.graph_commit, "work_seq": session["work_seq"],
                 "actor_revision": actor.revision,
                 "direction": self.base_direction(state, scope, session), "cursor": getattr(actor, "cursor_node_id", None)
@@ -415,7 +538,8 @@ class GrowthRunner:
                 "entry_node_ids": actor.entry_node_ids,
                 "allowed_actions": ["query", "read_page", "inspect", "apply", "revise", "adopt", "respond", "reflect", "wait",
                                     "try_write", "publish"]
-                    + ([] if scope.startswith("window:") else ["navigate", "render"]),
+                    + ([] if scope.startswith("window:") else ["navigate", "render"])
+                    + (["retry_review"] if debts else []),
                 "nodes": [{"id": n["id"], "version": n["version"], "created_commit": n["created_commit"],
                            "text_preview": self.body(n)[:120] if not n.get("private_scope") else "",
                            "text_ref": n["text_ref"]} for n in nodes],
@@ -426,6 +550,10 @@ class GrowthRunner:
                 "method_work": method_work, "reading_work": reading_work,
                 "method_cache": list(method_cache.values()), "method_execution": self.execution_projection(execution),
                 "method_evidence": method_evidence,
+                "world_frontier": frontier, "review_debt": debts, "invocations": invocations,
+                "evidence_context": {"coverage": "paged_excerpts_and_catalog", "seed_role": "starting_conditions",
+                    "review_status": "model_opinions", "frontier_status": "published_consequences",
+                    "method_results": "proposals_not_world_facts"},
                 "iteration_work": {"unchanged_actions": list(dict.fromkeys(unchanged)),
                     "recent_no_change_count": len(unchanged), "method_review_due": bool(pending and not pending_reviewed),
                     "last_review_ref": ref("response", latest_review) if latest_review else None,
@@ -440,19 +568,21 @@ class GrowthRunner:
             frame["allowed_actions"] = [a for a in frame["allowed_actions"] if a not in {"try_write", "render"}]
         return self.delivered_frame(state, scope, frame)
 
-    async def call(self, run_id, scope, sequence, stage, frame, *, repair=None, repair_attempt=0):
+    async def call(self, run_id, scope, sequence, stage, frame, *, repair=None, repair_attempt=0, request_key=None):
         state = self.load(run_id)
         parallel = state.config["limits"].get("max_parallel")
         if parallel is None:
-            return await self._call(run_id, scope, sequence, stage, frame, repair=repair, repair_attempt=repair_attempt)
+            return await self._call(run_id, scope, sequence, stage, frame, repair=repair, repair_attempt=repair_attempt,
+                                    request_key=request_key)
         semaphore = self.semaphores.setdefault((run_id, parallel), asyncio.Semaphore(parallel))
         async with semaphore:
-            return await self._call(run_id, scope, sequence, stage, frame, repair=repair, repair_attempt=repair_attempt)
+            return await self._call(run_id, scope, sequence, stage, frame, repair=repair, repair_attempt=repair_attempt,
+                                    request_key=request_key)
 
-    async def _call(self, run_id, scope, sequence, stage, frame, *, repair=None, repair_attempt=0):
+    async def _call(self, run_id, scope, sequence, stage, frame, *, repair=None, repair_attempt=0, request_key=None):
         state = self.load(run_id)
         provider = self.provider(state)
-        request_id = f"request-{identifier(scope, sequence, stage)}"
+        request_id = request_key or f"request-{identifier(scope, sequence, stage)}"
         existing = self.store.get(run_id, "request", request_id, include_private=True)
         if existing and existing.get("status") == "accepted":
             return self.ensure_safe(existing["result"]), request_id
@@ -520,7 +650,7 @@ class GrowthRunner:
             self.store.save_head(state)
             if isinstance(exc, ProviderError) and exc.feedback is not None and repair_attempt < 2:
                 return await self._call(run_id, scope, sequence, stage, frame,
-                                       repair=exc.feedback, repair_attempt=repair_attempt + 1)
+                                       repair=exc.feedback, repair_attempt=repair_attempt + 1, request_key=request_key)
             raise
         state = self.load(run_id)
         usage = state.config["usage"]
@@ -568,7 +698,7 @@ class GrowthRunner:
                 if actor.direction != session["base_direction"]:
                     actor.direction = session["base_direction"]
                     actor.revision += 1
-                state.status = "idle"
+                state.status = self.aggregate_status(state)
                 self.store.save_head(state)
                 self.event(state, decision["action"], {"scope_id": scope, "work_seq": seq, **result})
             except (KernelError, GrowthError, ProviderError) as exc:
@@ -714,13 +844,16 @@ class GrowthRunner:
                 get("node", key)
             draft_frame = {**frame, "direction": args.get("direction") or actor.direction,
                            "parent_ids": parents, "method": get("method", ref["object_id"], ref["version"])}
+            draft_frame = await self.prepare_generation(state, scope, session, draft_frame, seq, "draft")
             text, draft_request = await self.call(rid, scope, seq, "draft", draft_frame)
             frozen_draft = self.store.get(rid, "request", draft_request, include_private=True)["frame"]
             actual_method = frozen_draft["method"]
             ref = {"kind": "method", "object_id": actual_method["id"], "version": actual_method["version"]}
             used_spans = []
-            for source in frozen_draft["sources"]:
-                node = get("node", source["id"], source["version"])
+            for source in [*frozen_draft["sources"], *frozen_draft.get("world_frontier", [])]:
+                # These are frozen host-delivered excerpts, including scoped
+                # child-method inputs, rather than handles chosen by a decision.
+                node = get("node", source["id"], source["version"], internal=True)
                 used_spans.append(SourceSpan(node_id=node["id"], node_version=node["version"],
                     text_ref=node["text_ref"], start=source.get("start", 0),
                     end=source.get("end", len(source["text"]))).model_dump())
@@ -733,25 +866,48 @@ class GrowthRunner:
                     node = get("node", page["id"], page["version"])
                     used_spans.append(SourceSpan(node_id=node["id"], node_version=node["version"],
                         text_ref=node["text_ref"], start=page["start"], end=page["end"]).model_dump())
+            for span in (frozen_draft.get("method_invocation") or {}).get("used_source_spans", []):
+                exact = SourceSpan.model_validate(span)
+                node = get("node", exact.node_id, exact.node_version, internal=True)
+                if node["text_ref"] != exact.text_ref.model_dump():
+                    raise KernelError("SOURCE_RANGE_INVALID", "方法调用来源的精确正文版本无效。")
+                self.store.read_text(exact.text_ref, exact.start, exact.end)
+                if exact.model_dump() not in used_spans:
+                    used_spans.append(exact.model_dump())
             candidate = self.put(rid, "candidate", {"id": f"candidate-{identifier(scope, seq)}",
                 "scope_id": scope, "private_scope": scope, "text_ref": self.store.put_text(text).model_dump(),
                 "parent_ids": parents, "method_ref": ref, "request_id": draft_request, "source_spans": used_spans})
-            trial = self.put(rid, "trial", {"id": f"trial-{identifier(scope, seq)}", "scope_id": scope,
-                "private_scope": scope, "method_ref": ref, "source_refs": [
-                    {"kind": "node", "object_id": s["id"], "version": s["version"]}
-                    for s in frozen_draft["sources"]],
+            generation_ref = (frozen_draft.get("method_invocation") or {}).get("ref")
+            source_refs = (list({(s["node_id"], s["node_version"]):
+                {"kind": "node", "object_id": s["node_id"], "version": s["node_version"]}
+                for s in used_spans}.values()) + [generation_ref] if generation_ref else [
+                {"kind": "node", "object_id": s["id"], "version": s["version"]} for s in frozen_draft["sources"]])
+            trial = self.store.get(rid, "trial", f"trial-{identifier(scope, seq)}", scope_id=scope) or self.put(rid, "trial", {
+                "id": f"trial-{identifier(scope, seq)}", "scope_id": scope,
+                "private_scope": scope, "method_ref": ref, "source_refs": source_refs,
+                **({"generation_invocation_ref": generation_ref} if generation_ref else {}),
                 "result_ref": {"kind": "candidate", "object_id": candidate["id"], "version": candidate["version"]},
                 "feedback_refs": [], "adopted": False})
             session["pending_trial_id"] = trial["id"]
+            session["saved_draft_ref"] = trial["result_ref"]
+            session["phase"] = "draft_saved"
             if args.get("direction"):
                 session["last_trial_direction"] = args["direction"]
             reviewed = {}
-            if state.config["provider"] == "deepseek" and frame.get("work_protocol") == "growth-work-v2":
-                reviewed = await self.review(self.load(rid), scope, session, frozen_draft, seq, actual_method,
+            if state.config["provider"] == "deepseek" and frame.get("work_protocol") in {"growth-work-v2", "growth-work-v3"}:
+                reviewed = await self.review_product(self.load(rid), scope, session, frozen_draft, seq, actual_method,
                     [{"kind": "trial", "object_id": trial["id"], "version": trial["version"]}, ref], automatic=True)
+            else:
+                session["phase"] = "ready_to_publish"
             return {"trial_id": trial["id"], "method_ref": ref, "draft_request": draft_request, **reviewed}
         if action == "publish":
             trial = get("trial", args["trial_id"], args.get("trial_version"))
+            pending_debts = [d for d in session.get("review_debt", []) if d["status"] in {"pending", "failed"}
+                             and any(t["kind"] == "trial" and t["object_id"] == trial["id"] for t in d["targets"])]
+            if frame.get("work_protocol") == "growth-work-v3" and pending_debts and args.get("allow_pending_review") is not True:
+                raise KernelError("REVIEW_PENDING", "草稿评议待补，发表需明确接受此状态。")
+            if trial.get("published_node_id") and "parent_ids" not in args and not args.get("association_ids"):
+                return {"node_id": trial["published_node_id"], "trial_id": trial["id"], "changed": False}
             candidate = get("candidate", trial["result_ref"]["object_id"], trial["result_ref"]["version"], internal=True)
             state = self.load(rid)
             bound = state.config["limits"].get("max_windows")
@@ -767,15 +923,19 @@ class GrowthRunner:
                              input_refs=[ObjectRef.model_validate(r) for r in trial["source_refs"]
                                          + [trial["method_ref"]]])
             trial["adopted"] = True
-            self.put(rid, "trial", trial)
             session.pop("pending_trial_id", None)
+            session.pop("saved_draft_ref", None)
+            session["phase"] = "ready"
             if not already:
                 state.config["growth_commits"] = state.config.get("growth_commits", 0) + 1
                 self.store.save_head(state)
             node_id = (state.windows[actor_id].working_node_id if scope.startswith("window:") else
                        state.reading_tracks[actor_id].bookmark_node_ids[-1])
+            trial["published_node_id"] = node_id
+            self.put(rid, "trial", trial)
             return {"node_id": node_id,
-                    "trial_id": trial["id"]}
+                    "trial_id": trial["id"], "changed": not bool(already),
+                    **({"review_status": "pending"} if pending_debts else {})}
         if action == "navigate":
             node = get("node", args["node_id"])
             start = args.get("start", 0)
@@ -804,20 +964,57 @@ class GrowthRunner:
             render_frame["method_evidence"] = [m for m in frame.get("method_evidence", [])
                                               if m["kind"] in {"method", "response", "view"}]
             render_frame.update(sources=sources, visit_ids=args["visit_ids"], source_spans=spans)
+            render_frame = await self.prepare_generation(state, scope, session, render_frame, seq, "render")
             text, render_request = await self.call(rid, scope, seq, "render", render_frame)
             state = self.load(rid)
             add_passage(self.store, state, track_id, text, visit_ids=args["visit_ids"],
                         source_spans=spans, request_id=request_id)
+            action_row = self.store.get(rid, "passage_action", request_id, scope_id=scope)
+            passage = get("passage", action_row["passage_id"], internal=True)
+            frozen_render = self.store.get(rid, "request", render_request, include_private=True)["frame"]
+            generation_ref = (frozen_render.get("method_invocation") or {}).get("ref")
+            if generation_ref:
+                self.put(rid, "generation_use", {"id": passage["id"], "private_scope": scope, "scope_id": scope,
+                    "object_ref": {"kind": "passage", "object_id": passage["id"], "version": passage["version"]},
+                    "generation_invocation_ref": generation_ref})
             reviewed = {}
-            if state.config["provider"] == "deepseek" and frame.get("work_protocol") == "growth-work-v2":
-                action_row = self.store.get(rid, "passage_action", request_id, scope_id=scope)
-                passage = get("passage", action_row["passage_id"], internal=True)
-                frozen_render = self.store.get(rid, "request", render_request, include_private=True)["frame"]
-                reviewed = await self.review(self.load(rid), scope, session, frozen_render, seq, frozen_render["method"],
+            if state.config["provider"] == "deepseek" and frame.get("work_protocol") in {"growth-work-v2", "growth-work-v3"}:
+                reviewed = await self.review_product(self.load(rid), scope, session, frozen_render, seq, frozen_render["method"],
                     [{"kind": "passage", "object_id": passage["id"], "version": passage["version"]},
                      {"kind": "method", "object_id": frozen_render["method"]["id"], "version": frozen_render["method"]["version"]}],
                     automatic=True)
             return {"visit_ids": args["visit_ids"], "source_spans": spans, **reviewed}
+        if action == "retry_review":
+            debt = next((d for d in session.get("review_debt", []) if d["id"] == args["debt_id"]
+                         and d["status"] in {"pending", "failed"}), None)
+            if debt is None:
+                raise KernelError("TARGET_UNKNOWN", "待补评议在此位置不可见。")
+            original = self.store.get(rid, "request", debt["request_id"], scope_id=scope)
+            method_ref = debt.get("method_ref") or {"kind": "method", "object_id": original["frame"]["method"]["id"],
+                                                     "version": original["frame"]["method"]["version"]}
+            method = self.store.get(rid, "method", method_ref["object_id"], version=method_ref["version"], scope_id=scope)
+            if method is None:
+                raise KernelError("TARGET_UNKNOWN", "待补评议的方法精确版本不可见。")
+            context = {**frame, **{k: original["frame"][k] for k in ("sources", "visit_ids", "source_spans", "method_invocation")
+                                   if k in original["frame"]}} if original else frame
+            try:
+                result = await self.review(state, scope, session, context, seq, method, debt["targets"],
+                                           automatic=debt.get("automatic", False), purpose=debt.get("purpose", ""))
+            except ProviderError as exc:
+                if (exc.code != "MODEL_OUTPUT_INVALID" or exc.feedback is None
+                        or exc.feedback.category not in {"JSON_SYNTAX", "JSON_TYPE", "SCHEMA_VALIDATION", "PROSE_INVALID"}
+                        or "WORK_PRIVATE_CONTENT" in exc.feedback.issues):
+                    raise
+                debt.update(status="failed", request_id=f"request-{identifier(scope, seq, 'review')}",
+                            error={"code": exc.code, "message": exc.message,
+                                   "validation_feedback": exc.feedback.prompt_data()})
+                session["phase"] = "review_pending"
+                return {"review_status": "pending", "review_debt_id": debt["id"], "changed": False,
+                        "status": "deferred", "review_completed": False, "work_completed": False}
+            debt.update(status="complete", response_id=result["response_id"])
+            session["phase"] = ("review_pending" if any(d["status"] in {"pending", "failed"}
+                for d in session["review_debt"]) else "ready_to_publish" if session.get("pending_trial_id") else "ready")
+            return {**result, "completed_debt_id": debt["id"]}
         if action == "reflect":
             method = get("method", args["method_id"], args.get("method_version"))
             targets = []
@@ -831,7 +1028,7 @@ class GrowthRunner:
                 if exact.model_dump() not in targets:
                     targets.append(exact.model_dump())
             targets = targets or [{"kind": "method", "object_id": method["id"], "version": method["version"]}]
-            return await self.review(state, scope, session, frame, seq, method, targets, purpose=args.get("purpose", ""))
+            return await self.review_product(state, scope, session, frame, seq, method, targets, purpose=args.get("purpose", ""))
         if action == "respond":
             about_refs = []
             for key in args.get("about_ids", []):
@@ -939,6 +1136,13 @@ class GrowthRunner:
 
     def busy(self):
         return any(not t.done() for t in self.tasks.values()) or any(lock.locked() for lock in self.locks.values())
+
+    def recover_review_pauses(self, run_id):
+        if self.busy():
+            raise KernelError("RUN_BUSY", "请先暂停工作，再恢复评议阻断。")
+        from .growth_recovery import recover_review_pauses
+        result = recover_review_pauses(self.store, self.load(run_id))
+        return {"recovery": result, "snapshot": self.snapshot(run_id)}
 
     def recover(self):
         """Reconcile only interrupted indexed jobs, never materialize complete archives."""

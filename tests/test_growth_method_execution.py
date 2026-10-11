@@ -101,6 +101,10 @@ class ReviewingFixture(FixtureGrowthProvider):
         self.stages.append("draft")
         return ModelResult("她把水递过去，他抬起手，杯子在两人之间停了一会儿。", 20, 8)
 
+    async def invoke(self, frame, *, repair=None):
+        self.stages.append("invoke")
+        return await super().invoke(frame, repair=repair)
+
     async def review(self, frame, *, repair=None):
         self.stages.append("review")
         return ModelResult("以回答发生前后的距离作为新的比较标准，下一次把停顿与回应共同选入。", 15, 7)
@@ -114,12 +118,12 @@ async def test_each_remote_trial_gets_actual_review_and_review_can_itself_be_rev
     first = next(r for r in snapshot["responses"] if r.get("automatic"))
     assert first["review_order"] == 1 and first["review_request_id"]
     assert snapshot["trials"][0]["feedback_refs"] == [refs(first, "response")]
-    assert provider.stages == ["decide", "draft", "review"]
-    assert snapshot["run"]["usage"]["calls"] == 3
+    assert provider.stages == ["decide", "invoke", "draft", "review"]
+    assert snapshot["run"]["usage"]["calls"] == 4
     snapshot = await runner.step_scope(run_id, "window:a")
     second = next(r for r in snapshot["responses"] if r.get("review_order") == 2)
     assert second["about_refs"] == [refs(first, "response")]
-    assert snapshot["run"]["usage"]["calls"] == 5
+    assert snapshot["run"]["usage"]["calls"] == 6
     session = runner.session(runner.load(run_id), "window:a")
     assert session["max_review_order"] == 2
     request = runner.store.get(run_id, "request", second["review_request_id"], include_private=True)
@@ -128,7 +132,7 @@ async def test_each_remote_trial_gets_actual_review_and_review_can_itself_be_rev
 
 
 async def test_review_budget_pause_resumes_only_the_missing_review(runner, monkeypatch):
-    run_id = create(runner, "deepseek", Limits(max_calls=2, max_tokens=None, max_windows=None))
+    run_id = create(runner, "deepseek", Limits(max_calls=3, max_tokens=None, max_windows=None))
     provider = ReviewingFixture()
     monkeypatch.setattr(runner, "provider", lambda state: provider)
     with pytest.raises(KernelError) as error:
@@ -136,11 +140,11 @@ async def test_review_budget_pause_resumes_only_the_missing_review(runner, monke
     assert error.value.code == "BUDGET_EXHAUSTED"
     state = runner.load(run_id)
     assert runner.store.count_objects(run_id, "trial") == 1
-    state.config["limits"]["max_calls"] = 3
+    state.config["limits"]["max_calls"] = 4
     runner.store.save_head(state)
     snapshot = await runner.step_scope(run_id, "window:a")
-    assert provider.stages == ["decide", "draft", "review"]
-    assert snapshot["run"]["usage"]["calls"] == 3
+    assert provider.stages == ["decide", "invoke", "draft", "review"]
+    assert snapshot["run"]["usage"]["calls"] == 4
     assert runner.store.count_objects(run_id, "trial") == 1
 
 
@@ -186,8 +190,8 @@ async def test_real_reading_render_gets_review_of_exact_saved_passage(runner, mo
     response = snapshot["responses"][0]
     passage = snapshot["readings"][0]["passages"][0]
     assert refs(passage, "passage") in response["about_refs"]
-    assert provider.stages == ["render", "review"]
-    assert snapshot["run"]["usage"]["calls"] == 3
+    assert provider.stages == ["invoke", "render", "review"]
+    assert snapshot["run"]["usage"]["calls"] == 4
     request = runner.store.get(run_id, "request", response["review_request_id"], include_private=True)
     assert request["frame"]["method_evidence"][0]["text"] == passage["text"]
 
@@ -211,7 +215,7 @@ async def test_accepted_review_installation_recovers_without_redrafting_or_rebil
         await runner.step_scope(run_id, "window:a")
     usage = dict(runner.load(run_id).config["usage"])
     snapshot = await runner.step_scope(run_id, "window:a")
-    assert provider.stages == ["decide", "draft", "review"]
+    assert provider.stages == ["decide", "invoke", "draft", "review"]
     assert runner.load(run_id).config["usage"] == usage
     assert len(snapshot["responses"]) == len(snapshot["trials"]) == 1
     assert snapshot["trials"][0]["feedback_refs"] == [refs(snapshot["responses"][0], "response")]

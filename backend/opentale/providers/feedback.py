@@ -23,6 +23,7 @@ _FIELDS = frozenset({
     "object_id", "version", "program", "inputs", "calls", "method_ref", "input_refs", "groups", "relations",
     "source_id", "target_id", "relation", "purpose", "query", "offset", "start", "end", "direction",
     "transition", "reason", "node_ids", "about_refs",
+    "debt_id", "allow_pending_review",
 })
 _ERROR_TYPES = frozenset({
     "missing", "extra_forbidden", "string_type", "string_too_short", "string_too_long",
@@ -35,10 +36,10 @@ _REASONS = frozenset({
     "EXPRESSION_UNAVAILABLE", "ANCHOR_NOT_IN_TEXT", "READING_SCOPE_INVALID",
     "READING_FOCUS_INVALID", "READING_EXPRESSION_INVALID", "READING_HISTORY_INVALID",
     "READING_SHARED_REQUIRED",
-    "TECHNICAL_PROSE", "SCHEMA_INVALID", "WRAPPING_TOO_DEEP",
+    "TECHNICAL_PROSE", "WORK_PRIVATE_CONTENT", "SCHEMA_INVALID", "WRAPPING_TOO_DEEP",
     "REFLECTION_REFERENCE_INVALID",
     "HANDLE_UNKNOWN", "HANDLE_KIND_MISMATCH", "HANDLE_AMBIGUOUS", "HANDLE_VERSION_MISMATCH",
-    "METHOD_UNCHANGED",
+    "METHOD_UNCHANGED", "REVIEW_PENDING_ACK_REQUIRED",
 })
 
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-KINDS = frozenset({"node", "method", "trial", "response", "visit", "passage", "link", "view"})
+KINDS = frozenset({"node", "method", "trial", "response", "visit", "passage", "link", "view", "invocation"})
 PAGE_KINDS = KINDS
 TABLE_FIELD = "capabilities"
 
@@ -76,16 +76,22 @@ def collect_capabilities(frame: dict) -> tuple[Capability, ...]:
         for name, kind in (("nodes", "node"), ("sources", "node"), ("methods", "method"),
                            ("trials", "trial"), ("responses", "response"),
                            ("feedback_catalog", "response"), ("visits", "visit"),
-                           ("reading_history", "passage"), ("links", "link"), ("views", "view")):
+                           ("reading_history", "passage"), ("links", "link"), ("views", "view"),
+                           ("invocations", "invocation")):
             for row in _rows(frame, name):
                 add(kind, row)
                 _structure(row, kind, add)
         for name, kind in (("method", "method"), ("evaluation_method", "method"),
-                           ("pending_trial", "trial"), ("view", "view")):
+                           ("pending_trial", "trial"), ("view", "view"), ("method_invocation", "invocation")):
             row = frame.get(name)
             add(kind, row)
             if isinstance(row, dict):
                 _structure(row, kind, add)
+        for row in [frame.get("method_invocation") or {}, *_rows(frame, "invocation_children")]:
+            add("invocation", row.get("ref"))
+            add("method", row.get("method_ref"))
+        for row in _rows(frame, "world_frontier"):
+            add("node", row)
         cache = frame.get("method_cache", [])
         if isinstance(cache, dict):
             cached = [*_rows(cache, "methods"), *_rows(cache, "refs")]

@@ -3,9 +3,10 @@ import type { GraphPassage, GraphReading, GraphSnapshot, GraphSourceSpan, GraphV
 import { graphErrorText, type GrowthWorkbenchModel } from "../useGrowthWorkbench";
 import { graphApi } from "../graphApi";
 import { graphNodeLabel } from "./GraphNeighborhood";
+import GrowthWorkState, { workPhaseText } from "./GrowthWorkState";
 
 export function graphStatusText(status: string) {
-  return ({ ready: "可继续", idle: "待命", calling: "模型正在工作", running: "持续运行中", waiting: "等待可读节点", paused: "已暂停", error: "需要恢复", budget_exhausted: "预算已用尽" } as Record<string, string>)[status] ?? "可继续";
+  return ({ ready: "可继续", idle: "待命", calling: "模型正在工作", running: "持续运行中", waiting: "等待可读节点", paused: "已暂停", error: "需要恢复", warning: "有待补工作", proposal: "工作提案", proposal_not_world_fact: "工作提案", budget_exhausted: "预算已用尽" } as Record<string, string>)[status] ?? "可继续";
 }
 export function graphActionText(action: string) {
   return ({ ready: "准备开始", query: "已检索材料，可继续选择", read_page: "已读取原文片段", inspect: "已检查组织方法", apply: "已应用组织方法", revise: "已生成方法修订", adopt: "已采用组织方法", try_write: "候选已生成，等待评议与发布", publish: "候选已发布到图世界", respond: "已保存局部回应", reflect: "已评议自身工作方法", navigate: "已进入节点，等待组织阅读", render: "已保存阅读正文", wait: "等待下一步条件" } as Record<string, string>)[action] ?? "工作进度已保存";
@@ -87,7 +88,7 @@ export default function GrowthReading({ snapshot, model, selectedId, onSelect, o
         <div className="growth-reading-progress" aria-label="阅读进度"><span>阅读序号 <b>{reading.read_seq}</b></span><span>观察世界 <b>G{reading.observed_graph_commit}</b></span><span>当前世界 <b>G{snapshot.graph_commit}</b></span></div>
         {reading.direction && <p className="helper">阅读方向：{reading.direction}</p>}
         <ReadingNotice reading={reading} working={!!working} active={active} />
-        {session && !working && <p className="helper growth-work-action" role="status">{graphActionText(session.last_action)} · 本地工作 {session.work_seq}</p>}
+        {session && !working && <>{!workPhaseText(session) && <p className="helper growth-work-action" role="status">{graphActionText(session.last_action)} · 本地工作 {session.work_seq}</p>}<GrowthWorkState session={session} /></>}
         {session?.error && <p role="alert" className="message error">{session.error.message}（{session.error.code}）</p>}
         <div className="growth-passages">
           {passages.map((passage) => <article key={passage.id} className="growth-passage">

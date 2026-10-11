@@ -7,6 +7,7 @@ import httpx
 import pytest
 from opentale.config import Settings
 from opentale.providers import ProviderError
+from opentale.providers.feedback import OutputFeedback
 from opentale.providers.growth import (
     DeepSeekGrowthProvider,
     FixtureGrowthProvider,
@@ -749,6 +750,317 @@ async def test_review_is_public_positive_work_product_not_hidden_reasoning_or_na
     assert data["method_execution"] == current["method_execution"]
     assert "private transport reasoning" not in str(result.value)
     assert await FixtureGrowthProvider().review(current)
+
+
+@pytest.mark.parametrize("text", [
+    "以 method-old@version-old 的选材为依据，apply 后评议 node-a 的生活后果，再 revise program.calls。",
+    "来源：node-a 已交付区间。上次 reflect 只是建议；下一次试写让人物的新约定改变时间安排。",
+    "read_page 取得完整 method_id 指向的定义，再以 about_refs 保存可核对的工作依据。",
+])
+async def test_review_allows_public_work_handles_and_operations_without_granting_permissions(text):
+    current = frame()
+    current["method_evidence"] = [{"kind": "node", "id": "node-a", "version": "version-a",
+                                  "text": current["sources"][0]["text"]}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=envelope({"text": text})),
+    )) as client:
+        result = await DeepSeekGrowthProvider(Settings(api_key=KEY), client).review(current)
+    assert result.value == text
+    assert (result.input_tokens, result.output_tokens) == (81, 23)
+    with pytest.raises(ProviderError):
+        validate_decision(current, {"action": "apply", "args": {"method_id": "unoffered-method"}})
+
+
+@pytest.mark.parametrize("stage", ["draft", "render"])
+async def test_work_contract_does_not_relax_narrative_reference_filter(stage):
+    text = "apply method-old 后，node-a 的行动经过 reflect 得到下一种 program.calls。"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=envelope({"text": text})),
+    )) as client:
+        with pytest.raises(ProviderError) as captured:
+            await getattr(DeepSeekGrowthProvider(Settings(api_key=KEY), client), stage)(frame())
+    assert captured.value.feedback.issues == ("TECHNICAL_PROSE",)
+    assert captured.value.usage == (81, 23)
+
+
+@pytest.mark.parametrize("text", [
+    "<think>私有推理</think>采用新方法。",
+    "reasoning_content: 私有轨迹",
+    "隐藏推理：先做内部分析。",
+    "creator_provenance: private-origin",
+    "provider_error_body: raw-private-error",
+])
+async def test_review_private_traces_remain_safe_repairable_billed_errors(text):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=envelope({"text": text})),
+    )) as client:
+        with pytest.raises(ProviderError) as captured:
+            await DeepSeekGrowthProvider(Settings(api_key=KEY), client).review(frame())
+    assert captured.value.code == "MODEL_OUTPUT_INVALID"
+    assert captured.value.usage == (81, 23)
+    assert captured.value.feedback.issues == ("WORK_PRIVATE_CONTENT",)
+    assert "private" not in str(captured.value) + json.dumps(captured.value.public())
+
+
+async def test_review_keeps_transport_secret_echo_boundary():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=envelope({"text": f"工作依据 {KEY}"})),
+    )) as client:
+        with pytest.raises(ProviderError) as captured:
+            await DeepSeekGrowthProvider(Settings(api_key=KEY), client).review(frame())
+    assert captured.value.code == "MODEL_OUTPUT_INVALID"
+    assert KEY not in str(captured.value) + json.dumps(captured.value.public())
+
+
+async def test_prior_narrative_filter_repair_can_complete_technical_work_review():
+    requests = []
+    text = "对 method-old@version-old 执行 reflect，选取 node-a 的结果修订 program.calls，让约定改变人物的下一步。"
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=envelope({"text": text}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await DeepSeekGrowthProvider(Settings(api_key=KEY), client).review(
+            frame(), repair=OutputFeedback("PROSE_INVALID", ("TECHNICAL_PROSE",)),
+        )
+    assert result.value == text
+    assert len(requests) == 1
+    system = requests[0]["messages"][0]["content"]
+    assert "公开方法工作成果" in system
+    assert "TECHNICAL_PROSE" in system
+
+
+def test_review_invites_new_possibilities_and_checks_actual_version_claims():
+    system = DeepSeekGrowthProvider(Settings()).projection(frame(), "review")["messages"][0]["content"]
+    assert "种子是已经生活过的起点" in system
+    assert "以前评议提出的建议" in system
+    assert "核对完整指令" in system
+    assert "承诺如何改变时间安排" in system
+    assert "关系如何改变选择" in system
+    assert "一个可以尝试的新可能及检验方式" in system
+    assert "后续操作的权限仍由宿主逐项核验" in system
+
+
+def test_method_call_can_trial_a_changed_scale_before_formal_revision():
+    provider = DeepSeekGrowthProvider(Settings())
+    invocation = provider.projection(frame(), "invoke")["messages"][0]["content"]
+    draft = provider.projection(frame(), "draft")["messages"][0]["content"]
+    reading = provider.projection(frame(), "render")["messages"][0]["content"]
+    assert "instruction 记录可检验的做法" in invocation
+    assert "对旧方法的关注尺度、选材边界或判断标准" in invocation
+    assert "结果促成 revise/adopt" in invocation
+    assert "方法调用提出的局部试验在本次正文中实际展开" in draft
+    assert "来源范围内的依据" in reading
+
+
+def test_trial_creation_and_reading_have_distinct_fact_boundaries():
+    provider = DeepSeekGrowthProvider(Settings())
+    draft = provider.projection(frame(), "draft")["messages"][0]["content"]
+    reading = provider.projection(frame(), "render")["messages"][0]["content"]
+    assert "接下来的事件由本次试写创造" in draft
+    assert "新的人物" in draft or "出场人物" in draft
+    assert "保持来源范围内的依据" in reading
+    assert "新增世界事件需要另行试写和发布" in reading
+
+
+async def test_actual_invocation_receives_exact_method_children_and_returns_billed_work_product():
+    current = frame()
+    current["invocation_context"] = {"plan_id": "plan-a", "frame_id": "0", "mode": "draft",
+                                     "goal": "让既有约定改变下一次行动", "depth": 1}
+    current["invocation_children"] = [{
+        "ref": {"kind": "invocation", "object_id": "invocation-child", "version": "child-v"},
+        "method_ref": {"kind": "method", "object_id": "method-old", "version": "version-old"},
+        "text": "将物件的转交转成双方下一日要履行的约定。", "status": "proposal",
+    }]
+    current["evidence_context"] = {"origin": "model_work", "partial": True,
+                                    "actual_visits": [], "public_result_refs": []}
+    current["world_frontier"] = [{"id": "node-a", "version": "version-a", "text": "已经交付的新条件。"}]
+    original = copy.deepcopy(current)
+    requests = []
+    text = "按 method-old@version-old 接住子方法的约定判断，使 node-a 的关系后果决定下一次出门。"
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=envelope({"text": text}))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await DeepSeekGrowthProvider(Settings(api_key=KEY), client).invoke(current)
+    assert result.value == text
+    assert (result.input_tokens, result.output_tokens) == (81, 23)
+    assert current == original
+    data = json.loads(requests[0]["messages"][1]["content"])
+    for field in ("method", "sources", "invocation_context", "invocation_children", "evidence_context", "world_frontier"):
+        assert data[field] == original[field]
+    system = requests[0]["messages"][0]["content"]
+    assert "这是一次真实的方法调用" in system
+    assert "让子方法确实改变上层选材" in system
+    assert "过去的边界也可以成为本次重新检查的材料" in system
+    assert "等待作品验证的工作建议" in system
+    assert "private transport reasoning" not in result.value
+
+
+@pytest.mark.parametrize("stage", ["draft", "render"])
+def test_generation_projection_keeps_actual_invocation_strategy_separate_from_source_facts(stage):
+    current = frame("reading" if stage == "render" else "window")
+    current["method_invocation"] = {
+        "ref": {"kind": "invocation", "object_id": "invocation-a", "version": "invocation-v"},
+        "method_ref": {"kind": "method", "object_id": "method-old", "version": "version-old"},
+        "fingerprint": "fingerprint-a", "text": "从承诺造成的选择差异展开生活。",
+        "child_result_refs": [], "used_input_refs": [], "status": "proposal_not_world_fact",
+    }
+    current["evidence_context"] = {"actual_visits": [{"node_id": "node-a", "start": 0, "end": 15}]}
+    projected = project_frame(current, stage)
+    assert projected["method_invocation"] == current["method_invocation"]
+    assert projected["sources"] == current["sources"]
+    assert projected["evidence_context"] == current["evidence_context"]
+    projected["method_invocation"]["text"] = "changed local projection"
+    assert current["method_invocation"]["text"] == "从承诺造成的选择差异展开生活。"
+    system = DeepSeekGrowthProvider(Settings()).projection(current, stage)["messages"][0]["content"]
+    assert "method_invocation" in system
+
+
+async def test_fixture_invocation_applies_child_work_to_parent_plan_without_world_publication():
+    current = frame()
+    current["invocation_context"] = {"plan_id": "plan-a", "frame_id": "0", "mode": "render", "goal": "读法比较", "depth": 0}
+    child = "比较先前读法漏过的义务，让下一次访问接住另一人的应答。"
+    current["invocation_children"] = [{"text": child, "status": "proposal"}]
+    provider = FixtureGrowthProvider()
+    projection = provider.projection(current, "invoke")
+    result = await provider.invoke(current)
+    assert projection["stage"] == "invoke"
+    assert projection["frame"]["invocation_children"][0]["text"] == child
+    assert "本次阅读" in result.value
+    assert current["method"]["instruction"] in result.value
+    assert child in result.value
+    assert (result.input_tokens, result.output_tokens) == (0, 0)
+
+
+async def test_invocation_keeps_private_work_rejection_and_usage_accounting():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(200, json=envelope({"text": "<think>内部推理</think>方法"})),
+    )) as client:
+        with pytest.raises(ProviderError) as captured:
+            await DeepSeekGrowthProvider(Settings(api_key=KEY), client).invoke(frame())
+    assert captured.value.usage == (81, 23)
+    assert captured.value.feedback.issues == ("WORK_PRIVATE_CONTENT",)
+
+
+def test_invocation_can_operate_on_method_feedback_without_claiming_unread_story_text():
+    current = frame()
+    current["sources"] = []
+    current["method_evidence"] = [{"kind": "method", "id": "method-old", "version": "version-old",
+                                  "instruction": current["method"]["instruction"]}]
+    projected = project_frame(current, "invoke")
+    assert projected["sources"] == []
+    assert projected["method_evidence"] == current["method_evidence"]
+    with pytest.raises(ProviderError) as captured:
+        project_frame(current, "draft")
+    assert captured.value.code == "GROWTH_SOURCE_UNREAD"
+
+
+def _frame_with_review_debt(protocol="growth-work-v3", status="pending"):
+    current = frame()
+    current["work_protocol"] = protocol
+    current["allowed_actions"].append("retry_review")
+    current["trials"] = [{"id": "trial-a", "version": "trial-v"}, {"id": "trial-b", "version": "other-v"}]
+    current["review_debt"] = [{"id": "review-debt-a", "status": status, "targets": [
+        {"kind": "trial", "object_id": "trial-a", "version": "trial-v"},
+    ]}]
+    current["invocations"] = [{"id": "invocation-a", "version": "invocation-v", "text": "已保存的方法策略。"}]
+    return current
+
+
+@pytest.mark.parametrize("status", ["pending", "failed"])
+def test_saved_pending_review_can_be_retried_only_by_delivered_debt_id(status):
+    current = _frame_with_review_debt(status=status)
+    decision = {"action": "retry_review", "args": {"debt_id": "review-debt-a"}}
+    assert validate_decision(current, decision) == decision
+    assert project_frame(current, "decide")["review_debt"] == current["review_debt"]
+    assert project_frame(current, "decide")["invocations"] == current["invocations"]
+    unknown = {"action": "retry_review", "args": {"debt_id": "private-unoffered-debt"}}
+    with pytest.raises(ProviderError) as captured:
+        validate_decision(current, unknown)
+    assert captured.value.feedback.issues == ("debt_id:schema_invalid", "HANDLE_UNKNOWN")
+    assert "private-unoffered-debt" not in str(captured.value)
+
+
+@pytest.mark.parametrize("status", ["complete", "completed", "dismissed"])
+def test_completed_debt_is_neither_retried_nor_required_for_publication(status):
+    current = _frame_with_review_debt(status=status)
+    with pytest.raises(ProviderError):
+        validate_decision(current, {"action": "retry_review", "args": {"debt_id": "review-debt-a"}})
+    assert validate_decision(current, {"action": "publish", "args": {"trial_id": "trial-a"}})
+
+
+@pytest.mark.parametrize("allow", [None, False, 1, "true"])
+def test_pending_review_publication_requires_explicit_boolean_acknowledgement(allow):
+    current = _frame_with_review_debt()
+    args = {"trial_id": "trial-a"}
+    if allow is not None:
+        args["allow_pending_review"] = allow
+    with pytest.raises(ProviderError) as captured:
+        validate_decision(current, {"action": "publish", "args": args})
+    assert captured.value.feedback.issues[0] == "allow_pending_review:schema_invalid"
+    if allow is None or allow is False:
+        assert "REVIEW_PENDING_ACK_REQUIRED" in captured.value.feedback.issues
+    args["allow_pending_review"] = True
+    assert validate_decision(current, {"action": "publish", "args": args})
+    assert current["review_debt"][0]["status"] == "pending"
+
+
+def test_pending_review_ack_is_trial_specific_and_backward_compatible():
+    current = _frame_with_review_debt()
+    assert validate_decision(current, {"action": "publish", "args": {"trial_id": "trial-b"}})
+    current["work_protocol"] = "growth-work-v2"
+    assert validate_decision(current, {"action": "publish", "args": {"trial_id": "trial-a"}})
+
+
+def test_debt_schema_exposes_retry_handles_and_pending_publication_acknowledgement():
+    current = _frame_with_review_debt()
+    payload = DeepSeekGrowthProvider(Settings()).projection(current, "decide")
+    system = payload["messages"][0]["content"]
+    schema = json.loads(system.split("JSON schema:\n", 1)[1])
+    options = {option["properties"]["action"]["const"]: option for option in schema["oneOf"]}
+    retry = options["retry_review"]["properties"]["args"]
+    assert retry["required"] == ["debt_id"]
+    assert retry["properties"]["debt_id"]["enum"] == ["review-debt-a"]
+    publish = options["publish"]["properties"]["args"]
+    assert publish["properties"]["allow_pending_review"] == {"type": "boolean"}
+    assert publish["allOf"] == [{
+        "if": {"properties": {"trial_id": {"enum": ["trial-a"]}}, "required": ["trial_id"]},
+        "then": {"required": ["allow_pending_review"], "properties": {"allow_pending_review": {"const": True}}},
+    }]
+    assert "保留待补状态" in system
+    assert "发表并不完成评议" in system
+
+
+async def test_fixture_can_resume_real_review_or_explicitly_publish_preserved_trial():
+    current = _frame_with_review_debt()
+    provider = FixtureGrowthProvider()
+    assert (await provider.decide(current)).value == {"action": "retry_review", "args": {"debt_id": "review-debt-a"}}
+    current["allowed_actions"].remove("retry_review")
+    current["method"]["parent_ref"] = {"kind": "method", "object_id": "method-origin", "version": "origin-v"}
+    current["pending_trial"] = current["trials"][0]
+    record(current, "try_write")
+    result = await provider.decide(current)
+    assert result.value == {"action": "publish", "args": {"trial_id": "trial-a", "allow_pending_review": True}}
+    assert current["review_debt"][0]["status"] == "pending"
+
+
+def test_invocation_products_are_readable_method_inputs_not_world_parents():
+    current = _frame_with_review_debt()
+    invocation = {"kind": "invocation", "object_id": "invocation-a", "version": "invocation-v"}
+    assert validate_decision(current, {"action": "query", "args": {"kind": "invocation", "query": "*"}})
+    assert validate_decision(current, {"action": "read_page", "args": {
+        "kind": "invocation", "id": "invocation-a", "version": "invocation-v",
+    }})
+    assert validate_decision(current, {"action": "revise", "args": {
+        "method_id": "method-old", "instruction": "把实际调用的策略用于下一次承接。",
+        "program": {"inputs": [invocation]},
+    }})
+    with pytest.raises(ProviderError):
+        validate_decision(current, {"action": "try_write", "args": {"parent_ids": ["invocation-a"]}})
+    with pytest.raises(ProviderError):
+        validate_decision(current, {"action": "read_page", "args": {
+            "kind": "invocation", "id": "invocation-unoffered",
+        }})
 
 
 def test_publish_and_response_can_choose_exact_versions_from_history():

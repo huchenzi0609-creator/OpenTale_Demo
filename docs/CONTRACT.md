@@ -25,6 +25,30 @@ new DeepSeek drafts/renders invoke one recorded result review. Calls use the
 existing budget and independent accepted-stage recovery. See
 [method iteration protocol](GROWTH_METHOD_ITERATION.md).
 
+V0.6.4 new frames use `growth-work-v3`. Before a new draft/render, `invoke` executes
+the root method and its explicit child calls in postorder. Immutable, scope-private
+`invocation` objects retain exact methods, inputs, child results, fingerprints and
+accepted requests. The root strategy is attached as `method_invocation` to the
+actual generation input. Version/range/task-equivalent work reuses the saved result;
+method parent history is not automatically replayed as accumulated instructions.
+Trials expose `generation_invocation_ref`; a separate private `generation_use`
+record associates an immutable passage with its strategy without changing legacy
+passage hashes or kernel replay semantics. Saved older generation envelopes retain
+their original frames and never gain retrospective invocation calls.
+
+Method proposals and reviews have a public work-output contract distinct from
+narrative prose. Evidence retains exact object versions, origin and excerpt bounds;
+review opinions do not become verified history. Safe accepted products survive an
+advisory review format failure with session `phase:review_pending` and explicit
+`review_debt`. Only a real successful `retry_review` changes a debt to `complete`.
+New-protocol publication of an affected trial requires `allow_pending_review:true`
+and leaves the debt pending. Transport, budget, permission and private-content
+failures remain explicit failures. Verified historical `TECHNICAL_PROSE` pauses
+can be migrated with zero provider calls via `recover-review-pauses` or the backup
+recovery CLI; the recovery receipt marks deferred work rather than a fake review.
+Run status aggregates independent actor errors instead of taking the last actor's
+success. See [execution guide](GROWTH-V064.md) for evidence and effect boundaries.
+
 ## Bounded context pages (v0.5.2)
 
 New v2 jobs use `provider-json-v3-bounded` and `source-pages-v1`. Version-1 and

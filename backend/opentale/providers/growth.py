@@ -35,10 +35,11 @@ from .base import ModelResult, ProviderError
 from .deepseek import DeepSeekProvider
 from .feedback import OutputFeedback
 
-GrowthStage = Literal["decide", "draft", "render", "review"]
+GrowthStage = Literal["decide", "invoke", "draft", "render", "review"]
 Action = Literal[
     "query", "read_page", "inspect", "apply", "revise", "adopt", "try_write",
     "publish", "navigate", "render", "respond", "reflect", "wait",
+    "retry_review",
 ]
 PROJECTION_VERSION = "growth-pages-v1"
 
@@ -57,6 +58,10 @@ class GrowthProvider(Protocol):
     ) -> ModelResult[str]: ...
 
     async def review(
+        self, frame: dict, *, repair: OutputFeedback | None = None,
+    ) -> ModelResult[str]: ...
+
+    async def invoke(
         self, frame: dict, *, repair: OutputFeedback | None = None,
     ) -> ModelResult[str]: ...
 
@@ -81,6 +86,20 @@ class _Rendered(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_PRESENTATION_TEXT_CHARS)
 
 
+class _Reviewed(BaseModel):
+    """Public work evidence, deliberately distinct from fictional prose."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=MAX_PRESENTATION_TEXT_CHARS)
+
+
+class _Invoked(BaseModel):
+    """A method's executable proposal for this exact generation context."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1, max_length=MAX_PRESENTATION_TEXT_CHARS)
+
+
 _ACTIONS = frozenset(_Decision.model_json_schema()["properties"]["action"]["enum"])
 _FIELDS = {
     "query": ({"query", "kind"}, {"query", "kind", "offset"}),
@@ -90,11 +109,12 @@ _FIELDS = {
     "adopt": ({"method_id"}, {"method_id", "method_version"}),
     "revise": ({"method_id", "instruction"}, {"method_id", "method_version", "instruction", "input_ids", "input_refs", "purpose", "program"}),
     "try_write": ({"parent_ids"}, {"parent_ids", "direction"}),
-    "publish": ({"trial_id"}, {"trial_id", "trial_version", "parent_ids", "association_ids", "relation"}),
+    "publish": ({"trial_id"}, {"trial_id", "trial_version", "parent_ids", "association_ids", "relation", "allow_pending_review"}),
     "navigate": ({"node_id"}, {"node_id", "edge_id", "transition", "start", "end"}),
     "render": ({"visit_ids"}, {"visit_ids"}),
     "respond": ({"text"}, {"text", "about_ids", "about_refs", "evaluation_method_id", "evaluation_method_version"}),
     "reflect": ({"method_id"}, {"method_id", "method_version", "about_ids", "about_refs", "purpose"}),
+    "retry_review": ({"debt_id"}, {"debt_id"}),
     "wait": (set(), {"reason"}),
 }
 _FRAME_FIELDS = frozenset({
@@ -108,6 +128,8 @@ _FRAME_FIELDS = frozenset({
     "view", "method_evidence", "method_dependencies", "feedback_catalog", "response_page", "selected_node_ids",
     "views", "method_work", "reading_work", "capabilities", "method_execution", "method_cache",
     "iteration_work", "work_protocol", "review_targets", "review_order", "purpose",
+    "invocation_context", "invocation_children", "method_invocation", "evidence_context", "world_frontier",
+    "review_debt", "invocations",
 })
 _PRIVATE_KEYS = frozenset({
     "api_key", "authorization", "Authorization", "base_url", "endpoint", "settings",
@@ -132,6 +154,22 @@ def _catalog(frame: dict, name: str) -> list[dict]:
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ProviderError("GROWTH_FRAME_INVALID", "当前工作目录格式无效。")
     return rows
+
+
+def _pending_review_debts(frame: dict) -> list[dict]:
+    pending = [debt for debt in _catalog(frame, "review_debt")
+               if type(debt.get("status")) is str and debt["status"] in {"pending", "failed"}
+               and _string(debt.get("id"))]
+    if any(type(debt.get("targets", [])) is not list
+           or any(not isinstance(target, dict) for target in debt.get("targets", [])) for debt in pending):
+        raise ProviderError("GROWTH_FRAME_INVALID", "当前待补评议目录格式无效。")
+    return pending
+
+
+def _trial_review_pending(frame: dict, trial_id: str) -> bool:
+    return any(target.get("kind") == "trial" and target.get("object_id") == trial_id
+               for debt in _pending_review_debts(frame)
+               for target in debt.get("targets", []) if isinstance(target, dict))
 
 
 def _ids(frame: dict, name: str) -> set[str]:
@@ -296,6 +334,13 @@ def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | N
     for field in ("offset", "start", "end"):
         if field in args:
             valid &= type(args[field]) is int and args[field] >= 0
+    if "allow_pending_review" in args and type(args["allow_pending_review"]) is not bool:
+        raise _invalid(usage=usage, field="allow_pending_review")
+    if action == "retry_review":
+        if type(args["debt_id"]) is not str or args["debt_id"] not in {
+            debt["id"] for debt in _pending_review_debts(frame)
+        }:
+            raise _invalid(usage=usage, field="debt_id", issue="HANDLE_UNKNOWN")
     if "method_id" in args:
         try:
             if "method_version" in args and not _string(args["method_version"]):
@@ -319,6 +364,10 @@ def validate_decision(frame: dict, decision: dict, *, usage: tuple[int, int] | N
             resolve_handle(frame, args["trial_id"], "trial", args.get("trial_version"))
         except CapabilityError as exc:
             raise _invalid(usage=usage, field="trial_id", issue=exc.issue) from None
+        if (frame.get("work_protocol") == "growth-work-v3" and action == "publish"
+                and _trial_review_pending(frame, args["trial_id"])
+                and args.get("allow_pending_review") is not True):
+            raise _invalid(usage=usage, field="allow_pending_review", issue="REVIEW_PENDING_ACK_REQUIRED")
     for field in ("parent_ids", "association_ids"):
         if field in args:
             if not _references(args[field], offered["node"]):
@@ -409,7 +458,7 @@ def _clean(value: object) -> object:
 
 def project_frame(frame: dict, stage: GrowthStage) -> dict:
     """Keep action-local data; full chosen sources and own feedback stay intact."""
-    if stage not in {"decide", "draft", "render", "review"} or type(frame) is not dict:
+    if stage not in {"decide", "invoke", "draft", "render", "review"} or type(frame) is not dict:
         raise ProviderError("GROWTH_FRAME_INVALID", "当前工作输入格式无效。")
     try:
         data = _clean({key: value for key, value in frame.items() if key in _FRAME_FIELDS})
@@ -424,13 +473,13 @@ def project_frame(frame: dict, stage: GrowthStage) -> dict:
             raise ValueError("Invalid work observation")
     except (TypeError, ValueError, RecursionError):
         raise ProviderError("GROWTH_FRAME_INVALID", "当前工作输入格式无效。") from None
-    if stage in {"draft", "render", "review"}:
+    if stage in {"invoke", "draft", "render", "review"}:
         method = data.get("method")
         if not isinstance(method, dict) or not _string(method.get("id")) or not _string(method.get("version")):
-            raise ProviderError("GROWTH_FRAME_INVALID", "试写或阅读需要已冻结的精确方法版本。")
+            raise ProviderError("GROWTH_FRAME_INVALID", "方法工作或生成需要已冻结的精确方法版本。")
         if not _string(method.get("instruction"), maximum=MAX_MODEL_REQUEST_CHARS):
             raise ProviderError("GROWTH_FRAME_INVALID", "当前采用方法的完整指令尚未交付。", True)
-        if stage != "review" and not _catalog(data, "sources"):
+        if stage in {"draft", "render"} and not _catalog(data, "sources"):
             raise ProviderError("GROWTH_SOURCE_UNREAD", "先读取所选原文页面，再继续试写或阅读。", True)
         for source in _catalog(data, "sources"):
             if not _string(source.get("id")) or not _string(source.get("version")) or not _string(source.get("text"), maximum=MAX_MODEL_REQUEST_CHARS):
@@ -442,6 +491,7 @@ def project_frame(frame: dict, stage: GrowthStage) -> dict:
             "scope_id", "role", "graph_commit", "work_seq", "direction", "allowed_actions", "method",
             "sources", "source_spans", "visit_ids", "reading_history", "responses", "method_execution",
             "method_evidence", "work_protocol",
+            "method_invocation", "evidence_context",
         }}
     return data
 
@@ -455,8 +505,11 @@ _DISCIPLINE = """
 只在它们传达实际叙事差异时使用；成串的免责声明、先排除再立论和替读者消除误解的围栏会挤掉生活。
 direction、instruction、responses 属于工作目的与经验反馈。吸收其中要促成的变化，转成具体的
 选材、动作、关系或阅读重点；方法与评议也采用正向可执行的表述，让下一步有事可做。
-从当下生活中形成发现、选择与创造，节奏和篇幅由处境决定。方法按精确版本与完整指令执行；
-方法的组织说明与正文分开。角色、窗口、私人经验与局部冲突保持各自作用域。
+从当下生活中形成发现、选择与创造，节奏和篇幅由处境决定。方法的精确版本标记本次正在检验的
+完整做法，实际生成落实本次方法调用形成的策略。方法的组织说明与正文分开。
+角色、窗口、私人经验与局部冲突保持各自作用域。
+种子是已经生活过的起点：人物可以获得新经验，结识新人物，作出新的行动、约定和理解。
+来源与版本核查确认哪些事已经写过；试写可以从这些条件创造接下来的事，并形成新的可承接条件。
 目录提供可读取的句柄和简介。实际已见原文以 sources 与 pages 的范围为准。
 遇到未交付的正文、方法或回应，选择 read_page；长正文可以继续取得后页。完整回应与工作收据
 是下一步判断的依据，保留其具体内容。每个动作只提出一种工作，宿主随后执行并返回实际结果。
@@ -473,6 +526,9 @@ start/end 与 next_start 为准。原文后页沿 next_start 取得，EOF 表明
 inspect 查看方法定义；apply 按方法组织当前材料；try_write 产生可评价的试写；
 respond 保存公开工作反馈；revise 建立方法新版本；adopt 采用给定方法的精确已交付版本。
 publish 显式发布选定试写，parent_ids 表示生长来处，association_ids 表示一般关联。
+review_debt 列出已经保存产物的待补评议。retry_review 使用当前目录里 pending/failed 债务的 debt_id
+实际补做评议。已安全保存的草稿可继续比较、修订或明确发表；growth-work-v3 中发表尚有待补评议的
+试写时使用 allow_pending_review:true，表明保留未完成评议并承担这次选材决定。发表并不完成评议。
 阅读由 navigate 保存一次真实访问，其 start/end 是原文码点区间；随后 render 呈现给定 visit_ids。
 长正文按实际访问区间呈现；后页可以再次读取或访问。跨入口过渡属于读轨。
 role=reading 的主要工作是有意图地遍历已经生成的图并形成连续阅读：选择枝桠、navigate 真实访问、
@@ -505,6 +561,8 @@ reflect 使用 method_id 指定评议方法，about_ids/about_refs 指定实际�
 该方法自身。宿主执行方法评议并保存公开工作回应。再次 reflect 上一次回应及其方法，可以
 检验评议方式怎样影响接下来的选择；在 iteration_work 提供的未评议结果上及时完成这一工作。
 review 是可检验的工作产物，写出已见效果、采用方式和可执行下一步，随后 revise/calls 可使用。
+已有方法和评议也可以作为一次新生成的输入。组合调用已有方法检验其选材、组织与判断标准，
+让调用结果改变实际写作或阅读计划；一次方法的经验可以成为另一方法工作的条件。
 revise 只保存候选；从返回收据找到候选，inspect 取得完整定义，可 apply 该候选执行组织并
 临时试用，再通过 try_write 或 navigate/render 比较实际效果。adopt 正式采用选定精确版本；
 采用决定与组织执行分别记录，采用后 apply 新版本的组织，再继续工作。检验后可继续修订、
@@ -518,20 +576,49 @@ respond 的 text 保存工作判断与具体依据，以公开的结果评价和
 groups 共享分组与 relations 结构关系；这些均引用当前可用节点，组织关系随后由 apply 实际执行。
 返回 {"action":动作名,"args":该动作参数}。每种 args 使用本次给出的 schema；省去额外字段。
 """.strip(),
+    "invoke": """
+这是一次真实的方法调用。读懂 method 精确版本记录的完整做法，结合当前已交付材料与
+invocation_context，形成下一次 draft 或 render 可以执行的具体策略。
+instruction 记录可检验的做法。本次调用可依据实际结果，对旧方法的关注尺度、选材边界或判断标准
+作局部试验，在策略中说明这次具体怎样展开、怎样观察效果。随后 draft/render 落实这份策略，
+结果促成 revise/adopt 保存经检验的新做法。invocation_context 标明目标、模式和真实调用位置。
+invocation_children 交付已完成子方法的公开策略；逐项比较它们的选择与判断，将有用结果转成当前
+调用的操作，让子方法确实改变上层选材、组织、展开尺度或判断标准。方法可用于检查其他方法怎样
+选择和评议，再将这种检查的结果用于当前创作；阶位由实际调用产生，效果由下一次作品检验。
+依据 sources、method_evidence、evidence_context 和 world_frontier 指出当前处境，提出值得尝试的
+变化、具体展开方式与观察结果的依据。以完整方法版本为准，说明实际沿用、调整或扩展哪种做法。
+mode=draft 时，前史提供生成起点。方法过去的边界也可以成为本次重新检查的材料，依据当下经验
+尝试新的行动、关系、知识、义务或时间尺度，把一种实际后果交给后续人物和窗口继续选择。
+世界前沿帮助发现已实现且尚可承接的条件；新的人物、动作与生活后果可从这些条件创造出来。
+mode=render 时，在已实际访问的来源上组织阅读，选择跨段关系、关注或解释方式，让读者的经验
+发生变化。阅读呈现的事件依据 sources 与实际访问范围，扩展世界另行通过试写发布。
+本阶段交付公开可执行计划，可以使用操作名和已交付精确句柄。子方法产物、旧评议和这次计划均是
+等待作品验证的工作建议。把将要尝试的事表达为计划，把已经发生的事限定在已交付原文与执行事实。
+只交付有用的策略与效果检验方式，省去隐藏推理、认证信息和调试轨迹。
+直接返回 {"text":完整可执行的生成或阅读策略}。
+""".strip(),
     "draft": """
-按 method 的精确版本及完整 instruction，使用 sources 中实际已见的原文范围，形成一段试写。
+依据 method 精确版本记录的完整做法和本次 method_invocation 策略，使用 sources 中实际已见的
+原文范围，形成一段试写。方法调用提出的局部试验在本次正文中实际展开，结果交给后续评议与修订。
 接住当前 parent_ids 所选生活与本作用域方向，让材料产生实际行动、感知或关系后果。
 方法可以根据刚发生的反馈改变组织方式；所写文字应体现本次采用方式产生的具体后果。
 先选取方法要求的具体关系或经验变化，以行动实现本次工作差异，让后果成为下一次可用的材料。
 保留前史的必要依据，同时让当前人物形成新经验；篇章用发生的生活推进，避免把初始材料换句重写。
+所选原文交付起点与约束条件，接下来的事件由本次试写创造。行动类型、出场人物、关系和时间跨度
+可以随当前经验展开。尝试让一个具体后果改变其他人的可选生活，让新的条件进入下一段构造。
+method_invocation 保存本次已经实际调用方法得到的公开策略与子方法结果引用。让其中选材、尺度、
+展开和效果检验方式落实到这段正文；策略的设想在本次试写中成为实际经验后，才形成新的世界事实。
 试写尚未公开进入世界。直接返回 {"text":完整第三人称正文}。
 """.strip(),
     "render": """
-按 method 的精确版本与完整 instruction，为本读轨真实 visit_ids 的已访问原文形成连续阅读。
+依据 method 精确版本记录的完整做法和本次方法调用策略，为本读轨真实 visit_ids 的已访问原文
+形成连续阅读。当前读法可以通过关注尺度和段落联系的局部试验改变读者经验。
 可以转述、改变重点并保留局部解释，原文中的事件、时序、人物与关系保持来源范围内的依据。
 新增世界事件需要另行试写和发布。来源定位保存于 source_spans，正文自然连贯地呈现生活。
 本读轨的阅读方法也可从实际访问与回应中修订。当前呈现落实所采用的选取与重点，接住本轨已有
 阅读的经验变化，让路径选择形成意义，而不是一再复述原文的相同细节。
+method_invocation 是本次实际方法调用形成的阅读策略。将其选取、跨段联系与重点落实为连续正文，
+来源中已有事件提供事实，方法调用的建议提供读法；读法中的假设依其解释身份呈现。
 直接返回 {"text":完整第三人称阅读正文}。
 """.strip(),
     "review": """
@@ -542,6 +629,17 @@ review_targets 指定实际评议对象，review_order 记录此次评议在已�
 当评议对象本身是方法或评议时，检查它采用了什么选择与判断，怎样使某些后果进入后续构造；
 让更高一层的判断改变实际工作方式。把评议写成可被其他方法继续调用的公开工作产物。
 具体指出已经发生的变化和可执行的差异。用正向、直接的工作描述展开判断，保留材料的局部范围。
+这是公开方法工作成果，可使用 apply、reflect、revise、program.calls 等操作名和 capabilities 中
+已交付的精确句柄；这些内容保存在工作回应里，叙事正文另行生成。返回结果判断与可执行的做法，
+省去隐藏推理、认证配置与调试信息。句柄引用只说明依据，后续操作的权限仍由宿主逐项核验。
+区分三种材料：已交付原文中确实发生的事、以前评议提出的建议、候选方法等待验证的做法。
+指出某版本规定了什么时，核对完整指令；当前只见局部材料时说明观察范围。模型的回应是模型工作
+意见，采用决定与公开结果依据实际收据。评议意见留待下一次构造检验，不能自动成为已发生的世界事实。
+检查当前判断尺度是否反复把所有问题缩成同一种写法：除物件和微动作，也可关注知识如何改变行动、
+承诺如何改变时间安排、关系如何改变选择、一个人的后果如何进入另一人的生活、阅读路径如何改变理解。
+按实际材料选择适用的尺度，也可提出其他尺度。再评议应形成一个可以尝试的新可能及检验方式，
+把有用经验转为可执行操作；方法的进展由新增可选生活和实际承接检验，而非由限制条款数量衡量。
+种子提供前史，后续创造形成新经验。新动作、新人物、新关系和跨时推进可以从已有条件自然生出。
 直接返回 {"text":完整公开工作判断及可执行下一步}。
 """.strip(),
 }
@@ -572,6 +670,8 @@ def _work_guidance(data: dict) -> str:
         hints.append("当前正在采用或临时试用的方法尚未完成本版本组织。apply 当前 method 的精确版本，让选材和组织落实到后续工作。")
     if method_work.get("pending_trial_unpublished"):
         hints.append("当前已有尚未发布的试写。先从实际结果形成评价、修订/试用方法或选择 publish，再展开下一次试写。")
+    if _pending_review_debts(data):
+        hints.append("当前有待补评议，已有产物仍安全保存。可用 retry_review 实际补做评议，或继续比较方法；选择发表对应草稿时显式给出 allow_pending_review:true，保留待补状态。")
     if last == "revise":
         details = receipts[-1].get("details") or {}
         if details.get("changed") is False:
@@ -631,6 +731,10 @@ def _action_schema(frame: dict) -> dict:
         for field in sorted(fields):
             if field in {"offset", "start", "end"}:
                 properties[field] = integer
+            elif field == "allow_pending_review":
+                properties[field] = {"type": "boolean"}
+            elif field == "debt_id":
+                properties[field] = {"type": "string", "enum": sorted({debt["id"] for debt in _pending_review_debts(frame)})}
             elif field in {"method_id", "evaluation_method_id"}:
                 properties[field] = {"type": "string", "enum": sorted(offered["method"])}
             elif field == "method_version":
@@ -691,12 +795,21 @@ def _action_schema(frame: dict) -> dict:
                 }
             else:
                 properties[field] = {**scalar, "maxLength": 200} if field in {"purpose", "relation"} else scalar
+        args_schema = {
+            "type": "object", "additionalProperties": False, "required": sorted(required),
+            "properties": properties,
+        }
+        if action == "publish" and frame.get("work_protocol") == "growth-work-v3":
+            pending_trials = sorted(key for key in offered["trial"] if _trial_review_pending(frame, key))
+            if pending_trials:
+                args_schema["allOf"] = [{
+                    "if": {"properties": {"trial_id": {"enum": pending_trials}}, "required": ["trial_id"]},
+                    "then": {"required": ["allow_pending_review"],
+                             "properties": {"allow_pending_review": {"const": True}}},
+                }]
         options.append({
             "type": "object", "additionalProperties": False, "required": ["action", "args"],
-            "properties": {"action": {"const": action}, "args": {
-                "type": "object", "additionalProperties": False, "required": sorted(required),
-                "properties": properties,
-            }},
+            "properties": {"action": {"const": action}, "args": args_schema},
         })
     return {"oneOf": options, "$defs": {"exactRef": exact_ref(), "methodRef": exact_ref("method")}}
 
@@ -743,7 +856,8 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
     @staticmethod
     def _prepare(frame: dict, stage: GrowthStage) -> tuple:
         data = project_frame(frame, stage)
-        schema = {"decide": _Decision, "draft": _Draft, "render": _Rendered, "review": _Rendered}[stage]
+        schema = {"decide": _Decision, "invoke": _Invoked, "draft": _Draft,
+                  "render": _Rendered, "review": _Reviewed}[stage]
         shape = _action_schema(data) if stage == "decide" else schema.model_json_schema()
         return _INSTRUCTIONS[stage], data, schema, shape
 
@@ -760,7 +874,7 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
         value = validate_decision(data, result.value.model_dump(), usage=(result.input_tokens, result.output_tokens))
         return ModelResult(value, result.input_tokens, result.output_tokens)
 
-    async def _prose(self, frame: dict, stage: Literal["draft", "render", "review"], repair) -> ModelResult[str]:
+    async def _prose(self, frame: dict, stage: Literal["draft", "render"], repair) -> ModelResult[str]:
         instructions, data, schema, shape = self._prepare(frame, stage)
         result = await self._request(instructions, data, schema, output_schema=shape, repair=repair)
         text = result.value.text
@@ -784,7 +898,35 @@ class DeepSeekGrowthProvider(DeepSeekProvider):
         return await self._prose(frame, "render", repair)
 
     async def review(self, frame: dict, *, repair: OutputFeedback | None = None) -> ModelResult[str]:
-        return await self._prose(frame, "review", repair)
+        return await self._work_product(frame, "review", repair)
+
+    async def invoke(self, frame: dict, *, repair: OutputFeedback | None = None) -> ModelResult[str]:
+        return await self._work_product(frame, "invoke", repair)
+
+    async def _work_product(self, frame: dict, stage: Literal["invoke", "review"], repair) -> ModelResult[str]:
+        instructions, data, schema, shape = self._prepare(frame, stage)
+        result = await self._request(instructions, data, schema, output_schema=shape, repair=repair)
+        self._check_work_product(result.value.text, usage=(result.input_tokens, result.output_tokens))
+        return ModelResult(result.value.text, result.input_tokens, result.output_tokens)
+
+    @staticmethod
+    def _check_work_product(text: str, *, usage: tuple[int, int] | None = None) -> None:
+        """Work may name tools and public IDs; it never exposes private traces.
+
+        A mentioned handle is evidence prose, not an executable permission. All
+        subsequent typed action references still pass validate_decision and the
+        host's scoped, exact-version capability checks.
+        """
+        if (not text.strip() or re.search(
+            r"</?(?:think|analysis|reasoning)>|reasoning_content|hidden_reasoning|"
+            r"creator_provenance|source_position_id|condition_fingerprint|"
+            r"provider_error_body|raw_error|(?m:^\s*(?:隐藏推理|推理过程|思维链|CoT)\s*[:：])",
+            text, re.IGNORECASE,
+        )):
+            raise ProviderError(
+                "MODEL_OUTPUT_INVALID", "工作成果包含不允许公开的私有信息。", True, usage=usage,
+                feedback=OutputFeedback("PROSE_INVALID", ("WORK_PRIVATE_CONTENT",)),
+            )
 
 
 class FixtureGrowthProvider:
@@ -813,7 +955,10 @@ class FixtureGrowthProvider:
         method = data.get("method") or next(iter(_catalog(data, "methods")), {})
         method_id = method.get("id")
         adopted_revision = "adopt" in actions or bool(method.get("parent_ref"))
-        if data.get("role") == "reading":
+        pending_debts = _pending_review_debts(data)
+        if pending_debts and "retry_review" in data.get("allowed_actions", _ACTIONS):
+            decision = {"action": "retry_review", "args": {"debt_id": pending_debts[0]["id"]}}
+        elif data.get("role") == "reading":
             decision = self._reading(data, actions, method_id)
         elif last == "try_write" and data.get("pending_trial"):
             if adopted_revision:
@@ -850,6 +995,9 @@ class FixtureGrowthProvider:
             decision = {"action": "wait", "args": {"reason": "等待当前工作能力恢复。"}}
         if decision["action"] == "respond" and isinstance(data.get("evaluation_method"), dict):
             decision["args"]["evaluation_method_id"] = data["evaluation_method"]["id"]
+        if (decision["action"] == "publish" and data.get("work_protocol") == "growth-work-v3"
+                and _trial_review_pending(data, decision["args"]["trial_id"])):
+            decision["args"]["allow_pending_review"] = True
         return ModelResult(validate_decision(data, decision))
 
     @staticmethod
@@ -899,6 +1047,18 @@ class FixtureGrowthProvider:
         cue = next((str(item.get("text", item.get("instruction", "")))[:80]
                     for item in evidence if item.get("text") or item.get("instruction")), "本次交付的方法与实际结果")
         return ModelResult(f"这次方法接住了{cue}。下一次把实际回应和改变选材的方式共同作为输入，检验两种去处怎样留下不同后果。")
+
+    async def invoke(self, frame: dict, *, repair=None) -> ModelResult[str]:
+        data = project_frame(frame, "invoke")
+        context = data.get("invocation_context", {})
+        mode = "阅读" if context.get("mode") == "render" else "试写"
+        children = _catalog(data, "invocation_children")
+        child_text = "\n".join(row["text"] for row in children if isinstance(row.get("text"), str))
+        plan = (f"本次{mode}按完整方法操作：{data['method']['instruction']}。"
+                "从当前生活的实际后果选择材料，把人物回应造成的新条件接入下一段经验。")
+        if child_text:
+            plan += "\n将子方法的判断落实为当前操作：\n" + child_text
+        return ModelResult(plan)
 
 
 def make_growth_provider(mode: str, settings: Settings, client: httpx.AsyncClient | None = None) -> GrowthProvider:

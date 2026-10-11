@@ -4,6 +4,7 @@ import type { GraphObjectRef, GraphRecord, GraphRecordPage, GraphSnapshot } from
 import { budgetText } from "../budgetLimits";
 import { graphErrorText } from "../useGrowthWorkbench";
 import { graphStatusText } from "./GrowthReading";
+import GrowthWorkState from "./GrowthWorkState";
 
 export default function GrowthEvidence({ snapshot, diagnostics = false }: { snapshot: GraphSnapshot; diagnostics?: boolean }) {
   const refreshKey = JSON.stringify([
@@ -12,6 +13,7 @@ export default function GrowthEvidence({ snapshot, diagnostics = false }: { snap
     snapshot.sessions.map((session) => [session.work_seq, session.last_review_ref?.version ?? null]),
     snapshot.trials.map((trial) => [trial.id, trial.version ?? null]),
     snapshot.responses.map((response) => [response.id, response.version ?? null]),
+    snapshot.invocations?.map((invocation) => [invocation.id, invocation.version ?? null]),
   ]);
   if (diagnostics) return <div className="growth-evidence-layout">
     <section className="panel" aria-label="生长运行预算"><p className="eyebrow">USAGE / DIAGNOSTICS</p><h2>调用与预算</h2>
@@ -28,6 +30,7 @@ export default function GrowthEvidence({ snapshot, diagnostics = false }: { snap
     </section>
     <section className="panel" aria-label="独立工作会话"><p className="eyebrow">WORK SESSIONS</p><h2>工作会话</h2>
       {snapshot.sessions.length ? snapshot.sessions.map((session) => <div className="growth-record" key={session.id}><strong>{session.scope_id}</strong><p className="helper">本地工作序号 {session.work_seq} · {graphStatusText(session.status)} · {session.last_action}</p>
+        <GrowthWorkState session={session} diagnostics />
         {session.last_review_ref && <p className="helper">最近实际评议 <code>{session.last_review_ref.object_id}</code> · {session.last_review_ref.version.slice(0, 10)}</p>}
         {validCount(session.max_review_order) && <p className="helper">已观察最高评议对象阶次 {session.max_review_order}</p>}
         <MethodExecution value={session.view?.execution} />
@@ -41,15 +44,16 @@ export default function GrowthEvidence({ snapshot, diagnostics = false }: { snap
     </section>
   </div>;
   return <div className="growth-evidence-layout">
-    <section className="panel growth-evidence-intro"><p className="eyebrow">METHOD / TRIAL / RESPONSE</p><h2>组织方法也可以生长</h2><p className="helper">起步方法提供初始方向。修改会生成独立版本，试用与正式采用分别记录。方法版本的增加需要结合实际选材、试写与采用结果判断。</p></section>
+    <section className="panel growth-evidence-intro"><p className="eyebrow">METHOD / TRIAL / RESPONSE</p><h2>组织方法也可以生长</h2><p className="helper">起步方法提供初始方向。修改会生成独立版本，试用与正式采用分别记录。方法版本的增加需要结合实际选材、试写与采用结果判断。模型方法调用保存为工作提案，进入生成的精确结果单独记录。</p></section>
     <RecordPanel runId={snapshot.run.id} kind="methods" title="方法版本" refreshKey={refreshKey} snapshot={snapshot} />
+    {snapshot.invocations != null && <RecordPanel runId={snapshot.run.id} kind="invocations" title="模型方法调用与生成依据" refreshKey={refreshKey} snapshot={snapshot} />}
     <MethodActions snapshot={snapshot} />
     <RecordPanel runId={snapshot.run.id} kind="trials" title="候选试验" refreshKey={refreshKey} />
     <RecordPanel runId={snapshot.run.id} kind="responses" title="局部回应" refreshKey={refreshKey} />
   </div>;
 }
 
-function RecordPanel({ runId, kind, title, refreshKey, snapshot }: { runId: string; kind: "methods" | "trials" | "responses" | "events"; title: string; refreshKey: string; snapshot?: GraphSnapshot }) {
+function RecordPanel({ runId, kind, title, refreshKey, snapshot }: { runId: string; kind: "methods" | "trials" | "responses" | "events" | "invocations"; title: string; refreshKey: string; snapshot?: GraphSnapshot }) {
   const [page, setPage] = useState<GraphRecordPage | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -81,12 +85,13 @@ function RecordPanel({ runId, kind, title, refreshKey, snapshot }: { runId: stri
     {loading && !page && <p className="helper" role="status">正在读取记录…</p>}
     {error && <p className="message error" role="alert">{error}</p>}
     {page?.items.length === 0 && <p className="helper">当前没有{title}记录。</p>}
-    {page?.items.map((record) => <EvidenceRecord key={`${record.id}:${record.version ?? ""}`} record={record} kind={kind} adoptedBy={snapshot ? methodOwners(snapshot, record) : []} />)}
+    {kind === "invocations" && <p className="helper">调用结果是供生成使用的工作提案。下方仅依据候选或阅读保存的精确引用标明使用情况，声明调用与结构深度分别展示。</p>}
+    {page?.items.map((record) => <EvidenceRecord key={`${record.id}:${record.version ?? ""}`} record={record} kind={kind} adoptedBy={snapshot ? methodOwners(snapshot, record) : []} generationUses={snapshot ? invocationUses(snapshot, record) : []} />)}
     {page?.next_offset != null && <button className="text-button" disabled={loading} onClick={() => void more()}>{loading ? "正在读取…" : "载入更多记录"}</button>}
   </section>;
 }
 
-function EvidenceRecord({ record, kind, adoptedBy = [] }: { record: GraphRecord; kind: string; adoptedBy?: string[] }) {
+function EvidenceRecord({ record, kind, adoptedBy = [], generationUses = [] }: { record: GraphRecord; kind: string; adoptedBy?: string[]; generationUses?: string[] }) {
   const instruction = typeof record.instruction === "string" ? record.instruction : record.purpose;
   return <article className="growth-record">
     <strong>{record.title ?? record.label ?? (kind === "events" && typeof record.action === "string" ? record.action : kind === "events" && typeof record.type === "string" ? record.type : record.id)}</strong>
@@ -95,6 +100,11 @@ function EvidenceRecord({ record, kind, adoptedBy = [] }: { record: GraphRecord;
     {instruction && <p className="growth-record-body">{instruction}</p>}
     {record.text && <p className="growth-record-body">{record.text}</p>}
     {kind === "trials" && <span className="small-tag">{record.adopted === true ? "已采用" : "候选试验"}</span>}
+    {kind === "invocations" && <><span className="small-tag">模型调用结果 · 工作提案</span><p className="helper">{generationUses.length ? `已进入生成 · ${generationUses.join("、")}` : "当前快照尚未显示使用此精确结果的生成产物。"}</p>
+      {record.child_result_refs?.length ? <p className="helper">已输入上层的子方法结果 · {record.child_result_refs.length} 项</p> : null}
+      {record.input_refs?.length ? <details><summary>调用输入 · {record.input_refs.length} 个精确对象</summary><ul>{record.input_refs.map((ref, index) => <li key={`${ref.kind}:${ref.object_id}:${ref.version}:${index}`}>{ref.kind} · <code>{ref.object_id}</code> · {ref.version.slice(0, 10)}</li>)}</ul></details> : null}
+    </>}
+    {record.generation_invocation_ref && <p className="helper">实际生成方法调用 <code>{record.generation_invocation_ref.object_id}</code> · {record.generation_invocation_ref.version.slice(0, 10)}</p>}
     {record.method_ref && <p className="helper">方法来源 <code>{record.method_ref.object_id}</code> · {record.method_ref.version.slice(0, 10)}</p>}
     {record.evaluation_method_ref && <p className="helper">实际评议方法 <code>{record.evaluation_method_ref.object_id}</code> · {record.evaluation_method_ref.version.slice(0, 10)}</p>}
     {kind === "responses" && validCount(record.review_order) && <p className="helper">实际评议对象阶次 {record.review_order}</p>}
@@ -114,6 +124,14 @@ function sameMethod(ref: GraphObjectRef | null | undefined, record: GraphRecord)
 
 function methodOwners(snapshot: GraphSnapshot, record: GraphRecord) {
   return positions(snapshot).filter((actor) => sameMethod(actor.ref, record)).map((actor) => actor.label);
+}
+
+function invocationUses(snapshot: GraphSnapshot, record: GraphRecord) {
+  const uses: string[] = [];
+  const matches = (ref: GraphObjectRef | null | undefined) => ref?.kind === "invocation" && ref.object_id === record.id && ref.version === record.version;
+  for (const trial of snapshot.trials) if (matches(trial.generation_invocation_ref)) uses.push(`候选 ${trial.id}`);
+  for (const reading of snapshot.readings) for (const passage of reading.passages) if (matches(passage.generation_invocation_ref)) uses.push(`${reading.label} · 阅读 ${passage.read_seq}`);
+  return uses;
 }
 
 function CurrentMethods({ snapshot, records }: { snapshot: GraphSnapshot; records: GraphRecord[] }) {
@@ -165,7 +183,7 @@ function MethodProgram({ value }: { value: unknown }) {
   const inputs = Array.isArray(program.inputs) ? program.inputs.length : 0;
   const calls = Array.isArray(program.calls) ? program.calls.length : 0;
   return <div className="growth-method-program"><p className="helper">{selection} · 分组 {Object.keys(groups ?? {}).length} 个 · 关系 {relations.length} 条 · 重复出现 {occurrences} 处</p>
-    {(Object.hasOwn(program, "inputs") || Object.hasOwn(program, "calls")) && <p className="helper">通用输入 {inputs} 个 · 方法调用 {calls} 次</p>}
+    {(Object.hasOwn(program, "inputs") || Object.hasOwn(program, "calls")) && <p className="helper">通用输入 {inputs} 个 · 声明方法调用 {calls} 次</p>}
     {typeof program.purpose === "string" && program.purpose && <p className="growth-record-body">本次修改目的：{program.purpose}</p>}
     {groups && Object.keys(groups).length > 0 && <p className="helper">分组：{Object.keys(groups).join("、")}</p>}
     {relations.length > 0 && <ul>{relations.map((relation, index) => <li key={index}>{typeof relation.relation === "string" ? relation.relation : "组织关系"}{typeof relation.source_id === "string" && typeof relation.target_id === "string" ? ` · ${relation.source_id} → ${relation.target_id}` : ""}</li>)}</ul>}

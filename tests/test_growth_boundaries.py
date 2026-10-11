@@ -287,7 +287,7 @@ async def test_long_node_renders_only_the_actual_bounded_visit(runner, monkeypat
     span = visit["source_spans"][0]
     assert (span["start"], span["end"]) == expected_range
     assert passage["source_spans"] == visit["source_spans"]
-    assert state.config["usage"]["calls"] == 3
+    assert state.config["usage"]["calls"] == 4  # navigate, decide, actual method invocation, render
 
 
 async def test_dense_graph_keeps_latest_edges_and_can_query_then_traverse_older_edges(runner, monkeypatch):

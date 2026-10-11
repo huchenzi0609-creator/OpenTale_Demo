@@ -55,7 +55,7 @@ const fetchMock = vi.fn(async (url: string, options?: RequestInit) => {
     }
     return json(snapshot);
   }
-  if (/\/(methods|trials|responses|events)\?offset=0$/.test(url)) return json({ items: [], next_offset: null });
+  if (/\/(methods|trials|responses|events|invocations)\?offset=0$/.test(url)) return json({ items: [], next_offset: null });
   throw new Error(`Unexpected fixture request: ${method} ${url}`);
 });
 
@@ -253,6 +253,68 @@ describe("growth and independent reading workbench", () => {
     expect(screen.getByRole("button", { name: "阅读单步" })).toBeEnabled();
   });
 
+  it("keeps blocked growth windows visible while a reader continues independently", async () => {
+    snapshot.run.status = "error";
+    snapshot.windows[0].status = "error";
+    snapshot.sessions = [{ id: "blocked-window", scope_id: "window:a", work_seq: 4, last_action: "try_write", status: "error",
+      error: { code: "MODEL_OUTPUT_INVALID", message: "评议尚未完成，草稿已保留。", retryable: true } }];
+    await create();
+    expect(screen.getByRole("region", { name: "世界生长控制" })).toHaveTextContent("整体状态 · 需要恢复");
+    expect(screen.getByText(/1 个生长窗口需要恢复/)).toBeInTheDocument();
+    const windows = screen.getByRole("region", { name: "生成窗口状态" });
+    expect(within(windows).getByRole("alert")).toHaveTextContent("评议尚未完成，草稿已保留。（MODEL_OUTPUT_INVALID）");
+    expect(screen.getByRole("button", { name: "阅读单步" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "阅读单步" }));
+    await screen.findByText("他在街道上重新读那封信。");
+    expect(within(windows).getByRole("alert")).toHaveTextContent("草稿已保留");
+    expect(screen.getByRole("region", { name: "连续阅读" })).not.toHaveTextContent("MODEL_OUTPUT_INVALID");
+  });
+
+  it("shows saved drafts and review debt independently without claiming the failed review completed", async () => {
+    const draft = { kind: "candidate", object_id: "saved-candidate", version: "draft-version" };
+    snapshot.sessions = [{ id: "review-debt", scope_id: "window:a", work_seq: 8, last_action: "try_write", status: "ready",
+      phase: "review_pending", saved_draft_ref: draft, last_invocation_ref: { kind: "invocation", object_id: "actual-invocation", version: "invocation-version" },
+      review_debt: [{ id: "debt-1", status: "failed", stage: "try_write", request_id: "safe-review-request", targets: [draft],
+        error: Object.assign({ code: "MODEL_OUTPUT_INVALID", message: "评议返回格式无效。", retryable: true }, { raw_error: "private-review-provider-body" }) }] }];
+    await create();
+    const windows = screen.getByRole("region", { name: "生成窗口状态" });
+    expect(windows).toHaveTextContent("草稿已保存 · 评议待补 · 1 项");
+    expect(windows).toHaveTextContent("待补评议尚未完成");
+    expect(windows).not.toHaveTextContent("可发布");
+    expect(windows).not.toHaveTextContent("saved-candidate");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "生长单步" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "运行诊断" }));
+    const sessions = screen.getByRole("region", { name: "独立工作会话" });
+    expect(sessions).toHaveTextContent("保存草稿 · saved-candidate");
+    expect(sessions).toHaveTextContent("最近模型方法调用 · actual-invocation");
+    expect(sessions).toHaveTextContent("评议失败，等待后续工作");
+    expect(sessions).toHaveTextContent("评议返回格式无效。（MODEL_OUTPUT_INVALID）");
+    expect(screen.queryByText("private-review-provider-body")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(start|step)$/.test(url))).toBe(false);
+  });
+
+  it("distinguishes review-ready drafts from saved work awaiting a review and keeps reading text clean", async () => {
+    snapshot.sessions = [
+      { id: "ready-draft", scope_id: "window:a", work_seq: 6, last_action: "try_write", status: "ready", phase: "ready_to_publish", saved_draft_ref: { kind: "candidate", object_id: "reviewed-draft", version: "reviewed-version" }, review_debt: [{ id: "completed-review", status: "complete", stage: "review", request_id: "completed-request", targets: [] }] },
+      { id: "saved-draft", scope_id: "window:b", work_seq: 2, last_action: "try_write", status: "ready", phase: "draft_saved" },
+      { id: "reader-debt", scope_id: "reading:reader-1", work_seq: 5, last_action: "render", status: "ready", phase: "review_pending", review_debt: [{ id: "reader-debt-1", status: "pending", stage: "render", request_id: "reader-review", targets: [] }] },
+    ];
+    snapshot.readings[0].passages = [{ id: "saved-reading", track_id: "reader-1", read_seq: 1, text_ref: { sha256: "public-reading", length: 10 }, text: "他把信交到门边。", visit_ids: [], source_spans: [] }];
+    await create();
+    const windows = screen.getByRole("region", { name: "生成窗口状态" });
+    const ready = within(windows).getByText("写信人").closest("article")!;
+    const saved = within(windows).getByText("读信人").closest("article")!;
+    expect(ready).toHaveTextContent("草稿已保存 · 可发布");
+    expect(ready).not.toHaveTextContent("评议待补");
+    expect(saved).toHaveTextContent("草稿已保存");
+    expect(saved).not.toHaveTextContent("可发布");
+    expect(screen.getByRole("region", { name: "连续阅读" })).toHaveTextContent("评议待补 · 1 项");
+    expect(screen.getByRole("region", { name: "生长阅读正文" })).toHaveTextContent("他把信交到门边。");
+    expect(screen.getByRole("region", { name: "生长阅读正文" })).not.toHaveTextContent("评议待补");
+    expect(screen.getByRole("region", { name: "生长阅读正文" })).not.toHaveTextContent("reader-review");
+  });
+
   it("keeps methods, candidate text and call diagnostics out of reading prose", async () => {
     overrides["GET /api/graph-runs/graph-1/methods?offset=0"] = () => json({ items: [{ id: "method-1", version: "method-version", scope_id: "window:a", instruction: "先读共同来路，再选新节点。", program: { steps: [] }, payload: "private-provider-payload" }] });
     overrides["GET /api/graph-runs/graph-1/trials?offset=0"] = () => json({ items: [{ id: "trial-1", text: "这是候选试验里的文本。", adopted: false }] });
@@ -341,7 +403,7 @@ describe("growth and independent reading workbench", () => {
     expect(screen.queryByText(/实际评议对象阶次/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "方法、试验与回应" }));
     expect(await screen.findByText("实际评议对象阶次 3")).toBeInTheDocument();
-    expect(screen.getAllByText("通用输入 2 个 · 方法调用 1 次").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("通用输入 2 个 · 声明方法调用 1 次").length).toBeGreaterThan(0);
     const responses = screen.getByRole("region", { name: "局部回应" });
     const actual = within(responses).getByText("actual-review").closest("article")!;
     expect(actual).toHaveTextContent("实际评议方法 recursive-method");
@@ -357,8 +419,39 @@ describe("growth and independent reading workbench", () => {
     expect(sessions).toHaveTextContent("文本质量需结合实际阅读判断");
     fireEvent.click(screen.getByRole("button", { name: "连续阅读" }));
     expect(screen.queryByText(/实际评议对象阶次/)).not.toBeInTheDocument();
-    expect(screen.queryByText("通用输入 2 个 · 方法调用 1 次")).not.toBeInTheDocument();
+    expect(screen.queryByText("通用输入 2 个 · 声明方法调用 1 次")).not.toBeInTheDocument();
     expect(screen.queryByText("最近实际评议 actual-review")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => /\/(start|step)$/.test(url))).toBe(false);
+  });
+
+  it("shows exact model method results used in generation independently of declared and structural calls", async () => {
+    const ref = { kind: "invocation", object_id: "model-method-call", version: "used-version" };
+    const child = { kind: "invocation", object_id: "child-call", version: "child-version" };
+    snapshot.invocations = [{ id: ref.object_id, version: ref.version, scope_id: "window:a", text: "试试把送信改成邀请同行。", status: "proposal_not_world_fact", input_refs: [child], child_result_refs: [child] }];
+    snapshot.trials = [{ id: "result-trial", generation_invocation_ref: ref, text: "他邀她一同去送信。" }];
+    snapshot.readings[0].passages = [{ id: "read-result", track_id: "reader-1", read_seq: 1, text_ref: { sha256: "read-text", length: 8 }, text: "两人并肩走过街道。", visit_ids: [], source_spans: [], generation_invocation_ref: ref }];
+    overrides["GET /api/graph-runs/graph-1/invocations?offset=0"] = () => json({ items: [
+      ...snapshot.invocations!, { ...snapshot.invocations![0], version: "unused-version", text: "另一精确版本的工作提案。" },
+    ], next_offset: null });
+    overrides["GET /api/graph-runs/graph-1/trials?offset=0"] = () => json({ items: snapshot.trials, next_offset: null });
+    await create();
+    expect(screen.getByRole("region", { name: "生长阅读正文" })).not.toHaveTextContent(ref.object_id);
+    expect(screen.queryByText("试试把送信改成邀请同行。")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "方法、试验与回应" }));
+    await screen.findByText("试试把送信改成邀请同行。");
+    const calls = screen.getByRole("region", { name: "模型方法调用与生成依据" });
+    const used = within(calls).getByText("试试把送信改成邀请同行。").closest("article")!;
+    expect(used).toHaveTextContent("模型调用结果 · 工作提案");
+    expect(used).toHaveTextContent("已进入生成 · 候选 result-trial、第一条阅读 · 阅读 1");
+    expect(used).toHaveTextContent("已输入上层的子方法结果 · 1 项");
+    expect(used).toHaveTextContent("调用输入 · 1 个精确对象");
+    const unused = within(calls).getByText("另一精确版本的工作提案。").closest("article")!;
+    expect(unused).toHaveTextContent("当前快照尚未显示使用此精确结果的生成产物");
+    expect(unused).not.toHaveTextContent("已进入生成");
+    expect(screen.getByRole("region", { name: "候选试验" })).toHaveTextContent("实际生成方法调用 model-method-call");
+    fireEvent.click(screen.getByRole("button", { name: "连续阅读" }));
+    expect(screen.queryByText("试试把送信改成邀请同行。")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "生长阅读正文" })).toHaveTextContent("两人并肩走过街道。");
     expect(fetchMock.mock.calls.some(([url]) => /\/(start|step)$/.test(url))).toBe(false);
   });
 

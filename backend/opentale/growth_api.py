@@ -131,6 +131,10 @@ def register_graph_routes(app, runner, library):
         runner.store.save_head(state)
         return runner.snapshot(run_id)
 
+    @app.post("/api/graph-runs/{run_id}/recover-review-pauses")
+    async def recover_graph_reviews(run_id: str):
+        return runner.recover_review_pauses(run_id)
+
     @app.post("/api/graph-runs/{run_id}/fork")
     async def fork_graph(run_id: str, body: ForkGraph):
         if runner.busy():
@@ -243,7 +247,7 @@ def register_graph_routes(app, runner, library):
                                limit: int = Query(100, ge=1, le=100)):
         state = runner.load(run_id)
         kind = {"methods": "method", "trials": "trial", "responses": "response", "events": "event",
-                "receipts": "receipt", "sessions": "session"}.get(collection)
+                "receipts": "receipt", "sessions": "session", "invocations": "invocation"}.get(collection)
         if kind is None:
             raise KernelError("ACTION_INVALID", "记录类型不存在。")
         rows = runner.rows(state, kind, owner=True, offset=offset, limit=limit)

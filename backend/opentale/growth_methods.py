@@ -97,7 +97,7 @@ def compile_method(
     return SharedView.model_validate(saved)
 
 
-_INPUT_KINDS = frozenset({"node", "method", "response", "trial", "visit", "passage", "link", "view"})
+_INPUT_KINDS = frozenset({"node", "method", "response", "trial", "visit", "passage", "link", "view", "invocation"})
 
 
 def _program_refs(value: Any) -> list[ObjectRef]:

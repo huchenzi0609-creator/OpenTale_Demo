@@ -18,5 +18,5 @@ export const graphApi = {
   reading: (runId: string, trackId: string, action: "step" | "start" | "pause") => post<GraphSnapshot>(`${root(runId)}/readings/${encodeURIComponent(trackId)}/${action}`),
   passages: (runId: string, trackId: string, offset = 0) => request<GraphPage<GraphPassage>>(`${root(runId)}/readings/${encodeURIComponent(trackId)}/passages?offset=${offset}`),
   visits: (runId: string, trackId: string, offset = 0) => request<GraphPage<GraphVisit>>(`${root(runId)}/readings/${encodeURIComponent(trackId)}/visits?offset=${offset}`),
-  records: (runId: string, kind: "methods" | "trials" | "responses" | "events", offset = 0) => request<GraphRecordPage>(`${root(runId)}/${kind}?offset=${offset}`),
+  records: (runId: string, kind: "methods" | "trials" | "responses" | "events" | "invocations", offset = 0) => request<GraphRecordPage>(`${root(runId)}/${kind}?offset=${offset}`),
 };
